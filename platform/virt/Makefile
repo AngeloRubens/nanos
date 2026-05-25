@@ -33,7 +33,10 @@ SRCS-kernel.elf= \
 	$(SRCDIR)/drivers/acpi.c \
 	$(SRCDIR)/drivers/console.c \
 	$(SRCDIR)/drivers/dmi.c \
-	$(SRCDIR)/drivers/gve.c \
+	$(SRCDIR)/gcp/gve/gve_main.c \
+	$(SRCDIR)/gcp/gve/gve_adminq.c \
+	$(SRCDIR)/gcp/gve/gve_datapath.c \
+	$(SRCDIR)/gcp/gve/gve_dqo.c \
 	$(SRCDIR)/drivers/netconsole.c \
 	$(SRCDIR)/drivers/ns16550.c \
 	$(SRCDIR)/drivers/nvme.c \
@@ -222,7 +225,7 @@ UEFI_LDFLAGS=   -z noexecstack -nostdlib -shared -Bsymbolic -T $(SRCDIR)/aarch64
 
 DEPFILES+=      $(VDSO_DEPS) $(UEFI_DEPS)
 CLEANFILES+=    $(foreach f,gitversion.c frame.inc kernel.dis bin/kernel.elf boot/uefi.so src/unix/ftrace.* $(ARCHDIR)/ftrace.*,$(OBJDIR)/$f) $(VDSO_OBJDIR)/vdso.so $(VDSO_OBJDIR)/vdso-image.c $(VDSO_OBJDIR)/vdso-offset.h $(VDSO_OBJS) $(VDSO_DEPS) $(UEFI_OBJS) $(UEFI_DEPS) $(UEFI_LOADER) $(BOOTIMG) $(KERNEL)
-CLEANDIRS+=     $(foreach d,output/platform output src/aws src/hyperv vdso/src/$(ARCH) vdso/src vdso vendor vendor/lwip vendor/lwip/src vendor/lwip/src/netif vendor/lwip/src/netif/ppp vendor/acpica vendor/acpica/source vendor/acpica/source/components platform,$(OBJDIR)/$d) $(BOOT_OBJDIR) $(UEFI_OBJDIRS)
+CLEANDIRS+=     $(foreach d,output/platform output src/aws src/gcp src/gcp/gve src/hyperv vdso/src/$(ARCH) vdso/src vdso vendor vendor/lwip vendor/lwip/src vendor/lwip/src/netif vendor/lwip/src/netif/ppp vendor/acpica vendor/acpica/source vendor/acpica/source/components platform,$(OBJDIR)/$d) $(BOOT_OBJDIR) $(UEFI_OBJDIRS)
 
 OBJCOPYFLAGS	= -S -O binary
 

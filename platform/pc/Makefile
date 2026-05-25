@@ -19,7 +19,10 @@ SRCS-kernel.elf= \
 	$(SRCDIR)/drivers/ata-pci.c \
 	$(SRCDIR)/drivers/console.c \
 	$(SRCDIR)/drivers/dmi.c \
-	$(SRCDIR)/drivers/gve.c \
+	$(SRCDIR)/gcp/gve/gve_main.c \
+	$(SRCDIR)/gcp/gve/gve_adminq.c \
+	$(SRCDIR)/gcp/gve/gve_datapath.c \
+	$(SRCDIR)/gcp/gve/gve_dqo.c \
 	$(SRCDIR)/drivers/nvme.c \
 	$(SRCDIR)/drivers/netconsole.c \
 	$(SRCDIR)/drivers/vga.c \
@@ -198,7 +201,7 @@ OBJDUMPFLAGS=	-d -S -M intel-mnemonic
 
 DEPFILES+=      $(VDSO_DEPS)
 CLEANFILES+=    $(foreach f,gitversion.c frame.inc kernel.dis kernel.elf src/unix/ftrace.* $(ARCHDIR)/ftrace.*,$(OBJDIR)/$f) $(VDSO_OBJDIR)/vdso.so $(VDSO_OBJDIR)/vdso-image.c $(VDSO_OBJS) $(VDSO_DEPS) $(KERNEL)
-CLEANDIRS+=     $(foreach d,output/platform output src/aws src/hyperv vdso/src/$(ARCH) vdso/src vdso vendor vendor/lwip vendor/lwip/src vendor/lwip/src/netif vendor/lwip/src/netif/ppp vendor/acpica vendor/acpica/source vendor/acpica/source/components platform,$(OBJDIR)/$d)
+CLEANDIRS+=     $(foreach d,output/platform output src/aws src/gcp src/gcp/gve src/hyperv vdso/src/$(ARCH) vdso/src vdso vendor vendor/lwip vendor/lwip/src vendor/lwip/src/netif vendor/lwip/src/netif/ppp vendor/acpica vendor/acpica/source vendor/acpica/source/components platform,$(OBJDIR)/$d)
 
 MKFS=		$(TOOLDIR)/mkfs
 BOOTIMG=	$(OBJDIR)/boot/boot.img

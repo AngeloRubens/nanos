@@ -1,0 +1,792 @@
+/* gve_adminq.c — gVNIC admin queue, QPL management, queue create/destroy
+ *
+ * Covers:
+ *   - Admin queue command submission and polling
+ *   - Device describe / configure device resources
+ *   - QPL (Queue Page List) register / unregister
+ *   - TX and RX queue create / destroy
+ *   - Queue count negotiation (device caps, MSI-X, CPU, manifest)
+ */
+
+#include "gve_priv.h"
+
+/* ------------------------------------------------------------------ */
+/* Admin queue helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+static boolean gve_adminq_wait(gve adapter, u32 cmd_index)
+{
+    int retries = 0;
+    do {
+        if (retries)
+            kernel_delay(milliseconds(20));
+        u32 tail = be32toh(pci_bar_read_4(&adapter->reg_bar,
+                                          GVE_REG_ADMINQ_EVT_CNT));
+        if (((s32)(tail - cmd_index)) >= 0)
+            return true;
+    } while (retries++ < 64);
+    return false;
+}
+
+static struct gve_adminq_command *gve_adminq_new_cmd(gve adapter)
+{
+    struct gve_adminq_command *cmd =
+        &adapter->adminq[adapter->adminq_head & adapter->adminq_mask];
+    zero(cmd, sizeof(*cmd));
+    return cmd;
+}
+
+static u32 gve_adminq_issue_cmd(gve adapter)
+{
+    write_barrier();
+    pci_bar_write_4(&adapter->reg_bar, GVE_REG_ADMINQ_DOORBELL,
+                    htobe32(++adapter->adminq_head));
+    return adapter->adminq_head;
+}
+
+static boolean gve_adminq_execute_cmd(gve adapter,
+                                      struct gve_adminq_command *cmd)
+{
+    u32 index = gve_adminq_issue_cmd(adapter);
+    if (!gve_adminq_wait(adapter, index)) {
+        msg_err("%s: command %d timed out", func_ss, be32toh(cmd->opcode));
+        return false;
+    }
+    read_barrier();
+    u32 status = be32toh(cmd->status);
+    gve_debug("cmd %d, status %d", be32toh(cmd->opcode), status);
+    return (status == GVE_ADMINQ_COMMAND_PASSED);
+}
+
+/* ------------------------------------------------------------------ */
+/* Device describe / configure                                          */
+/* ------------------------------------------------------------------ */
+
+boolean gve_describe_device(gve adapter)
+{
+    struct gve_device_descriptor *desc =
+        allocate(adapter->contiguous, PAGESIZE);
+    if (desc == INVALID_ADDRESS)
+        return false;
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_DESCRIBE_DEVICE);
+    cmd->describe_device.device_descriptor_addr =
+        htobe64(physical_from_virtual(desc));
+    cmd->describe_device.device_descriptor_version = htobe32(1);
+    cmd->describe_device.available_length = htobe32(PAGESIZE);
+    boolean success = gve_adminq_execute_cmd(adapter, cmd);
+    if (success) {
+        u8 *mac = adapter->ndev.n.hwaddr;
+        runtime_memcpy(mac, desc->mac, sizeof(desc->mac));
+        adapter->mtu               = be16toh(desc->mtu);
+        adapter->num_event_counters = be16toh(desc->counters);
+        adapter->tx_desc_cnt       = be16toh(desc->tx_queue_entries);
+        adapter->rx_desc_cnt       = be16toh(desc->rx_queue_entries);
+        adapter->tx_pages_per_qpl  = be16toh(desc->tx_pages_per_qpl);
+        adapter->rx_data_slot_cnt  = be16toh(desc->rx_pages_per_qpl);
+
+        /* Walk device option list.
+         * Priority: DQO-RDA > GQI-RDA > GQI-QPL. */
+        u16 num_opts   = be16toh(desc->num_device_options);
+        u16 total_len  = be16toh(desc->total_length);
+        struct gve_device_option *opt =
+            (struct gve_device_option *)(desc + 1);
+        for (u16 i = 0; i < num_opts; i++) {
+            if ((u8 *)(opt + 1) > (u8 *)desc + total_len)
+                break;
+            u16 id  = be16toh(opt->option_id);
+            u16 len = be16toh(opt->option_length);
+            if (id == GVE_DEV_OPT_ID_DQO_RDA)
+                adapter->dqo = true;
+            else if (!adapter->dqo &&
+                     (id == GVE_DEV_OPT_ID_GQI_RDA ||
+                      id == GVE_DEV_OPT_ID_GQI_RAW_ADDRESSING))
+                adapter->raw_addressing = true;
+            opt = (struct gve_device_option *)((u8 *)(opt + 1) + len);
+        }
+
+        const char *fmt = adapter->dqo    ? "DQO-RDA" :
+                          adapter->raw_addressing ? "GQI-RDA" : "GQI-QPL";
+        rprintf("GVE: MAC %02x:%02x:%02x:%02x:%02x:%02x MTU %d "
+                "TX-desc %d RX-desc %d format %s\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                adapter->mtu, adapter->tx_desc_cnt, adapter->rx_desc_cnt, fmt);
+    }
+    deallocate(adapter->contiguous, desc, PAGESIZE);
+    return success;
+}
+
+boolean gve_cfg_device_resources(gve adapter)
+{
+    u32 nq = adapter->num_queues;
+    u32 nirq = GVE_IRQ_DB_COUNT(nq);
+
+    u64 evt_cnt_size = MAX(adapter->num_event_counters * sizeof(u32),
+                           PAGESIZE);
+    adapter->event_counters = allocate(adapter->contiguous, evt_cnt_size);
+    if (adapter->event_counters == INVALID_ADDRESS)
+        return false;
+
+    u64 irq_db_size = sizeof(struct gve_irq_db) * nirq;
+    adapter->irq_db_indices = allocate(adapter->contiguous, irq_db_size);
+    if (adapter->irq_db_indices == INVALID_ADDRESS)
+        goto err_evt;
+
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_CONFIGURE_DEVICE_RESOURCES);
+    cmd->cfg_dev_resources.counter_array =
+        htobe64(physical_from_virtual(adapter->event_counters));
+    cmd->cfg_dev_resources.irq_db_addr =
+        htobe64(physical_from_virtual(adapter->irq_db_indices));
+    cmd->cfg_dev_resources.num_counters =
+        htobe32(adapter->num_event_counters);
+    cmd->cfg_dev_resources.num_irq_dbs   = htobe32(nirq);
+    cmd->cfg_dev_resources.irq_db_stride =
+        htobe32(sizeof(*adapter->irq_db_indices));
+    cmd->cfg_dev_resources.ntfy_blk_msix_base_idx = htobe32(0);
+    cmd->cfg_dev_resources.queue_format =
+        adapter->dqo ? GVE_DQO_RDA_FORMAT :
+        adapter->raw_addressing ? GVE_GQI_RDA_FORMAT : GVE_GQI_QPL_FORMAT;
+
+    boolean success = gve_adminq_execute_cmd(adapter, cmd);
+    if (success)
+        return true;
+
+    deallocate(adapter->contiguous, adapter->irq_db_indices, irq_db_size);
+  err_evt:
+    deallocate(adapter->contiguous, adapter->event_counters, evt_cnt_size);
+    return false;
+}
+
+void gve_free_device_resources(gve adapter)
+{
+    u32 nq = adapter->num_queues;
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_DECONFIGURE_DEVICE_RESOURCES);
+    gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, adapter->irq_db_indices,
+               sizeof(struct gve_irq_db) * GVE_IRQ_DB_COUNT(nq));
+    deallocate(adapter->contiguous, adapter->event_counters,
+               MAX(adapter->num_event_counters * sizeof(u32), PAGESIZE));
+}
+
+/* ------------------------------------------------------------------ */
+/* QPL management                                                       */
+/* ------------------------------------------------------------------ */
+
+static void *gve_create_qpl(gve adapter, u16 num_pages, u32 id)
+{
+    void *qpl_base = allocate(adapter->contiguous,
+                              num_pages * PAGESIZE);
+    if (qpl_base == INVALID_ADDRESS)
+        return qpl_base;
+    u64 *page_list = allocate(adapter->contiguous,
+                              num_pages * sizeof(*page_list));
+    if (page_list == INVALID_ADDRESS)
+        goto error;
+    u64 page_addr = physical_from_virtual(qpl_base);
+    for (u16 page = 0; page < num_pages; page++) {
+        page_list[page] = htobe64(page_addr);
+        page_addr += PAGESIZE;
+    }
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_REGISTER_PAGE_LIST);
+    cmd->register_page_list.page_list_id           = htobe32(id);
+    cmd->register_page_list.num_pages               = htobe32(num_pages);
+    cmd->register_page_list.page_address_list_addr =
+        htobe64(physical_from_virtual(page_list));
+    cmd->register_page_list.page_size               = htobe64(PAGESIZE);
+    boolean success = gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, page_list,
+               num_pages * sizeof(*page_list));
+    if (success)
+        return qpl_base;
+  error:
+    deallocate(adapter->contiguous, qpl_base, num_pages * PAGESIZE);
+    return INVALID_ADDRESS;
+}
+
+static void gve_destroy_qpl(gve adapter, void *qpl_base,
+                             u16 num_pages, u32 id)
+{
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_UNREGISTER_PAGE_LIST);
+    cmd->unregister_page_list.page_list_id = htobe32(id);
+    gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, qpl_base, num_pages * PAGESIZE);
+}
+
+/* ------------------------------------------------------------------ */
+/* Queue create / destroy                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * QPL ID assignment (QPL mode only):
+ *   TX queue i  -> QPL id = i
+ *   RX queue i  -> QPL id = num_queues + i
+ *
+ * ntfy_id (= IRQ DB slot index) follows GVE_IRQ_DB_TX/RX macros:
+ *   TX ntfy_id = i
+ *   RX ntfy_id = num_queues + i
+ */
+
+static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
+                                    u32 index)
+{
+    boolean rda = adapter->raw_addressing;
+
+    if (rda) {
+        tx->qpl_base = NULL;
+        tx->pending  = allocate(adapter->general,
+                                adapter->tx_desc_cnt * sizeof(*tx->pending));
+        if (tx->pending == INVALID_ADDRESS)
+            return false;
+        zero(tx->pending, adapter->tx_desc_cnt * sizeof(*tx->pending));
+    } else {
+        tx->qpl_base = gve_create_qpl(adapter, adapter->tx_pages_per_qpl,
+                                      index);
+        if (tx->qpl_base == INVALID_ADDRESS)
+            return false;
+        tx->qpl_allocated = allocate(adapter->general,
+                                     adapter->tx_desc_cnt *
+                                     sizeof(*tx->qpl_allocated));
+        if (tx->qpl_allocated == INVALID_ADDRESS) {
+            gve_destroy_qpl(adapter, tx->qpl_base,
+                            adapter->tx_pages_per_qpl, index);
+            return false;
+        }
+    }
+
+    tx->desc = allocate(adapter->contiguous,
+                        adapter->tx_desc_cnt * sizeof(*tx->desc));
+    if (tx->desc == INVALID_ADDRESS)
+        goto err_after_mode_alloc;
+
+    tx->q_res = allocate(adapter->contiguous, sizeof(*tx->q_res));
+    if (tx->q_res == INVALID_ADDRESS)
+        goto err_after_desc;
+
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_CREATE_TX_QUEUE);
+    cmd->create_tx_queue.queue_id             = htobe32(index);
+    cmd->create_tx_queue.queue_resources_addr =
+        htobe64(physical_from_virtual(tx->q_res));
+    cmd->create_tx_queue.tx_ring_addr         =
+        htobe64(physical_from_virtual(tx->desc));
+    cmd->create_tx_queue.queue_page_list_id   =
+        htobe32(rda ? GVE_RAW_ADDRESSING_QPL_ID : index);
+    cmd->create_tx_queue.ntfy_id              =
+        htobe32(GVE_IRQ_DB_TX(adapter->num_queues, index));
+    cmd->create_tx_queue.tx_ring_size         =
+        htobe16(adapter->tx_desc_cnt);
+
+    if (!gve_adminq_execute_cmd(adapter, cmd))
+        goto err_after_q_res;
+
+    tx->mask            = adapter->tx_desc_cnt - 1;
+    tx->head = tx->tail = 0;
+    if (!rda) {
+        tx->qpl_head = 0;
+        tx->qpl_used = 0;
+        tx->qpl_size = adapter->tx_pages_per_qpl * PAGESIZE;
+    }
+    tx->adapter         = adapter;
+    tx->last_completion = now(CLOCK_ID_MONOTONIC);
+    tx->stuck           = false;
+    return true;
+
+  err_after_q_res:
+    deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+  err_after_desc:
+    deallocate(adapter->contiguous, tx->desc,
+               adapter->tx_desc_cnt * sizeof(*tx->desc));
+  err_after_mode_alloc:
+    if (rda) {
+        deallocate(adapter->general, tx->pending,
+                   adapter->tx_desc_cnt * sizeof(*tx->pending));
+    } else {
+        deallocate(adapter->general, tx->qpl_allocated,
+                   adapter->tx_desc_cnt * sizeof(*tx->qpl_allocated));
+        gve_destroy_qpl(adapter, tx->qpl_base,
+                        adapter->tx_pages_per_qpl, index);
+    }
+    return false;
+}
+
+static void gve_destroy_tx_queue(gve adapter, gve_tx_queue tx,
+                                  u32 index)
+{
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_DESTROY_TX_QUEUE);
+    cmd->destroy_tx_queue.queue_id = htobe32(index);
+    gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+    deallocate(adapter->contiguous, tx->desc,
+               adapter->tx_desc_cnt * sizeof(*tx->desc));
+    if (adapter->raw_addressing) {
+        for (u32 i = 0; i <= tx->mask; i++)
+            if (tx->pending[i])
+                pbuf_free(tx->pending[i]);
+        deallocate(adapter->general, tx->pending,
+                   adapter->tx_desc_cnt * sizeof(*tx->pending));
+    } else {
+        deallocate(adapter->general, tx->qpl_allocated,
+                   adapter->tx_desc_cnt * sizeof(*tx->qpl_allocated));
+        gve_destroy_qpl(adapter, tx->qpl_base,
+                        adapter->tx_pages_per_qpl, index);
+    }
+}
+
+static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
+                                    u32 index)
+{
+    boolean rda = adapter->raw_addressing;
+    u16 num_pages = adapter->rx_data_slot_cnt;
+    u32 nq = adapter->num_queues;
+    u32 qpl_id;
+
+    if (rda) {
+        rx->qpl_base = allocate(adapter->contiguous,
+                                num_pages * PAGESIZE);
+        if (rx->qpl_base == INVALID_ADDRESS)
+            return false;
+        rx->rda_base_phys = physical_from_virtual(rx->qpl_base);
+        qpl_id = GVE_RAW_ADDRESSING_QPL_ID;
+    } else {
+        qpl_id = nq + index;
+        rx->qpl_base = gve_create_qpl(adapter, num_pages, qpl_id);
+        if (rx->qpl_base == INVALID_ADDRESS)
+            return false;
+        rx->rda_base_phys = 0;
+    }
+
+    rx->qpl_available = rx->qpl_count = num_pages;
+
+    rx->pbufs = allocate(adapter->general,
+                         rx->qpl_count * sizeof(*rx->pbufs));
+    if (rx->pbufs == INVALID_ADDRESS)
+        goto err_after_qpl;
+
+    rx->desc = allocate(adapter->contiguous,
+                        adapter->rx_desc_cnt * sizeof(*rx->desc));
+    if (rx->desc == INVALID_ADDRESS)
+        goto err_after_pbufs;
+
+    rx->data = allocate(adapter->contiguous,
+                        adapter->rx_data_slot_cnt * sizeof(*rx->data));
+    if (rx->data == INVALID_ADDRESS)
+        goto err_after_desc;
+
+    rx->q_res = allocate(adapter->contiguous, sizeof(*rx->q_res));
+    if (rx->q_res == INVALID_ADDRESS)
+        goto err_after_data;
+
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_CREATE_RX_QUEUE);
+    cmd->create_rx_queue.queue_id =
+        cmd->create_rx_queue.index = htobe32(index);
+    cmd->create_rx_queue.ntfy_id  = htobe32(GVE_IRQ_DB_RX(nq, index));
+    cmd->create_rx_queue.queue_resources_addr =
+        htobe64(physical_from_virtual(rx->q_res));
+    cmd->create_rx_queue.rx_desc_ring_addr =
+        htobe64(physical_from_virtual(rx->desc));
+    cmd->create_rx_queue.rx_data_ring_addr =
+        htobe64(physical_from_virtual(rx->data));
+    cmd->create_rx_queue.queue_page_list_id  = htobe32(qpl_id);
+    cmd->create_rx_queue.rx_ring_size        = htobe16(adapter->rx_desc_cnt);
+    cmd->create_rx_queue.packet_buffer_size  = htobe16(PAGESIZE / 2);
+    cmd->create_rx_queue.rx_buff_ring_size   =
+        htobe16(rda ? 0 : adapter->rx_data_slot_cnt);
+
+    if (!gve_adminq_execute_cmd(adapter, cmd))
+        goto err_after_q_res;
+
+    rx->mask = adapter->rx_desc_cnt - 1;
+    rx->head = rx->tail = 0;
+    rx->qpl_head = 0;
+    for (u32 i = 0; i < rx->qpl_count; i++) {
+        struct pbuf *pb = &rx->pbufs[i];
+        pb->next          = NULL;
+        pb->type_internal = PBUF_REF;
+        pb->flags         = 0;
+        pb->ref           = 1;
+        pb->if_idx        = NETIF_NO_INDEX;
+    }
+    rx->irq_db_index =
+        &adapter->irq_db_indices[GVE_IRQ_DB_RX(nq, index)].index;
+    rx->adapter = adapter;
+
+    /* Init closures and fill initial RX buffers (gve_datapath.c). */
+    gve_rx_init(rx);
+    gve_rx_fill(rx);
+    return true;
+
+  err_after_q_res:
+    deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
+  err_after_data:
+    deallocate(adapter->contiguous, rx->data,
+               adapter->rx_data_slot_cnt * sizeof(*rx->data));
+  err_after_desc:
+    deallocate(adapter->contiguous, rx->desc,
+               adapter->rx_desc_cnt * sizeof(*rx->desc));
+  err_after_pbufs:
+    deallocate(adapter->general, rx->pbufs,
+               rx->qpl_count * sizeof(*rx->pbufs));
+  err_after_qpl:
+    if (rda)
+        deallocate(adapter->contiguous, rx->qpl_base,
+                   num_pages * PAGESIZE);
+    else
+        gve_destroy_qpl(adapter, rx->qpl_base, num_pages, qpl_id);
+    return false;
+}
+
+static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
+                                  u32 index)
+{
+    u32 nq = adapter->num_queues;
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_DESTROY_RX_QUEUE);
+    cmd->destroy_rx_queue.queue_id = htobe32(index);
+    gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
+    deallocate(adapter->contiguous, rx->data,
+               adapter->rx_data_slot_cnt * sizeof(*rx->data));
+    deallocate(adapter->contiguous, rx->desc,
+               adapter->rx_desc_cnt * sizeof(*rx->desc));
+    deallocate(adapter->general, rx->pbufs,
+               rx->qpl_count * sizeof(*rx->pbufs));
+    if (adapter->raw_addressing)
+        deallocate(adapter->contiguous, rx->qpl_base,
+                   adapter->rx_data_slot_cnt * PAGESIZE);
+    else
+        gve_destroy_qpl(adapter, rx->qpl_base,
+                        adapter->rx_data_slot_cnt, nq + index);
+}
+
+/* ------------------------------------------------------------------ */
+/* DQO queue create / destroy                                           */
+/* ------------------------------------------------------------------ */
+
+static boolean gve_create_tx_queue_dqo(gve adapter,
+                                        gve_tx_dqo_queue tx, u32 index)
+{
+    u16 desc_cnt  = adapter->tx_desc_cnt;
+
+    tx->desc = allocate(adapter->contiguous,
+                        desc_cnt * sizeof(*tx->desc));
+    if (tx->desc == INVALID_ADDRESS)
+        return false;
+
+    tx->compl = allocate(adapter->contiguous,
+                         desc_cnt * sizeof(*tx->compl));
+    if (tx->compl == INVALID_ADDRESS)
+        goto err_compl;
+    zero(tx->compl, desc_cnt * sizeof(*tx->compl));
+
+    tx->pending = allocate(adapter->general,
+                           desc_cnt * sizeof(*tx->pending));
+    if (tx->pending == INVALID_ADDRESS)
+        goto err_pending;
+    zero(tx->pending, desc_cnt * sizeof(*tx->pending));
+
+    tx->seg_counts = allocate(adapter->general,
+                              desc_cnt * sizeof(*tx->seg_counts));
+    if (tx->seg_counts == INVALID_ADDRESS)
+        goto err_seg_counts;
+    zero(tx->seg_counts, desc_cnt * sizeof(*tx->seg_counts));
+
+    tx->q_res = allocate(adapter->contiguous, sizeof(*tx->q_res));
+    if (tx->q_res == INVALID_ADDRESS)
+        goto err_q_res;
+
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_CREATE_TX_QUEUE);
+    cmd->create_tx_queue.queue_id             = htobe32(index);
+    cmd->create_tx_queue.queue_resources_addr =
+        htobe64(physical_from_virtual(tx->q_res));
+    cmd->create_tx_queue.tx_ring_addr         =
+        htobe64(physical_from_virtual(tx->desc));
+    cmd->create_tx_queue.queue_page_list_id   =
+        htobe32(GVE_RAW_ADDRESSING_QPL_ID);
+    cmd->create_tx_queue.ntfy_id              =
+        htobe32(GVE_IRQ_DB_TX(adapter->num_queues, index));
+    cmd->create_tx_queue.tx_ring_size         = htobe16(desc_cnt);
+    cmd->create_tx_queue.tx_comp_ring_addr    =
+        htobe64(physical_from_virtual(tx->compl));
+    cmd->create_tx_queue.tx_comp_ring_size    = htobe16(desc_cnt);
+
+    if (!gve_adminq_execute_cmd(adapter, cmd))
+        goto err_cmd;
+
+    tx->mask             = desc_cnt - 1;
+    tx->head             = 0;
+    tx->desc_tail        = 0;
+    tx->compl_head       = 0;
+    tx->expected_gen     = 1;  /* device writes gen=1 on first pass */
+    tx->adapter          = adapter;
+    tx->last_completion  = now(CLOCK_ID_MONOTONIC);
+    tx->stuck            = false;
+    return true;
+
+  err_cmd:
+    deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+  err_q_res:
+    deallocate(adapter->general, tx->seg_counts,
+               desc_cnt * sizeof(*tx->seg_counts));
+  err_seg_counts:
+    deallocate(adapter->general, tx->pending,
+               desc_cnt * sizeof(*tx->pending));
+  err_pending:
+    deallocate(adapter->contiguous, tx->compl,
+               desc_cnt * sizeof(*tx->compl));
+  err_compl:
+    deallocate(adapter->contiguous, tx->desc,
+               desc_cnt * sizeof(*tx->desc));
+    return false;
+}
+
+static void gve_destroy_tx_queue_dqo(gve adapter,
+                                      gve_tx_dqo_queue tx, u32 index)
+{
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_DESTROY_TX_QUEUE);
+    cmd->destroy_tx_queue.queue_id = htobe32(index);
+    gve_adminq_execute_cmd(adapter, cmd);
+
+    u16 desc_cnt = adapter->tx_desc_cnt;
+    /* Free any in-flight pbufs. */
+    for (u32 i = 0; i <= tx->mask; i++)
+        if (tx->pending[i])
+            pbuf_free(tx->pending[i]);
+    deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+    deallocate(adapter->general,    tx->seg_counts,
+               desc_cnt * sizeof(*tx->seg_counts));
+    deallocate(adapter->general,    tx->pending,
+               desc_cnt * sizeof(*tx->pending));
+    deallocate(adapter->contiguous, tx->compl,
+               desc_cnt * sizeof(*tx->compl));
+    deallocate(adapter->contiguous, tx->desc,
+               desc_cnt * sizeof(*tx->desc));
+}
+
+static boolean gve_create_rx_queue_dqo(gve adapter,
+                                        gve_rx_dqo_queue rx, u32 index)
+{
+    u32 num_bufs  = adapter->rx_data_slot_cnt;
+    u32 nq        = adapter->num_queues;
+
+    rx->qpl_base = allocate(adapter->contiguous,
+                             num_bufs * GVE_DQO_BUF_SIZE);
+    if (rx->qpl_base == INVALID_ADDRESS)
+        return false;
+    rx->rda_base_phys = physical_from_virtual(rx->qpl_base);
+
+    rx->pbufs = allocate(adapter->general,
+                         num_bufs * sizeof(*rx->pbufs));
+    if (rx->pbufs == INVALID_ADDRESS)
+        goto err_pbufs;
+
+    rx->buf_ring = allocate(adapter->contiguous,
+                            num_bufs * sizeof(*rx->buf_ring));
+    if (rx->buf_ring == INVALID_ADDRESS)
+        goto err_buf_ring;
+    zero(rx->buf_ring, num_bufs * sizeof(*rx->buf_ring));
+
+    rx->compl_ring = allocate(adapter->contiguous,
+                              num_bufs * sizeof(*rx->compl_ring));
+    if (rx->compl_ring == INVALID_ADDRESS)
+        goto err_compl_ring;
+    zero(rx->compl_ring, num_bufs * sizeof(*rx->compl_ring));
+
+    rx->q_res = allocate(adapter->contiguous, sizeof(*rx->q_res));
+    if (rx->q_res == INVALID_ADDRESS)
+        goto err_q_res;
+
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_CREATE_RX_QUEUE);
+    cmd->create_rx_queue.queue_id =
+        cmd->create_rx_queue.index = htobe32(index);
+    cmd->create_rx_queue.ntfy_id  = htobe32(GVE_IRQ_DB_RX(nq, index));
+    cmd->create_rx_queue.queue_resources_addr =
+        htobe64(physical_from_virtual(rx->q_res));
+    cmd->create_rx_queue.rx_desc_ring_addr =   /* completion ring */
+        htobe64(physical_from_virtual(rx->compl_ring));
+    cmd->create_rx_queue.rx_data_ring_addr =   /* buffer ring */
+        htobe64(physical_from_virtual(rx->buf_ring));
+    cmd->create_rx_queue.queue_page_list_id  =
+        htobe32(GVE_RAW_ADDRESSING_QPL_ID);
+    cmd->create_rx_queue.rx_ring_size        = htobe16(num_bufs);
+    cmd->create_rx_queue.packet_buffer_size  = htobe16(GVE_DQO_BUF_SIZE);
+    cmd->create_rx_queue.rx_buff_ring_size   = htobe16(num_bufs);
+
+    if (!gve_adminq_execute_cmd(adapter, cmd))
+        goto err_cmd;
+
+    rx->mask         = num_bufs - 1;
+    rx->num_bufs     = num_bufs;
+    rx->buf_head     = 0;
+    rx->compl_head   = 0;
+    rx->expected_gen = 1;
+    rx->adapter      = adapter;
+    rx->irq_db_index =
+        &adapter->irq_db_indices[GVE_IRQ_DB_RX(nq, index)].index;
+
+    for (u32 i = 0; i < num_bufs; i++) {
+        struct pbuf *pb = &rx->pbufs[i];
+        pb->next          = NULL;
+        pb->type_internal = PBUF_REF;
+        pb->flags         = 0;
+        pb->ref           = 1;
+        pb->if_idx        = NETIF_NO_INDEX;
+    }
+
+    /* Init service closure and fill initial buffers (gve_dqo.c). */
+    gve_rx_dqo_init(rx);
+    gve_rx_dqo_fill(rx);
+    return true;
+
+  err_cmd:
+    deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
+  err_q_res:
+    deallocate(adapter->contiguous, rx->compl_ring,
+               num_bufs * sizeof(*rx->compl_ring));
+  err_compl_ring:
+    deallocate(adapter->contiguous, rx->buf_ring,
+               num_bufs * sizeof(*rx->buf_ring));
+  err_buf_ring:
+    deallocate(adapter->general, rx->pbufs,
+               num_bufs * sizeof(*rx->pbufs));
+  err_pbufs:
+    deallocate(adapter->contiguous, rx->qpl_base,
+               num_bufs * GVE_DQO_BUF_SIZE);
+    return false;
+}
+
+static void gve_destroy_rx_queue_dqo(gve adapter,
+                                      gve_rx_dqo_queue rx, u32 index)
+{
+    u32 num_bufs = rx->num_bufs;
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_DESTROY_RX_QUEUE);
+    cmd->destroy_rx_queue.queue_id = htobe32(index);
+    gve_adminq_execute_cmd(adapter, cmd);
+
+    deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
+    deallocate(adapter->contiguous, rx->compl_ring,
+               num_bufs * sizeof(*rx->compl_ring));
+    deallocate(adapter->contiguous, rx->buf_ring,
+               num_bufs * sizeof(*rx->buf_ring));
+    deallocate(adapter->general,    rx->pbufs,
+               num_bufs * sizeof(*rx->pbufs));
+    deallocate(adapter->contiguous, rx->qpl_base,
+               num_bufs * GVE_DQO_BUF_SIZE);
+}
+
+/* ------------------------------------------------------------------ */
+/* Queue count negotiation and setup                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * gve_calc_num_queues: determine how many TX/RX queue pairs to create.
+ *
+ * Priority (lowest wins):
+ *   1. GVE_MAX_IO_QUEUES compile-time cap
+ *   2. Device-reported max TX / RX queues (register BAR)
+ *   3. Available MSI-X vectors (2 per queue + 1 mgmt)
+ *   4. CPU count
+ *   5. "io-queues" manifest option
+ */
+u32 gve_calc_num_queues(gve adapter, tuple config)
+{
+    u32 dev_max_tx = be32toh(pci_bar_read_4(&adapter->reg_bar,
+                                             GVE_REG_MAX_TX_QUEUES));
+    u32 dev_max_rx = be32toh(pci_bar_read_4(&adapter->reg_bar,
+                                             GVE_REG_MAX_RX_QUEUES));
+    u32 dev_max = MIN(dev_max_tx, dev_max_rx);
+    if (dev_max == 0)
+        dev_max = 1;    /* legacy firmware that reports 0 = single queue */
+
+    u32 nq = MIN(GVE_MAX_IO_QUEUES, dev_max);
+
+    /* MSI-X constraint: need 2*nq + 1 vectors. */
+    int msix_avail = pci_get_msix_count(adapter->pdev);
+    if (msix_avail > 1)
+        nq = MIN(nq, (u32)((msix_avail - 1) / 2));
+
+    /* CPU constraint. */
+    nq = MIN(nq, (u32)total_processors);
+
+    /* Manifest override. */
+    u64 manifest_val = 0;
+    if (config && get_u64(config, sym_this("io-queues"), &manifest_val)
+            && manifest_val > 0)
+        nq = MIN(nq, (u32)manifest_val);
+
+    if (nq == 0)
+        nq = 1;
+
+    return nq;
+}
+
+boolean gve_setup_queues(gve adapter)
+{
+    u32 nq = adapter->num_queues;
+    u32 i;
+
+    if (adapter->dqo) {
+        for (i = 0; i < nq; i++) {
+            if (!gve_create_tx_queue_dqo(adapter, &adapter->tx_dqo[i], i))
+                goto err_tx_dqo;
+        }
+        for (i = 0; i < nq; i++) {
+            if (!gve_create_rx_queue_dqo(adapter, &adapter->rx_dqo[i], i))
+                goto err_rx_dqo;
+        }
+        return true;
+
+      err_rx_dqo:
+        for (u32 j = 0; j < i; j++)
+            gve_destroy_rx_queue_dqo(adapter, &adapter->rx_dqo[j], j);
+        i = nq;
+      err_tx_dqo:
+        for (u32 j = 0; j < i; j++)
+            gve_destroy_tx_queue_dqo(adapter, &adapter->tx_dqo[j], j);
+        return false;
+    }
+
+    for (i = 0; i < nq; i++) {
+        if (!gve_create_tx_queue(adapter, &adapter->tx[i], i))
+            goto err_tx;
+    }
+    for (i = 0; i < nq; i++) {
+        if (!gve_create_rx_queue(adapter, &adapter->rx[i], i))
+            goto err_rx;
+    }
+    return true;
+
+  err_rx:
+    for (u32 j = 0; j < i; j++)
+        gve_destroy_rx_queue(adapter, &adapter->rx[j], j);
+    i = nq;
+  err_tx:
+    for (u32 j = 0; j < i; j++)
+        gve_destroy_tx_queue(adapter, &adapter->tx[j], j);
+    return false;
+}
+
+void gve_teardown_queues(gve adapter)
+{
+    u32 nq = adapter->num_queues;
+    if (adapter->dqo) {
+        for (u32 i = 0; i < nq; i++)
+            gve_destroy_rx_queue_dqo(adapter, &adapter->rx_dqo[i], i);
+        for (u32 i = 0; i < nq; i++)
+            gve_destroy_tx_queue_dqo(adapter, &adapter->tx_dqo[i], i);
+    } else {
+        for (u32 i = 0; i < nq; i++)
+            gve_destroy_rx_queue(adapter, &adapter->rx[i], i);
+        for (u32 i = 0; i < nq; i++)
+            gve_destroy_tx_queue(adapter, &adapter->tx[i], i);
+    }
+}
