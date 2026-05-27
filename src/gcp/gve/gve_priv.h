@@ -333,8 +333,9 @@ struct gve_tx_compl_desc_dqo {
 #define GVE_DQO_COMPL_GEN_BIT       0x8000u  /* bit 15 of id_type_gen */
 #define GVE_DQO_COMPL_TYPE_SHIFT    11       /* type field in bits[13:11] */
 #define GVE_DQO_COMPL_TYPE_PKT      0x2u     /* normal packet completion */
-#define GVE_DQO_COMPL_TYPE_MISS     0x4u     /* device buffered packet; await reinjection */
-#define GVE_DQO_COMPL_TYPE_REINJECT 0x5u     /* buffered packet delivered */
+#define GVE_DQO_COMPL_TYPE_DESC     0x4u     /* descriptor completion (context descriptors) */
+#define GVE_DQO_COMPL_TYPE_MISS     0x1u     /* miss path: device buffered packet */
+#define GVE_DQO_COMPL_TYPE_REINJECT 0x3u     /* reinjection: buffered packet delivered */
 
 /*
  * DQO RX buffer descriptor — 32 bytes, little-endian.
