@@ -152,6 +152,10 @@ static err_t gve_linkoutput_qpl(struct netif *netif, struct pbuf *p)
         seg->seg_addr   = htobe64(seg_off);
     }
 
+    tx->tx_stats.cnt++;
+    tx->tx_stats.bytes += p->tot_len;
+    adapter->hw_stats.tx_packets++;
+    adapter->hw_stats.tx_bytes += p->tot_len;
     write_barrier();
     pci_bar_write_4(&adapter->db_bar,
                     be32toh(tx->q_res->db_index) * sizeof(u32),
@@ -215,6 +219,10 @@ static err_t gve_linkoutput_rda(struct netif *netif, struct pbuf *p)
         seg->seg_addr   = htobe64(physical_from_virtual(q->payload));
     }
 
+    tx->tx_stats.cnt++;
+    tx->tx_stats.bytes += p->tot_len;
+    adapter->hw_stats.tx_packets++;
+    adapter->hw_stats.tx_bytes += p->tot_len;
     write_barrier();
     pci_bar_write_4(&adapter->db_bar,
                     be32toh(tx->q_res->db_index) * sizeof(u32),
@@ -282,56 +290,71 @@ closure_func_basic(thunk, void, gve_rx_service)
                                         gve_rx_queue, service);
     gve adapter = rx->adapter;
     struct netif *net_if = &adapter->ndev.n;
-    u32 tail;
     boolean irq_acked = false;
     spin_lock(&rx->lock);
   begin:
-    tail = be32toh(
-        adapter->event_counters[be32toh(rx->q_res->counter_index)]);
-    gve_debug("RX tail %d -> %d", rx->tail, tail);
-    for (; rx->tail != tail; rx->qpl_available++, rx->tail++) {
-        struct gve_rx_desc *desc = &rx->desc[rx->tail & rx->mask];
-        u16 length = be16toh(desc->len);
-        if (length <= GVE_RX_PADDING)
-            continue;
-        if (desc->flags_seq & (GVE_RXF_ERR | GVE_RXF_PKT_CONT)) {
-            msg_err("%s: unexpected flags 0x%x", func_ss,
-                    desc->flags_seq);
-            continue;
-        }
-        /* qpl_head is stable during this loop (fill runs after).
-         * qpl_available counts buffers returned so far this service
-         * call, so qpl_head + qpl_available is the QPL page index
-         * for the current completion. */
-        u32 qpl_index = rx->qpl_head + rx->qpl_available;
-        if (qpl_index >= rx->qpl_count)
-            qpl_index -= rx->qpl_count;
-        u64 qpl_offset = be64toh(rx->data[rx->tail & rx->mask]) -
-                         rx->rda_base_phys;
-        void *payload = rx->qpl_base + qpl_offset + GVE_RX_PADDING;
-        length -= GVE_RX_PADDING;
-        struct pbuf *p;
-        if (qpl_offset == (u64)qpl_index * PAGESIZE) {
-            p = &rx->pbufs[qpl_index];
-            p->payload = payload;
-            p->len = p->tot_len = length;
-            pbuf_ref(p);
-        } else {
-            gve_debug("RX packet copy");
-            p = pbuf_alloc(PBUF_RAW, length, PBUF_RAM);
-            if (p) {
-                pbuf_take(p, payload, length);
-            } else {
-                msg_err("%s: failed to allocate pbuf", func_ss);
+    gve_debug("GQI RX service tail %d", rx->tail);
+
+    for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
+        int budget = GVE_RX_BUDGET;
+        u32 tail = be32toh(
+            adapter->event_counters[be32toh(rx->q_res->counter_index)]);
+        for (; rx->tail != tail && budget > 0;
+             rx->qpl_available++, rx->tail++, budget--) {
+            struct gve_rx_desc *desc = &rx->desc[rx->tail & rx->mask];
+            u16 length = be16toh(desc->len);
+            if (length <= GVE_RX_PADDING) {
+                rx->rx_stats.rx_dropped++;
                 continue;
             }
+            if (desc->flags_seq & (GVE_RXF_ERR | GVE_RXF_PKT_CONT)) {
+                msg_err("%s: unexpected flags 0x%x", func_ss,
+                        desc->flags_seq);
+                rx->rx_stats.rx_dropped++;
+                continue;
+            }
+            /* qpl_head is stable during this loop (fill runs after).
+             * qpl_available counts buffers returned so far this service
+             * call, so qpl_head + qpl_available is the QPL page index
+             * for the current completion. */
+            u32 qpl_index = rx->qpl_head + rx->qpl_available;
+            if (qpl_index >= rx->qpl_count)
+                qpl_index -= rx->qpl_count;
+            u64 qpl_offset = be64toh(rx->data[rx->tail & rx->mask]) -
+                             rx->rda_base_phys;
+            void *payload = rx->qpl_base + qpl_offset + GVE_RX_PADDING;
+            length -= GVE_RX_PADDING;
+            struct pbuf *p;
+            if (qpl_offset == (u64)qpl_index * PAGESIZE) {
+                p = &rx->pbufs[qpl_index];
+                p->payload = payload;
+                p->len = p->tot_len = length;
+                pbuf_ref(p);
+            } else {
+                gve_debug("RX packet copy");
+                p = pbuf_alloc(PBUF_RAW, length, PBUF_RAM);
+                if (p) {
+                    pbuf_take(p, payload, length);
+                    rx->rx_stats.rx_copy++;
+                } else {
+                    msg_err("%s: failed to allocate pbuf", func_ss);
+                    rx->rx_stats.rx_dropped++;
+                    continue;
+                }
+            }
+            err_t err = net_if->input(p, net_if);
+            if (err != ERR_OK)
+                pbuf_free(p);
+            rx->rx_stats.cnt++;
+            rx->rx_stats.bytes += length;
+            adapter->hw_stats.rx_packets++;
+            adapter->hw_stats.rx_bytes += length;
         }
-        err_t err = net_if->input(p, net_if);
-        if (err != ERR_OK)
-            pbuf_free(p);
+        if (rx->head - rx->tail <= (rx->mask + 1) / 2)
+            gve_rx_fill(rx);
+        if (rx->tail == tail)
+            break;  /* caught up before budget — no more work */
     }
-    if (rx->head - rx->tail <= (rx->mask + 1) / 2)
-        gve_rx_fill(rx);
     if (!irq_acked) {
         pci_bar_write_4(&adapter->db_bar,
                         be32toh(*rx->irq_db_index) * sizeof(u32),

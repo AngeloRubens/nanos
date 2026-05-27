@@ -81,6 +81,11 @@
  * On GCP Axion (128-byte cacheline) bump this define if needed. */
 #define GVE_TX_PAD  DEFAULT_CACHELINE_SIZE
 
+/* Per-invocation RX budget: completions processed per inner loop pass.
+ * CLEAN_BUDGET bounds the outer retry count when the ring saturates budget. */
+#define GVE_RX_BUDGET    64
+#define GVE_CLEAN_BUDGET  8
+
 /* Sentinel QPL id: tells the device to use direct physical addresses
  * (GQI-RDA mode) rather than a registered page list. */
 #define GVE_RAW_ADDRESSING_QPL_ID   0xFFFFFFFFu
@@ -325,9 +330,11 @@ struct gve_tx_compl_desc_dqo {
     u32 reserved;
 } __attribute__((packed));
 
-#define GVE_DQO_COMPL_GEN_BIT    0x8000u  /* bit 15 of id_type_gen */
-#define GVE_DQO_COMPL_TYPE_SHIFT 11       /* type field in bits[13:11] */
-#define GVE_DQO_COMPL_TYPE_PKT   0x2u     /* packet completion */
+#define GVE_DQO_COMPL_GEN_BIT       0x8000u  /* bit 15 of id_type_gen */
+#define GVE_DQO_COMPL_TYPE_SHIFT    11       /* type field in bits[13:11] */
+#define GVE_DQO_COMPL_TYPE_PKT      0x2u     /* normal packet completion */
+#define GVE_DQO_COMPL_TYPE_MISS     0x4u     /* device buffered packet; await reinjection */
+#define GVE_DQO_COMPL_TYPE_REINJECT 0x5u     /* buffered packet delivered */
 
 /*
  * DQO RX buffer descriptor — 32 bytes, little-endian.
@@ -424,6 +431,30 @@ struct gve_rx_desc {
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------ */
+/* Per-queue and adapter statistics                                     */
+/* ------------------------------------------------------------------ */
+
+struct gve_stats_tx {
+    u64 cnt;            /* packets sent */
+    u64 bytes;          /* bytes sent */
+    u64 bad_compl_tag;  /* completion with invalid/unexpected tag */
+};
+
+struct gve_stats_rx {
+    u64 cnt;            /* packets received */
+    u64 bytes;          /* bytes received */
+    u64 rx_copy;        /* packets received via copy path */
+    u64 rx_dropped;     /* packets dropped (error or alloc failure) */
+};
+
+struct gve_hw_stats {
+    u64 rx_packets;
+    u64 tx_packets;
+    u64 rx_bytes;
+    u64 tx_bytes;
+};
+
+/* ------------------------------------------------------------------ */
 /* GQI per-queue structs                                                */
 /* ------------------------------------------------------------------ */
 
@@ -459,6 +490,8 @@ typedef struct gve_tx_queue {
     struct pbuf **pending;  /* RDA mode: in-flight pbuf per descriptor slot */
     struct gve_queue_resources *q_res;
 
+    struct gve_stats_tx tx_stats;
+
     /* Watchdog: timestamp of last successful TX event-counter advance */
     timestamp last_completion;
     boolean   stuck;
@@ -480,6 +513,8 @@ typedef struct gve_rx_queue {
     closure_struct(thunk, irq_handler);
     closure_struct(thunk, service);
     struct gve_queue_resources *q_res;
+
+    struct gve_stats_rx rx_stats;
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -513,7 +548,11 @@ typedef struct gve_tx_dqo_queue {
     struct gve_tx_compl_desc_dqo *compl;
     struct pbuf                 **pending;    /* pbuf per compl_tag slot */
     u16                         *seg_counts;  /* seg_count per compl_tag slot */
+    timestamp                   *miss_times;  /* non-zero after miss, cleared on reinject */
+    u16                          pending_misses;
     struct gve_queue_resources  *q_res;
+
+    struct gve_stats_tx tx_stats;
 
     timestamp last_completion;
     boolean   stuck;
@@ -549,6 +588,8 @@ typedef struct gve_rx_dqo_queue {
     closure_struct(thunk, irq_handler);
     closure_struct(thunk, service);
     struct gve_queue_resources *q_res;
+
+    struct gve_stats_rx rx_stats;
 } *gve_rx_dqo_queue;
 
 /* ------------------------------------------------------------------ */
@@ -588,6 +629,7 @@ typedef struct gve {
     boolean resetting;
     struct timer watchdog_timer;
     closure_struct(timer_handler, watchdog_task);
+    struct gve_hw_stats hw_stats;
     u16 mtu;
 } *gve;
 

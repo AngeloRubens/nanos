@@ -46,19 +46,75 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
         u8 type = (u8)((itg >> GVE_DQO_COMPL_TYPE_SHIFT) & 0x7);  /* bits[13:11] */
         if (type == GVE_DQO_COMPL_TYPE_PKT) {
             u16_t tag = c->completion_tag & tx->mask;
+            if (!tx->seg_counts[tag]) {
+                msg_err("GVE: DQO TX invalid completion tag %u", tag);
+                tx->tx_stats.bad_compl_tag++;
+                gve a = tx->adapter;
+                if (!a->resetting) {
+                    a->resetting = true;
+                    async_apply_bh((thunk)&a->reset_handler);
+                }
+                break;
+            }
             tx->desc_tail += tx->seg_counts[tag];
             if (tx->pending[tag]) {
                 pbuf_free(tx->pending[tag]);
                 tx->pending[tag] = NULL;
             }
             tx->last_completion = now(CLOCK_ID_MONOTONIC);
+        } else if (type == GVE_DQO_COMPL_TYPE_MISS) {
+            u16_t tag = c->completion_tag & tx->mask;
+            if (!tx->miss_times[tag]) {
+                tx->miss_times[tag] = now(CLOCK_ID_MONOTONIC);
+                tx->pending_misses++;
+            }
+        } else if (type == GVE_DQO_COMPL_TYPE_REINJECT) {
+            u16_t tag = c->completion_tag & tx->mask;
+            tx->desc_tail += tx->seg_counts[tag];
+            if (tx->pending[tag]) {
+                pbuf_free(tx->pending[tag]);
+                tx->pending[tag] = NULL;
+            }
+            if (tx->miss_times[tag]) {
+                tx->miss_times[tag] = 0;
+                tx->pending_misses--;
+            }
+            tx->last_completion = now(CLOCK_ID_MONOTONIC);
         }
-        /* Other completion types (miss, re-injection): no action needed. */
 
         tx->compl_head++;
         /* Flip expected_gen each time compl_head wraps around the ring. */
         if (!(tx->compl_head & tx->mask))
             tx->expected_gen ^= 1;
+    }
+
+    /* Per-packet watchdog: a miss completion that never gets a matching
+     * reinject within GVE_TX_WATCHDOG_MS indicates a device stall.
+     * The slot's pbuf is freed here to avoid a leak on reset. */
+    if (tx->pending_misses) {
+        timestamp now_ts  = now(CLOCK_ID_MONOTONIC);
+        timestamp deadline = milliseconds(GVE_TX_WATCHDOG_MS);
+        for (u32 i = 0; i <= tx->mask; i++) {
+            if (!tx->miss_times[i])
+                continue;
+            if (now_ts - tx->miss_times[i] <= deadline)
+                continue;
+            msg_err("GVE: DQO TX slot %d: miss not reinjected after %d ms, "
+                    "scheduling reset", i, GVE_TX_WATCHDOG_MS);
+            if (tx->pending[i]) {
+                pbuf_free(tx->pending[i]);
+                tx->pending[i] = NULL;
+            }
+            tx->miss_times[i] = 0;
+            tx->pending_misses--;
+            tx->stuck = true;
+            gve a = tx->adapter;
+            if (!a->resetting) {
+                a->resetting = true;
+                async_apply_bh((thunk)&a->reset_handler);
+            }
+            break;
+        }
     }
 }
 
@@ -125,6 +181,10 @@ err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p)
     tx->pending[last_slot]    = p;
     tx->seg_counts[last_slot] = (u16_t)seg_count;
 
+    tx->tx_stats.cnt++;
+    tx->tx_stats.bytes += p->tot_len;
+    adapter->hw_stats.tx_packets++;
+    adapter->hw_stats.tx_bytes += p->tot_len;
     write_barrier();
     pci_bar_write_4(&adapter->db_bar,
                     be32toh(tx->q_res->db_index) * sizeof(u32),
@@ -187,60 +247,71 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
   begin:
     gve_debug("DQO RX service compl_head %d", rx->compl_head);
 
-    while (1) {
-        u32 slot = rx->compl_head & rx->mask;
-        struct gve_rx_compl_desc_dqo *c = &rx->compl_ring[slot];
-        /* generation is bit 14 of pkt_len_gen (bytes 4-5). */
-        u8 gen = !!(c->pkt_len_gen & GVE_DQO_RX_GEN);
-        if (gen != rx->expected_gen)
-            break;
+    for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
+        int budget = GVE_RX_BUDGET;
+        for (; budget > 0; budget--) {
+            u32 slot = rx->compl_head & rx->mask;
+            struct gve_rx_compl_desc_dqo *c = &rx->compl_ring[slot];
+            u8 gen = !!(c->pkt_len_gen & GVE_DQO_RX_GEN);
+            if (gen != rx->expected_gen)
+                goto done;
 
-        if (c->err_flags & GVE_DQO_RX_ERR) {
-            gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
-            goto next;
-        }
-
-        u16_t pkt_len = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
-        u16_t buf_id  = c->buf_id & rx->mask;
-
-        if (pkt_len <= GVE_RX_PADDING)
-            goto next;
-        u16_t data_len = pkt_len - GVE_RX_PADDING;
-
-        void *virt_buf = (u8 *)rx->qpl_base +
-                         (u64)buf_id * GVE_DQO_BUF_SIZE;
-        void *payload  = (u8 *)virt_buf + GVE_RX_PADDING;
-
-        struct pbuf *pb = &rx->pbufs[buf_id];
-        struct pbuf *inp;
-        if (pb->ref == 1) {
-            /* Zero-copy: hand the pre-allocated PBUF_REF to lwIP. */
-            pb->payload   = payload;
-            pb->len       = pb->tot_len = data_len;
-            pbuf_ref(pb);
-            inp = pb;
-        } else {
-            /* Buffer still held by lwIP; fall back to copy. */
-            gve_debug("DQO RX: pbuf copy (ref %d)", pb->ref);
-            inp = pbuf_alloc(PBUF_RAW, data_len, PBUF_RAM);
-            if (inp) {
-                pbuf_take(inp, payload, data_len);
-            } else {
-                msg_err("%s: pbuf_alloc failed", func_ss);
-                goto next;
+            if (c->err_flags & GVE_DQO_RX_ERR) {
+                gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
+                rx->rx_stats.rx_dropped++;
+                goto advance;
             }
+
+            u16_t pkt_len = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
+            u16_t buf_id  = c->buf_id & rx->mask;
+
+            if (pkt_len <= GVE_RX_PADDING)
+                goto advance;
+            u16_t data_len = pkt_len - GVE_RX_PADDING;
+
+            void *virt_buf = (u8 *)rx->qpl_base +
+                             (u64)buf_id * GVE_DQO_BUF_SIZE;
+            void *payload  = (u8 *)virt_buf + GVE_RX_PADDING;
+
+            struct pbuf *pb = &rx->pbufs[buf_id];
+            struct pbuf *inp;
+            if (pb->ref == 1) {
+                pb->payload   = payload;
+                pb->len       = pb->tot_len = data_len;
+                pbuf_ref(pb);
+                inp = pb;
+            } else {
+                gve_debug("DQO RX: pbuf copy (ref %d)", pb->ref);
+                inp = pbuf_alloc(PBUF_RAW, data_len, PBUF_RAM);
+                if (inp) {
+                    pbuf_take(inp, payload, data_len);
+                    rx->rx_stats.rx_copy++;
+                } else {
+                    msg_err("%s: pbuf_alloc failed", func_ss);
+                    rx->rx_stats.rx_dropped++;
+                    goto advance;
+                }
+            }
+
+            {
+                err_t err = net_if->input(inp, net_if);
+                if (err != ERR_OK)
+                    pbuf_free(inp);
+            }
+
+            rx->rx_stats.cnt++;
+            rx->rx_stats.bytes += data_len;
+            adapter->hw_stats.rx_packets++;
+            adapter->hw_stats.rx_bytes += data_len;
+
+          advance:
+            rx->compl_head++;
+            if (!(rx->compl_head & rx->mask))
+                rx->expected_gen ^= 1;
         }
-
-        err_t err = net_if->input(inp, net_if);
-        if (err != ERR_OK)
-            pbuf_free(inp);
-
-      next:
-        rx->compl_head++;
-        if (!(rx->compl_head & rx->mask))
-            rx->expected_gen ^= 1;
+        /* budget exhausted: ring may have more — try again */
     }
-
+  done:
     gve_rx_dqo_fill(rx);
 
     if (!irq_acked) {

@@ -149,8 +149,10 @@ boolean gve_cfg_device_resources(gve adapter)
         adapter->raw_addressing ? GVE_GQI_RDA_FORMAT : GVE_GQI_QPL_FORMAT;
 
     boolean success = gve_adminq_execute_cmd(adapter, cmd);
-    if (success)
+    if (success) {
+        zero(&adapter->hw_stats, sizeof(adapter->hw_stats));
         return true;
+    }
 
     deallocate(adapter->contiguous, adapter->irq_db_indices, irq_db_size);
   err_evt:
@@ -293,6 +295,7 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
     tx->adapter         = adapter;
     tx->last_completion = now(CLOCK_ID_MONOTONIC);
     tx->stuck           = false;
+    zero(&tx->tx_stats, sizeof(tx->tx_stats));
     return true;
 
   err_after_q_res:
@@ -415,6 +418,7 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     rx->irq_db_index =
         &adapter->irq_db_indices[GVE_IRQ_DB_RX(nq, index)].index;
     rx->adapter = adapter;
+    zero(&rx->rx_stats, sizeof(rx->rx_stats));
 
     /* Init closures and fill initial RX buffers (gve_datapath.c). */
     gve_rx_init(rx);
@@ -496,6 +500,12 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
         goto err_seg_counts;
     zero(tx->seg_counts, desc_cnt * sizeof(*tx->seg_counts));
 
+    tx->miss_times = allocate(adapter->general,
+                              desc_cnt * sizeof(*tx->miss_times));
+    if (tx->miss_times == INVALID_ADDRESS)
+        goto err_miss;
+    zero(tx->miss_times, desc_cnt * sizeof(*tx->miss_times));
+
     tx->q_res = allocate(adapter->contiguous, sizeof(*tx->q_res));
     if (tx->q_res == INVALID_ADDRESS)
         goto err_q_res;
@@ -527,11 +537,16 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     tx->adapter          = adapter;
     tx->last_completion  = now(CLOCK_ID_MONOTONIC);
     tx->stuck            = false;
+    tx->pending_misses   = 0;
+    zero(&tx->tx_stats, sizeof(tx->tx_stats));
     return true;
 
   err_cmd:
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
   err_q_res:
+    deallocate(adapter->general, tx->miss_times,
+               desc_cnt * sizeof(*tx->miss_times));
+  err_miss:
     deallocate(adapter->general, tx->seg_counts,
                desc_cnt * sizeof(*tx->seg_counts));
   err_seg_counts:
@@ -560,6 +575,8 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
         if (tx->pending[i])
             pbuf_free(tx->pending[i]);
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+    deallocate(adapter->general,    tx->miss_times,
+               desc_cnt * sizeof(*tx->miss_times));
     deallocate(adapter->general,    tx->seg_counts,
                desc_cnt * sizeof(*tx->seg_counts));
     deallocate(adapter->general,    tx->pending,
@@ -631,6 +648,7 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     rx->adapter      = adapter;
     rx->irq_db_index =
         &adapter->irq_db_indices[GVE_IRQ_DB_RX(nq, index)].index;
+    zero(&rx->rx_stats, sizeof(rx->rx_stats));
 
     for (u32 i = 0; i < num_bufs; i++) {
         struct pbuf *pb = &rx->pbufs[i];
