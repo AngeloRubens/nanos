@@ -476,6 +476,11 @@ struct gve_hw_stats {
 #define GVE_TX_RESUME_THRESH    8      /* wake when >= this many HW slots free */
 #define GVE_TX_DOORBELL_BATCH   64     /* max packets per doorbell write */
 
+/* Ring size backoff: minimum ring size when allocation fails under memory
+ * pressure.  Must be a power-of-two; device-reported sizes are always
+ * powers-of-two so halving keeps the invariant. */
+#define GVE_MIN_RING_SIZE       64
+
 /* Adapter-level atomic flags (use atomic_test_and_set_bit / atomic_clear_bit). */
 #define GVE_FLAG_RESETTING      0      /* reset has been scheduled */
 #define GVE_FLAG_ONGOING_RESET  1      /* reset is actively running */

@@ -801,7 +801,7 @@ u32 gve_calc_num_queues(gve adapter, tuple config)
     return nq;
 }
 
-boolean gve_setup_queues(gve adapter)
+static boolean gve_try_setup_queues(gve adapter)
 {
     u32 nq = adapter->num_queues;
     u32 i;
@@ -845,6 +845,38 @@ boolean gve_setup_queues(gve adapter)
     for (u32 j = 0; j < i; j++)
         gve_destroy_tx_queue(adapter, &adapter->tx[j], j);
     return false;
+}
+
+/*
+ * gve_setup_queues — create all TX/RX queue pairs with ring-size backoff.
+ *
+ * If contiguous memory allocation fails, halve tx_desc_cnt / rx_desc_cnt
+ * (and the QPL page counts for GQI-QPL mode) and retry until we reach
+ * GVE_MIN_RING_SIZE.  This matches the ENA driver pattern and avoids
+ * probe failure under memory pressure at boot or after reset.
+ */
+boolean gve_setup_queues(gve adapter)
+{
+    for (;;) {
+        if (gve_try_setup_queues(adapter))
+            return true;
+
+        if (adapter->tx_desc_cnt <= GVE_MIN_RING_SIZE ||
+            adapter->rx_desc_cnt <= GVE_MIN_RING_SIZE) {
+            msg_err("GVE: queue alloc failed at minimum ring size "
+                    "(TX %u RX %u slots); giving up",
+                    adapter->tx_desc_cnt, adapter->rx_desc_cnt);
+            return false;
+        }
+
+        adapter->tx_desc_cnt      /= 2;
+        adapter->rx_desc_cnt      /= 2;
+        adapter->tx_pages_per_qpl /= 2;
+        adapter->rx_data_slot_cnt /= 2;
+        rprintf("GVE: ring alloc failed, retrying with "
+                "TX %u / RX %u slots\n",
+                adapter->tx_desc_cnt, adapter->rx_desc_cnt);
+    }
 }
 
 void gve_teardown_queues(gve adapter)
