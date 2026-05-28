@@ -43,8 +43,7 @@ static void gve_tx_fill_csum(struct pbuf *p, struct gve_tx_pkt_desc *pkt)
  * if (pending) guard is safe to remove. */
 static void gve_tx_cleanup_rda(gve_tx_queue tx)
 {
-    u32 tail = be32toh(
-        tx->adapter->event_counters[be32toh(tx->q_res->counter_index)]);
+    u32 tail = be32toh(tx->adapter->event_counters[tx->event_counter_idx]);
     int budget = GVE_TX_CLEAN_BUDGET;
     for (; tx->tail != tail && budget > 0; tx->tail++, budget--) {
         u32 slot = tx->tail & tx->mask;
@@ -56,8 +55,7 @@ static void gve_tx_cleanup_rda(gve_tx_queue tx)
 
 static void gve_tx_cleanup_qpl(gve_tx_queue tx)
 {
-    u32 tail = be32toh(
-        tx->adapter->event_counters[be32toh(tx->q_res->counter_index)]);
+    u32 tail = be32toh(tx->adapter->event_counters[tx->event_counter_idx]);
     gve_debug("TX tail %d -> %d, QPL used %d", tx->tail, tail,
               tx->qpl_used);
     int budget = GVE_TX_CLEAN_BUDGET;
