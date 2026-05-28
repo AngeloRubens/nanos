@@ -490,6 +490,16 @@ struct gve_hw_stats {
 #define GVE_TX_RESUME_THRESH    8      /* wake when >= this many HW slots free */
 #define GVE_TX_DOORBELL_BATCH   64     /* max packets per doorbell write */
 
+/* TX completion budget: maximum completions retired per gve_tx_cleanup call
+ * (matches ENA TX_BUDGET=128).  Bounds the time spent in a single cleanup
+ * invocation so that long completion bursts do not starve other BH work. */
+#define GVE_TX_CLEAN_BUDGET     128
+
+/* Watchdog queue rotation: number of TX/RX queue pairs checked per watchdog
+ * tick (matches ENA DEFAULT_TX_MONITORED_QUEUES=4).  A full pass over all
+ * queues completes in ceil(num_queues / GVE_TX_MONITORED_QUEUES) ticks. */
+#define GVE_TX_MONITORED_QUEUES 4
+
 /* Ring size backoff: minimum ring size when allocation fails under memory
  * pressure.  Must be a power-of-two; device-reported sizes are always
  * powers-of-two so halving keeps the invariant. */
@@ -701,6 +711,7 @@ typedef struct gve {
     struct spinlock global_lock;  /* held during full reset sequence */
     struct timer watchdog_timer;
     closure_struct(timer_handler, watchdog_task);
+    u32 next_monitored_tx_qid;   /* rotation cursor for watchdog TX/RX checks */
     struct gve_hw_stats hw_stats;
     struct gve_stats_dev dev_stats;
     u16 mtu;

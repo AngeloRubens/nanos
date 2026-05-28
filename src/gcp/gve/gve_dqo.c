@@ -33,7 +33,8 @@
  */
 static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
 {
-    while (1) {
+    int budget = GVE_TX_CLEAN_BUDGET;
+    while (budget-- > 0) {
         u32 slot = tx->compl_head & tx->mask;
         struct gve_tx_compl_desc_dqo *c = &tx->compl[slot];
 
