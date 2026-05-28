@@ -173,6 +173,30 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                     tx->stuck = true;
                     any_stuck = true;
                 }
+                /* Miss-reinject timeout: DQO MISS completions that never
+                 * get a matching REINJECT within GVE_TX_WATCHDOG_MS indicate
+                 * a device stall.  Checked here (watchdog) not in the hot
+                 * path (same split as ENA check_missing_comp_in_tx_queue). */
+                if (tx->pending_misses) {
+                    for (u32 mi = 0; mi <= tx->mask; mi++) {
+                        if (!tx->miss_times[mi])
+                            continue;
+                        if (now_ts - tx->miss_times[mi] <= deadline)
+                            continue;
+                        msg_err("GVE: DQO TX queue %d slot %u: miss not "
+                                "reinjected after %d ms, scheduling reset",
+                                ri, mi, GVE_TX_WATCHDOG_MS);
+                        if (tx->pending[mi]) {
+                            pbuf_free(tx->pending[mi]);
+                            tx->pending[mi] = NULL;
+                        }
+                        tx->miss_times[mi] = 0;
+                        tx->pending_misses--;
+                        tx->stuck = true;
+                        any_stuck = true;
+                        break;
+                    }
+                }
             }
             gve_rx_dqo_queue rx = &adapter->rx_dqo[ri];
             if (rx->first_interrupt) {

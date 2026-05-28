@@ -496,11 +496,16 @@ static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
     /* Wait for any in-flight RX pbufs held by lwIP to be released.
      * NETIF_FLAG_UP was cleared by gve_reset before this point; any
      * gve_rx_service BH that passed the UP check will complete its
-     * current pass and exit on the next check (same assumption as ENA). */
+     * current pass and exit on the next check.  Bound the wait: lwIP
+     * may hold refs in a TCP receive buffer, but reset is more important
+     * than a clean drain.  After 1000 iterations log and proceed. */
     for (u32 i = 0; i < rx->qpl_count; i++) {
         struct pbuf *pb = &rx->pbufs[i];
-        while (pb->ref > 1)
+        for (int retries = 1000; pb->ref > 1 && retries > 0; retries--)
             read_barrier();
+        if (pb->ref > 1)
+            msg_err("GVE: RX teardown: pbuf[%u] still held (ref %d), "
+                    "proceeding", i, (int)pb->ref);
     }
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
@@ -773,12 +778,16 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
-    /* Wait for in-flight lwIP refs to drop (same assumption as ENA:
-     * NETIF_FLAG_UP already cleared, any racing BH will exit on next check). */
+    /* Wait for in-flight lwIP refs to drop.  NETIF_FLAG_UP is already
+     * cleared; any racing BH will exit on its next UP check.  Bound
+     * the wait: after 1000 iterations log and proceed rather than hang. */
     for (u32 i = 0; i < num_bufs; i++) {
         struct pbuf *pb = &rx->pbufs[i];
-        while (pb->ref > 1)
+        for (int retries = 1000; pb->ref > 1 && retries > 0; retries--)
             read_barrier();
+        if (pb->ref > 1)
+            msg_err("GVE: DQO RX teardown: pbuf[%u] still held (ref %d), "
+                    "proceeding", i, (int)pb->ref);
     }
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));

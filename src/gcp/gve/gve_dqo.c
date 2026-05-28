@@ -99,31 +99,6 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
         if (!(tx->compl_head & tx->mask))
             tx->expected_gen ^= 1;
     }
-
-    /* Per-packet watchdog: a miss completion that never gets a matching
-     * reinject within GVE_TX_WATCHDOG_MS indicates a device stall.
-     * The slot's pbuf is freed here to avoid a leak on reset. */
-    if (tx->pending_misses) {
-        timestamp now_ts  = now(CLOCK_ID_MONOTONIC);
-        timestamp deadline = milliseconds(GVE_TX_WATCHDOG_MS);
-        for (u32 i = 0; i <= tx->mask; i++) {
-            if (!tx->miss_times[i])
-                continue;
-            if (now_ts - tx->miss_times[i] <= deadline)
-                continue;
-            msg_err("GVE: DQO TX slot %d: miss not reinjected after %d ms, "
-                    "scheduling reset", i, GVE_TX_WATCHDOG_MS);
-            if (tx->pending[i]) {
-                pbuf_free(tx->pending[i]);
-                tx->pending[i] = NULL;
-            }
-            tx->miss_times[i] = 0;
-            tx->pending_misses--;
-            tx->stuck = true;
-            gve_trigger_reset(tx->adapter);
-            break;
-        }
-    }
 }
 
 /* gve_tx_dqo_fill_csum — DQO wrapper around gve_pseudo_csum (gve_priv.h).
