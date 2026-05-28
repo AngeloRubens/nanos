@@ -47,6 +47,7 @@ static void gve_tx_cleanup_rda(gve_tx_queue tx)
         tx->adapter->event_counters[be32toh(tx->q_res->counter_index)]);
     for (; tx->tail != tail; tx->tail++) {
         u32 slot = tx->tail & tx->mask;
+        tx->tx_timestamps[slot] = 0;
         pbuf_free(tx->pending[slot]);
         tx->pending[slot] = NULL;
     }
@@ -58,8 +59,11 @@ static void gve_tx_cleanup_qpl(gve_tx_queue tx)
         tx->adapter->event_counters[be32toh(tx->q_res->counter_index)]);
     gve_debug("TX tail %d -> %d, QPL used %d", tx->tail, tail,
               tx->qpl_used);
-    for (; tx->tail != tail; tx->tail++)
-        tx->qpl_used -= tx->qpl_allocated[tx->tail & tx->mask];
+    for (; tx->tail != tail; tx->tail++) {
+        u32 slot = tx->tail & tx->mask;
+        tx->tx_timestamps[slot] = 0;
+        tx->qpl_used -= tx->qpl_allocated[slot];
+    }
 }
 
 /*
@@ -119,6 +123,7 @@ static boolean gve_tx_write_qpl(gve_tx_queue tx, struct pbuf *p)
     pkt->l4_csum_offset = 0;
     pkt->l4_hdr_offset  = 0;
     gve_tx_fill_csum(p, pkt);
+    tx->tx_timestamps[slot] = now(CLOCK_ID_MONOTONIC);
 
     u32 offset;
     gve_tx_qpl_cpy(tx, p, &offset, &tx->qpl_allocated[slot]);
@@ -131,14 +136,16 @@ static boolean gve_tx_write_qpl(gve_tx_queue tx, struct pbuf *p)
     pkt->seg_addr = htobe64(offset);
 
     for (struct pbuf *q = p->next; q != NULL; q = q->next) {
+        u32 seg_slot = tx->head & tx->mask;
         u32 seg_off;
-        gve_tx_qpl_cpy(tx, q, &seg_off,
-                       &tx->qpl_allocated[tx->head & tx->mask]);
-        tx->qpl_used += tx->qpl_allocated[tx->head & tx->mask];
-        struct gve_tx_seg_desc *seg = &tx->desc[tx->head++ & tx->mask].seg;
+        gve_tx_qpl_cpy(tx, q, &seg_off, &tx->qpl_allocated[seg_slot]);
+        tx->qpl_used += tx->qpl_allocated[seg_slot];
+        tx->tx_timestamps[seg_slot] = now(CLOCK_ID_MONOTONIC);
+        struct gve_tx_seg_desc *seg = &tx->desc[seg_slot].seg;
         seg->type_flags = GVE_TXD_SEG;
         seg->seg_len    = htobe16(q->len);
         seg->seg_addr   = htobe64(seg_off);
+        tx->head++;
     }
     return true;
 }
@@ -160,8 +167,10 @@ static boolean gve_tx_write_rda(gve_tx_queue tx, struct pbuf *p)
     if (tx->head - tx->tail + seg_count > adapter->tx_desc_cnt)
         return false;
 
-    struct gve_tx_pkt_desc *pkt = &tx->desc[tx->head & tx->mask].pkt;
-    tx->pending[tx->head & tx->mask] = p;  /* uses the ref from br-enqueue */
+    u32 pkt_slot = tx->head & tx->mask;
+    struct gve_tx_pkt_desc *pkt = &tx->desc[pkt_slot].pkt;
+    tx->pending[pkt_slot]    = p;  /* uses the ref from br-enqueue */
+    tx->tx_timestamps[pkt_slot] = now(CLOCK_ID_MONOTONIC);
     tx->head++;
 
     pkt->type_flags     = GVE_TXD_STD;
@@ -175,40 +184,29 @@ static boolean gve_tx_write_rda(gve_tx_queue tx, struct pbuf *p)
 
     for (struct pbuf *q = p->next; q != NULL; q = q->next) {
         pbuf_ref(q);  /* each segment slot owns an independent ref */
-        struct gve_tx_seg_desc *seg = &tx->desc[tx->head & tx->mask].seg;
-        tx->pending[tx->head & tx->mask] = q;
-        tx->head++;
+        u32 seg_slot = tx->head & tx->mask;
+        tx->pending[seg_slot]       = q;
+        tx->tx_timestamps[seg_slot] = now(CLOCK_ID_MONOTONIC);
+        struct gve_tx_seg_desc *seg = &tx->desc[seg_slot].seg;
         seg->type_flags = GVE_TXD_SEG;
         seg->seg_len    = htobe16(q->len);
         seg->seg_addr   = htobe64(physical_from_virtual(q->payload));
+        tx->head++;
     }
     return true;
 }
 
 /*
- * gve_tx_start_xmit_gqi — drain the software TX queue into the GQI HW ring.
- *
- * Retires completions, then drains tx->br into the HW ring until empty or
- * HW ring full.  Doorbells are batched (GVE_TX_DOORBELL_BATCH) to amortize
- * PCI transaction overhead.
- *
- * Stop/wakeup: when the HW ring is full the queue is marked stopped
- * (running=false); the watchdog reschedules this drain once enough slots
- * are free (via async_apply_bh on enqueue_task).
+ * gve_tx_drain_gqi — drain the GQI software TX queue into the HW ring.
+ * Must be called with tx->ring_mtx held (same ownership model as ENA).
  */
-static void gve_tx_start_xmit_gqi(gve_tx_queue tx)
+static void gve_tx_drain_gqi(gve_tx_queue tx)
 {
     gve adapter = tx->adapter;
     boolean qpl = !adapter->raw_addressing;
-    spin_lock(&tx->ring_mtx);
 
-    /* Bail if a reset is tearing down this queue.  A stale enqueue_task BH
-     * may fire after gve_destroy_tx_queue releases ring_mtx; the ONGOING_RESET
-     * flag is set before teardown and cleared only after new queues are up. */
-    if (adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET)) {
-        spin_unlock(&tx->ring_mtx);
+    if (adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET))
         return;
-    }
 
     if (qpl)
         gve_tx_cleanup_qpl(tx);
@@ -217,10 +215,8 @@ static void gve_tx_start_xmit_gqi(gve_tx_queue tx)
 
     if (!tx->running) {
         u32 free = adapter->tx_desc_cnt - (tx->head - tx->tail);
-        if (free < GVE_TX_RESUME_THRESH) {
-            spin_unlock(&tx->ring_mtx);
+        if (free < GVE_TX_RESUME_THRESH)
             return;
-        }
         tx->running = true;
         tx->tx_stats.queue_wakeup++;
         memory_barrier();
@@ -240,7 +236,7 @@ static void gve_tx_start_xmit_gqi(gve_tx_queue tx)
             break;
         }
         if (qpl)
-            pbuf_free(p);  /* QPL data copied; release our ref */
+            pbuf_free(p);
 
         tx->tx_stats.cnt++;
         tx->tx_stats.bytes += tot_len;
@@ -264,19 +260,21 @@ static void gve_tx_start_xmit_gqi(gve_tx_queue tx)
         tx->tx_stats.doorbells++;
     }
     tx->acum_pkts = 0;
-    spin_unlock(&tx->ring_mtx);
 }
 
 closure_func_basic(thunk, void, gve_tx_enqueue_gqi)
 {
     gve_tx_queue tx = struct_from_field(closure_self(),
                                         gve_tx_queue, enqueue_task);
-    gve_tx_start_xmit_gqi(tx);
+    spin_lock(&tx->ring_mtx);
+    gve_tx_drain_gqi(tx);
+    spin_unlock(&tx->ring_mtx);
 }
 
 /* gve_linkoutput_gqi — GQI linkoutput (handles both QPL and RDA formats).
- * Enqueues the pbuf to the per-queue software ring; actual HW-ring write
- * happens asynchronously in gve_tx_start_xmit_gqi via BH. */
+ * Fast path: if the software ring was empty and the lock is free, drain
+ * inline without scheduling a BH (same pattern as ENA ena_linkoutput).
+ * Slow path: enqueue and schedule the enqueue_task BH. */
 static err_t gve_linkoutput_gqi(struct netif *netif, struct pbuf *p)
 {
     gve adapter = netif->state;
@@ -286,12 +284,16 @@ static err_t gve_linkoutput_gqi(struct netif *netif, struct pbuf *p)
     gve_tx_queue tx = &adapter->tx[qidx];
     if (tx->stuck)
         return ERR_IF;
-    pbuf_ref(p);
-    if (!enqueue(tx->br, p)) {
-        pbuf_free(p);
+    boolean is_empty = queue_empty(tx->br);
+    if (!enqueue(tx->br, p))
         return ERR_MEM;
+    pbuf_ref(p);
+    if (is_empty && spin_try(&tx->ring_mtx)) {
+        gve_tx_drain_gqi(tx);
+        spin_unlock(&tx->ring_mtx);
+    } else {
+        async_apply_bh((thunk)&tx->enqueue_task);
     }
-    async_apply_bh((thunk)&tx->enqueue_task);
     return ERR_OK;
 }
 
@@ -362,8 +364,9 @@ closure_func_basic(thunk, void, gve_rx_service)
     if (!(net_if->flags & NETIF_FLAG_UP))
         return;
     boolean irq_acked = false;
-    spin_lock(&rx->lock);
   begin:
+    if (!(net_if->flags & NETIF_FLAG_UP))
+        return;
     gve_debug("GQI RX service tail %d", rx->tail);
 
     for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
@@ -434,15 +437,12 @@ closure_func_basic(thunk, void, gve_rx_service)
         memory_barrier();
         goto begin;
     }
-    spin_unlock(&rx->lock);
 }
 
-/* gve_rx_init: called from gve_adminq.c after the queue is allocated.
- * Initialises the service closure and the per-queue spinlock. */
+/* gve_rx_init: called from gve_adminq.c after the queue is allocated. */
 void gve_rx_init(gve_rx_queue rx)
 {
     init_closure_func(&rx->service, thunk, gve_rx_service);
-    spin_lock_init(&rx->lock);
 }
 
 /* gve_tx_init_gqi: called from gve_adminq.c after a GQI TX queue is

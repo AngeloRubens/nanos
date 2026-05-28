@@ -268,9 +268,15 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
     if (tx->q_res == INVALID_ADDRESS)
         goto err_after_desc;
 
+    tx->tx_timestamps = allocate(adapter->general,
+                                  adapter->tx_desc_cnt * sizeof(*tx->tx_timestamps));
+    if (tx->tx_timestamps == INVALID_ADDRESS)
+        goto err_after_q_res;
+    zero(tx->tx_timestamps, adapter->tx_desc_cnt * sizeof(*tx->tx_timestamps));
+
     tx->br = allocate_queue(adapter->general, GVE_BUF_RING_SIZE);
     if (tx->br == INVALID_ADDRESS)
-        goto err_after_q_res;
+        goto err_after_timestamps;
 
     struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
     cmd->opcode = htobe32(GVE_ADMINQ_CREATE_TX_QUEUE);
@@ -297,7 +303,6 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
         tx->qpl_size = adapter->tx_pages_per_qpl * PAGESIZE;
     }
     tx->adapter           = adapter;
-    tx->last_completion   = now(CLOCK_ID_MONOTONIC);
     tx->stuck             = false;
     tx->running           = true;
     tx->acum_pkts         = 0;
@@ -308,6 +313,9 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
 
   err_after_br:
     deallocate_queue(tx->br);
+  err_after_timestamps:
+    deallocate(adapter->general, tx->tx_timestamps,
+               adapter->tx_desc_cnt * sizeof(*tx->tx_timestamps));
   err_after_q_res:
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
   err_after_desc:
@@ -347,6 +355,8 @@ static void gve_destroy_tx_queue(gve adapter, gve_tx_queue tx,
     deallocate_queue(tx->br);
 
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+    deallocate(adapter->general, tx->tx_timestamps,
+               adapter->tx_desc_cnt * sizeof(*tx->tx_timestamps));
     deallocate(adapter->contiguous, tx->desc,
                adapter->tx_desc_cnt * sizeof(*tx->desc));
     if (adapter->raw_addressing) {
@@ -450,6 +460,7 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     rx->first_interrupt        = false;
     rx->no_interrupt_event_cnt = 0;
     rx->empty_rx_queue         = 0;
+    rx->event_counter_idx      = be32toh(rx->q_res->counter_index);
     gve_rx_fill(rx);
     return true;
 
@@ -482,21 +493,15 @@ static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
-    /* Wait for any in-flight RX pbufs held by lwIP's TCP stack to be
-     * released.  Must NOT hold rx->lock here: gve_rx_service holds the
-     * lock while it passes pbufs to lwIP, and lwIP may keep a ref until
-     * the application reads the socket — spinning with the lock held
-     * would deadlock against the application. */
+    /* Wait for any in-flight RX pbufs held by lwIP to be released.
+     * NETIF_FLAG_UP was cleared by gve_reset before this point; any
+     * gve_rx_service BH that passed the UP check will complete its
+     * current pass and exit on the next check (same assumption as ENA). */
     for (u32 i = 0; i < rx->qpl_count; i++) {
         struct pbuf *pb = &rx->pbufs[i];
         while (pb->ref > 1)
             read_barrier();
     }
-
-    /* Take rx->lock to exclude any gve_rx_service BH that passed the
-     * NETIF_FLAG_UP check (cleared by gve_reset) before we got here.
-     * Once we hold the lock we know no service is touching ring memory. */
-    spin_lock(&rx->lock);
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
     deallocate(adapter->contiguous, rx->data,
@@ -511,8 +516,6 @@ static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
     else
         gve_destroy_qpl(adapter, rx->qpl_base,
                         adapter->rx_data_slot_cnt, nq + index);
-
-    spin_unlock(&rx->lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -557,9 +560,15 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     if (tx->q_res == INVALID_ADDRESS)
         goto err_q_res;
 
+    tx->tx_timestamps = allocate(adapter->general,
+                                  desc_cnt * sizeof(*tx->tx_timestamps));
+    if (tx->tx_timestamps == INVALID_ADDRESS)
+        goto err_after_q_res;
+    zero(tx->tx_timestamps, desc_cnt * sizeof(*tx->tx_timestamps));
+
     tx->br = allocate_queue(adapter->general, GVE_BUF_RING_SIZE);
     if (tx->br == INVALID_ADDRESS)
-        goto err_br;
+        goto err_timestamps;
 
     struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
     cmd->opcode = htobe32(GVE_ADMINQ_CREATE_TX_QUEUE);
@@ -586,7 +595,6 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     tx->compl_head       = 0;
     tx->expected_gen     = 1;  /* device writes gen=1 on first pass */
     tx->adapter          = adapter;
-    tx->last_completion  = now(CLOCK_ID_MONOTONIC);
     tx->stuck            = false;
     tx->running          = true;
     tx->acum_pkts        = 0;
@@ -597,7 +605,10 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
 
   err_cmd:
     deallocate_queue(tx->br);
-  err_br:
+  err_timestamps:
+    deallocate(adapter->general, tx->tx_timestamps,
+               desc_cnt * sizeof(*tx->tx_timestamps));
+  err_after_q_res:
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
   err_q_res:
     deallocate(adapter->general, tx->miss_times,
@@ -640,6 +651,8 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
         if (tx->pending[i])
             pbuf_free(tx->pending[i]);
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+    deallocate(adapter->general,    tx->tx_timestamps,
+               desc_cnt * sizeof(*tx->tx_timestamps));
     deallocate(adapter->general,    tx->miss_times,
                desc_cnt * sizeof(*tx->miss_times));
     deallocate(adapter->general,    tx->seg_counts,
@@ -760,16 +773,13 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
-    /* Wait for in-flight lwIP refs (without lock — see GQI equivalent). */
+    /* Wait for in-flight lwIP refs to drop (same assumption as ENA:
+     * NETIF_FLAG_UP already cleared, any racing BH will exit on next check). */
     for (u32 i = 0; i < num_bufs; i++) {
         struct pbuf *pb = &rx->pbufs[i];
         while (pb->ref > 1)
             read_barrier();
     }
-
-    /* Take lock to exclude any gve_rx_dqo_service BH that passed the
-     * NETIF_FLAG_UP check before gve_reset cleared it. */
-    spin_lock(&rx->lock);
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
     deallocate(adapter->contiguous, rx->compl_ring,
@@ -780,8 +790,6 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
                num_bufs * sizeof(*rx->pbufs));
     deallocate(adapter->contiguous, rx->qpl_base,
                num_bufs * GVE_DQO_BUF_SIZE);
-
-    spin_unlock(&rx->lock);
 }
 
 /* ------------------------------------------------------------------ */

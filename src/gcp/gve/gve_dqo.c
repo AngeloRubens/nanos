@@ -60,12 +60,16 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
                     gve_trigger_reset(tx->adapter);
                     break;
                 }
-                tx->desc_tail += tx->seg_counts[tag];
+                /* Clear per-slot timestamps for all descriptor slots retired
+                 * by this completion (EOP slot at tag, working backwards). */
+                u16_t seg_cnt = tx->seg_counts[tag];
+                for (u16_t k = 0; k < seg_cnt; k++)
+                    tx->tx_timestamps[(u16_t)(tag - k) & tx->mask] = 0;
+                tx->desc_tail += seg_cnt;
                 if (tx->pending[tag]) {
                     pbuf_free(tx->pending[tag]);
                     tx->pending[tag] = NULL;
                 }
-                tx->last_completion = now(CLOCK_ID_MONOTONIC);
             }
         } else if (type == GVE_DQO_COMPL_TYPE_MISS) {
             u16_t tag = c->completion_tag & tx->mask;
@@ -75,7 +79,10 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             }
         } else if (type == GVE_DQO_COMPL_TYPE_REINJECT) {
             u16_t tag = c->completion_tag & tx->mask;
-            tx->desc_tail += tx->seg_counts[tag];
+            u16_t seg_cnt = tx->seg_counts[tag];
+            for (u16_t k = 0; k < seg_cnt; k++)
+                tx->tx_timestamps[(u16_t)(tag - k) & tx->mask] = 0;
+            tx->desc_tail += seg_cnt;
             if (tx->pending[tag]) {
                 pbuf_free(tx->pending[tag]);
                 tx->pending[tag] = NULL;
@@ -84,7 +91,6 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
                 tx->miss_times[tag] = 0;
                 tx->pending_misses--;
             }
-            tx->last_completion = now(CLOCK_ID_MONOTONIC);
         }
 
         tx->compl_head++;
@@ -164,8 +170,9 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
             last_slot = slot;
         }
 
-        tx->pending[slot]    = NULL;
-        tx->seg_counts[slot] = 0;
+        tx->pending[slot]       = NULL;
+        tx->seg_counts[slot]    = 0;
+        tx->tx_timestamps[slot] = now(CLOCK_ID_MONOTONIC);
         tx->head++;
     }
     tx->pending[last_slot]    = p;    /* ref from br-enqueue */
@@ -174,27 +181,22 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
 }
 
 /*
- * gve_tx_start_xmit_dqo — drain the software TX queue into the DQO HW ring.
- * Same stop/wakeup and doorbell-batching logic as gve_tx_start_xmit_gqi.
+ * gve_tx_drain_dqo — drain the DQO software TX queue into the HW ring.
+ * Must be called with tx->ring_mtx held (same ownership model as ENA).
  */
-static void gve_tx_start_xmit_dqo(gve_tx_dqo_queue tx)
+static void gve_tx_drain_dqo(gve_tx_dqo_queue tx)
 {
     gve adapter = tx->adapter;
-    spin_lock(&tx->ring_mtx);
 
-    if (adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET)) {
-        spin_unlock(&tx->ring_mtx);
+    if (adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET))
         return;
-    }
 
     gve_tx_dqo_cleanup(tx);
 
     if (!tx->running) {
         u32 free = (tx->mask + 1) - (tx->head - tx->desc_tail);
-        if (free < GVE_TX_RESUME_THRESH) {
-            spin_unlock(&tx->ring_mtx);
+        if (free < GVE_TX_RESUME_THRESH)
             return;
-        }
         tx->running = true;
         tx->tx_stats.queue_wakeup++;
         memory_barrier();
@@ -234,14 +236,15 @@ static void gve_tx_start_xmit_dqo(gve_tx_dqo_queue tx)
         tx->tx_stats.doorbells++;
     }
     tx->acum_pkts = 0;
-    spin_unlock(&tx->ring_mtx);
 }
 
 closure_func_basic(thunk, void, gve_tx_enqueue_dqo)
 {
     gve_tx_dqo_queue tx = struct_from_field(closure_self(),
                                             gve_tx_dqo_queue, enqueue_task);
-    gve_tx_start_xmit_dqo(tx);
+    spin_lock(&tx->ring_mtx);
+    gve_tx_drain_dqo(tx);
+    spin_unlock(&tx->ring_mtx);
 }
 
 err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p)
@@ -253,12 +256,16 @@ err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p)
     gve_tx_dqo_queue tx = &adapter->tx_dqo[qidx];
     if (tx->stuck)
         return ERR_IF;
-    pbuf_ref(p);
-    if (!enqueue(tx->br, p)) {
-        pbuf_free(p);
+    boolean is_empty = queue_empty(tx->br);
+    if (!enqueue(tx->br, p))
         return ERR_MEM;
+    pbuf_ref(p);
+    if (is_empty && spin_try(&tx->ring_mtx)) {
+        gve_tx_drain_dqo(tx);
+        spin_unlock(&tx->ring_mtx);
+    } else {
+        async_apply_bh((thunk)&tx->enqueue_task);
     }
-    async_apply_bh((thunk)&tx->enqueue_task);
     return ERR_OK;
 }
 
@@ -321,8 +328,9 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
     if (!(net_if->flags & NETIF_FLAG_UP))
         return;
     boolean irq_acked = false;
-    spin_lock(&rx->lock);
   begin:
+    if (!(net_if->flags & NETIF_FLAG_UP))
+        return;
     gve_debug("DQO RX service compl_head %d", rx->compl_head);
 
     for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
@@ -405,13 +413,11 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
         memory_barrier();
         goto begin;
     }
-    spin_unlock(&rx->lock);
 }
 
 void gve_rx_dqo_init(gve_rx_dqo_queue rx)
 {
     init_closure_func(&rx->service, thunk, gve_rx_dqo_service);
-    spin_lock_init(&rx->lock);
 }
 
 /* gve_tx_init_dqo: called from gve_adminq.c after a DQO TX queue is

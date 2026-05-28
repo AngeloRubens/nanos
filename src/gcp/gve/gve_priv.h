@@ -72,9 +72,18 @@
  */
 #define GVE_MAX_IO_QUEUES   16
 
-/* Watchdog: if TX event counter does not advance for this many ms,
- * declare the queue stuck and stop transmitting on it. */
-#define GVE_TX_WATCHDOG_MS  5000
+/* Watchdog: if a TX descriptor slot has been outstanding for this many ms
+ * with no completion, declare the queue stuck and schedule a reset. */
+#define GVE_TX_WATCHDOG_MS          5000
+
+/* Watchdog timer fires at this interval (matches ENA 1-second cadence).
+ * Decoupled from GVE_TX_WATCHDOG_MS so the deadline and polling frequency
+ * can be tuned independently. */
+#define GVE_WATCHDOG_INTERVAL_MS    1000
+
+/* If this many consecutive watchdog ticks pass without an RX interrupt,
+ * the MSI-X vector may have been lost — schedule a reset. */
+#define GVE_MAX_NO_INTERRUPT_ITERATIONS  3
 
 /* Cacheline boundary used for QPL copy padding.
  * DEFAULT_CACHELINE_SIZE is 64 on both x86_64 and aarch64 in nanos.
@@ -523,10 +532,13 @@ typedef struct gve_tx_queue {
 
     struct gve_stats_tx tx_stats;
 
-    /* Watchdog: timestamp of last successful TX event-counter advance */
-    timestamp last_completion;
-    boolean   stuck;
-    u32       event_counter_idx;  /* cached from q_res->counter_index at create */
+    /* Watchdog: per-slot submission timestamp (same model as ENA tx_buf->timestamp).
+     * Set when a descriptor slot is posted; cleared on completion.
+     * Watchdog iterates outstanding slots [tail, head) and flags any slot
+     * whose age exceeds GVE_TX_WATCHDOG_MS. */
+    timestamp *tx_timestamps;
+    boolean    stuck;
+    u32        event_counter_idx;  /* cached from q_res->counter_index at create */
 
     /* Software TX queue (buf_ring pattern, same as ENA). */
     queue            br;          /* software queue absorbs burst when HW ring full */
@@ -537,7 +549,6 @@ typedef struct gve_tx_queue {
 } *gve_tx_queue;
 
 typedef struct gve_rx_queue {
-    struct spinlock lock;
     u32 head, tail;
     u32 qpl_head, qpl_available;
     u64 rda_base_phys;  /* RDA: physical_from_virtual(qpl_base); 0 in QPL mode */
@@ -559,6 +570,7 @@ typedef struct gve_rx_queue {
     boolean first_interrupt;      /* set to true on first IRQ arrival */
     u16   no_interrupt_event_cnt; /* increments if completions arrive but no IRQ */
     int   empty_rx_queue;         /* consecutive watchdog ticks with ring empty */
+    u32   event_counter_idx;      /* cached from q_res->counter_index at create */
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -598,8 +610,9 @@ typedef struct gve_tx_dqo_queue {
 
     struct gve_stats_tx tx_stats;
 
-    timestamp last_completion;
-    boolean   stuck;
+    /* Watchdog: per-slot submission timestamp (same model as GQI above). */
+    timestamp *tx_timestamps;
+    boolean    stuck;
 
     queue            br;
     boolean          running;
@@ -618,7 +631,6 @@ typedef struct gve_tx_dqo_queue {
  * expected_gen tracks generation bit convention.
  */
 typedef struct gve_rx_dqo_queue {
-    struct spinlock lock;
     u32  buf_head;           /* next buf_ring slot to post */
     u32  compl_head;         /* next compl_ring entry to consume */
     u8   expected_gen;       /* expected generation bit */

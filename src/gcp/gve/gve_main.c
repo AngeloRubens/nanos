@@ -147,18 +147,25 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
     boolean   any_stuck = false;
 
     if (adapter->dqo) {
+        /* Per-slot TX stuck detection (same model as ENA check_missing_comp_in_tx_queue):
+         * iterate all outstanding descriptor slots; flag any slot whose submission
+         * timestamp exceeds GVE_TX_WATCHDOG_MS. */
         for (u32 i = 0; i < adapter->num_queues; i++) {
             gve_tx_dqo_queue tx = &adapter->tx_dqo[i];
             if (tx->stuck)
                 continue;
-            /* Pending: head != desc_tail (descriptor slots still in flight) */
-            if (tx->head == tx->desc_tail)
-                continue;
-            if (now_ts - tx->last_completion > deadline) {
-                msg_err("GVE: DQO TX queue %d stuck (%d ms), "
-                        "scheduling reset", i, GVE_TX_WATCHDOG_MS);
-                tx->stuck = true;
-                any_stuck = true;
+            for (u32 s = tx->desc_tail; s != tx->head; s++) {
+                timestamp ts = tx->tx_timestamps[s & tx->mask];
+                if (!ts)
+                    continue;  /* non-EOP slot or already retired */
+                if (now_ts - ts > deadline) {
+                    msg_err("GVE: DQO TX queue %d slot %u stuck (%d ms), "
+                            "scheduling reset", i, s & tx->mask,
+                            GVE_TX_WATCHDOG_MS);
+                    tx->stuck = true;
+                    any_stuck = true;
+                    break;
+                }
             }
         }
         /* Wakeup: stopped DQO TX queues with pending packets that have not
@@ -182,6 +189,30 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                 async_apply_bh((thunk)&rx->service);
             }
         }
+        /* Interrupt-miss detection (ENA check_for_rx_interrupt_queue):
+         * if first_interrupt not set for GVE_MAX_NO_INTERRUPT_ITERATIONS ticks
+         * AND the CQ has a pending completion (gen bit matches expected), the
+         * MSI-X vector may be lost — schedule a reset.
+         * CQ-empty guard mirrors ena_com_cq_empty to avoid spurious resets
+         * when the adapter is idle. */
+        for (u32 i = 0; i < adapter->num_queues; i++) {
+            gve_rx_dqo_queue rx = &adapter->rx_dqo[i];
+            if (rx->first_interrupt) {
+                rx->first_interrupt = false;
+                rx->no_interrupt_event_cnt = 0;
+            } else {
+                u32 slot = rx->compl_head & rx->mask;
+                u8 gen = !!(rx->compl_ring[slot].pkt_len_gen & GVE_DQO_RX_GEN);
+                if (gen != rx->expected_gen)
+                    continue;  /* CQ empty — no pending completions, no miss */
+                if (++rx->no_interrupt_event_cnt > GVE_MAX_NO_INTERRUPT_ITERATIONS) {
+                    msg_err("GVE: DQO RX queue %d: no interrupt after %d "
+                            "watchdog ticks, scheduling reset", i,
+                            GVE_MAX_NO_INTERRUPT_ITERATIONS);
+                    gve_trigger_reset(adapter);
+                }
+            }
+        }
     } else {
         for (u32 i = 0; i < adapter->num_queues; i++) {
             /* Re-check flags each iteration: event_counters and q_res are
@@ -195,19 +226,19 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
             gve_tx_queue tx = &adapter->tx[i];
             if (tx->stuck)
                 continue;
-            if (tx->head == tx->tail)
-                continue;
-            /* Use cached event_counter_idx (set at queue create) to avoid
-             * dereferencing tx->q_res, which is freed during teardown. */
-            u32 tail = be32toh(
-                adapter->event_counters[tx->event_counter_idx]);
-            if (tail != tx->tail) {
-                tx->last_completion = now_ts;
-            } else if (now_ts - tx->last_completion > deadline) {
-                msg_err("GVE: TX queue %d stuck (%d ms), "
-                        "scheduling reset", i, GVE_TX_WATCHDOG_MS);
-                tx->stuck = true;
-                any_stuck = true;
+            /* Per-slot timestamp check (same model as ENA). */
+            for (u32 s = tx->tail; s != tx->head; s++) {
+                timestamp ts = tx->tx_timestamps[s & tx->mask];
+                if (!ts)
+                    continue;  /* seg descriptor or already retired */
+                if (now_ts - ts > deadline) {
+                    msg_err("GVE: TX queue %d slot %u stuck (%d ms), "
+                            "scheduling reset", i, s & tx->mask,
+                            GVE_TX_WATCHDOG_MS);
+                    tx->stuck = true;
+                    any_stuck = true;
+                    break;
+                }
             }
         }
         /* Wakeup: stopped GQI TX queues with pending packets. */
@@ -216,7 +247,7 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
             if (tx->stuck || tx->running)
                 continue;
             u32 hw_tail = be32toh(
-                adapter->event_counters[be32toh(tx->q_res->counter_index)]);
+                adapter->event_counters[tx->event_counter_idx]);
             u32 free = adapter->tx_desc_cnt - (tx->head - hw_tail);
             if (free >= GVE_TX_RESUME_THRESH)
                 async_apply_bh((thunk)&tx->enqueue_task);
@@ -227,6 +258,27 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                 rx->rx_stats.empty_rx_ring++;
                 rx->empty_rx_queue = 0;
                 async_apply_bh((thunk)&rx->service);
+            }
+        }
+        /* Interrupt-miss detection for GQI RX (ENA check_for_rx_interrupt_queue).
+         * CQ-empty guard: if the event counter has not advanced past rx->tail,
+         * the device has no pending completions — no miss possible. */
+        for (u32 i = 0; i < adapter->num_queues; i++) {
+            gve_rx_queue rx = &adapter->rx[i];
+            if (rx->first_interrupt) {
+                rx->first_interrupt = false;
+                rx->no_interrupt_event_cnt = 0;
+            } else {
+                u32 hw_tail = be32toh(
+                    adapter->event_counters[rx->event_counter_idx]);
+                if (hw_tail == rx->tail)
+                    continue;  /* CQ empty — event counter not advanced, no miss */
+                if (++rx->no_interrupt_event_cnt > GVE_MAX_NO_INTERRUPT_ITERATIONS) {
+                    msg_err("GVE: RX queue %d: no interrupt after %d "
+                            "watchdog ticks, scheduling reset", i,
+                            GVE_MAX_NO_INTERRUPT_ITERATIONS);
+                    gve_trigger_reset(adapter);
+                }
             }
         }
     }
@@ -345,8 +397,8 @@ static boolean gve_init(gve adapter, tuple config)
         goto err3;
     }
 
-    /* Start TX completion watchdog (fires every GVE_TX_WATCHDOG_MS/2). */
-    timestamp watchdog_interval = milliseconds(GVE_TX_WATCHDOG_MS / 2);
+    /* Start TX completion watchdog (fires every GVE_WATCHDOG_INTERVAL_MS). */
+    timestamp watchdog_interval = milliseconds(GVE_WATCHDOG_INTERVAL_MS);
     init_timer(&adapter->watchdog_timer);
     register_timer(kernel_timers, &adapter->watchdog_timer,
                    CLOCK_ID_MONOTONIC, watchdog_interval, false,
