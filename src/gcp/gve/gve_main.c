@@ -147,25 +147,31 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
     boolean   any_stuck = false;
 
     if (adapter->dqo) {
-        /* Per-slot TX stuck detection (same model as ENA check_missing_comp_in_tx_queue):
-         * iterate all outstanding descriptor slots; flag any slot whose submission
-         * timestamp exceeds GVE_TX_WATCHDOG_MS. */
+        /* Per-slot TX stuck detection (ENA check_missing_comp_in_tx_queue):
+         * count slots past GVE_TX_WATCHDOG_MS; reset only when the count
+         * exceeds GVE_TX_STUCK_THRESHOLD (same as ENA DEFAULT_TX_CMP_THRESHOLD).
+         * Counting all stuck slots before deciding avoids spurious resets
+         * from transient single-slot stalls. */
         for (u32 i = 0; i < adapter->num_queues; i++) {
             gve_tx_dqo_queue tx = &adapter->tx_dqo[i];
             if (tx->stuck)
                 continue;
+            u32 missed_tx = 0;
             for (u32 s = tx->desc_tail; s != tx->head; s++) {
                 timestamp ts = tx->tx_timestamps[s & tx->mask];
                 if (!ts)
                     continue;  /* non-EOP slot or already retired */
                 if (now_ts - ts > deadline) {
-                    msg_err("GVE: DQO TX queue %d slot %u stuck (%d ms), "
-                            "scheduling reset", i, s & tx->mask,
-                            GVE_TX_WATCHDOG_MS);
-                    tx->stuck = true;
-                    any_stuck = true;
-                    break;
+                    tx->tx_stats.missing_tx_comp++;
+                    missed_tx++;
                 }
+            }
+            if (missed_tx > GVE_TX_STUCK_THRESHOLD) {
+                msg_err("GVE: DQO TX queue %d: %u stuck completions "
+                        "(threshold %u), scheduling reset",
+                        i, missed_tx, GVE_TX_STUCK_THRESHOLD);
+                tx->stuck = true;
+                any_stuck = true;
             }
         }
         /* Wakeup: stopped DQO TX queues with pending packets that have not
@@ -226,19 +232,24 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
             gve_tx_queue tx = &adapter->tx[i];
             if (tx->stuck)
                 continue;
-            /* Per-slot timestamp check (same model as ENA). */
+            /* Per-slot timestamp check (ENA check_missing_comp_in_tx_queue):
+             * count timed-out slots; reset only above GVE_TX_STUCK_THRESHOLD. */
+            u32 missed_tx = 0;
             for (u32 s = tx->tail; s != tx->head; s++) {
                 timestamp ts = tx->tx_timestamps[s & tx->mask];
                 if (!ts)
                     continue;  /* seg descriptor or already retired */
                 if (now_ts - ts > deadline) {
-                    msg_err("GVE: TX queue %d slot %u stuck (%d ms), "
-                            "scheduling reset", i, s & tx->mask,
-                            GVE_TX_WATCHDOG_MS);
-                    tx->stuck = true;
-                    any_stuck = true;
-                    break;
+                    tx->tx_stats.missing_tx_comp++;
+                    missed_tx++;
                 }
+            }
+            if (missed_tx > GVE_TX_STUCK_THRESHOLD) {
+                msg_err("GVE: TX queue %d: %u stuck completions "
+                        "(threshold %u), scheduling reset",
+                        i, missed_tx, GVE_TX_STUCK_THRESHOLD);
+                tx->stuck = true;
+                any_stuck = true;
             }
         }
         /* Wakeup: stopped GQI TX queues with pending packets. */

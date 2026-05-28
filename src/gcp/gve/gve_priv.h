@@ -85,6 +85,11 @@
  * the MSI-X vector may have been lost — schedule a reset. */
 #define GVE_MAX_NO_INTERRUPT_ITERATIONS  3
 
+/* Number of per-slot TX timeouts required to trigger a reset.
+ * Matches ENA DEFAULT_TX_CMP_THRESHOLD: avoids spurious resets from
+ * transient single-slot stalls; requires sustained queue exhaustion. */
+#define GVE_TX_STUCK_THRESHOLD          128
+
 /* Cacheline boundary used for QPL copy padding.
  * DEFAULT_CACHELINE_SIZE is 64 on both x86_64 and aarch64 in nanos.
  * On GCP Axion (128-byte cacheline) bump this define if needed. */
