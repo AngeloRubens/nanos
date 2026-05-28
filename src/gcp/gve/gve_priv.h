@@ -330,6 +330,10 @@ struct gve_tx_compl_desc_dqo {
     u32 reserved;
 } __attribute__((packed));
 
+/* Alternate miss completion encoding: hardware may set bit 15 of
+ * completion_tag instead of using type=GVE_DQO_COMPL_TYPE_MISS. */
+#define GVE_DQO_ALT_MISS_COMPL_BIT  0x8000u  /* bit 15 of completion_tag */
+
 #define GVE_DQO_COMPL_GEN_BIT       0x8000u  /* bit 15 of id_type_gen */
 #define GVE_DQO_COMPL_TYPE_SHIFT    11       /* type field in bits[13:11] */
 #define GVE_DQO_COMPL_TYPE_PKT      0x2u     /* normal packet completion */
@@ -436,9 +440,13 @@ struct gve_rx_desc {
 /* ------------------------------------------------------------------ */
 
 struct gve_stats_tx {
-    u64 cnt;            /* packets sent */
-    u64 bytes;          /* bytes sent */
-    u64 bad_compl_tag;  /* completion with invalid/unexpected tag */
+    u64 cnt;              /* packets sent */
+    u64 bytes;            /* bytes sent */
+    u64 bad_compl_tag;    /* completion with invalid/unexpected tag */
+    u64 queue_stop;       /* times TX ring stopped (HW ring full) */
+    u64 queue_wakeup;     /* times TX ring woken after stop */
+    u64 missing_tx_comp;  /* packets past completion deadline */
+    u64 doorbells;        /* doorbell writes issued */
 };
 
 struct gve_stats_rx {
@@ -446,6 +454,13 @@ struct gve_stats_rx {
     u64 bytes;          /* bytes received */
     u64 rx_copy;        /* packets received via copy path */
     u64 rx_dropped;     /* packets dropped (error or alloc failure) */
+    u64 refil_partial;  /* RX refill posted fewer buffers than requested */
+    u64 empty_rx_ring;  /* watchdog-triggered refill (ring fully empty) */
+    u64 bad_req_id;     /* completion with out-of-range buffer id */
+};
+
+struct gve_stats_dev {
+    u64 wd_expired;     /* watchdog-triggered resets */
 };
 
 struct gve_hw_stats {
@@ -454,6 +469,16 @@ struct gve_hw_stats {
     u64 rx_bytes;
     u64 tx_bytes;
 };
+
+/* TX software queue constants (buf_ring pattern, same as ENA). */
+#define GVE_BUF_RING_SIZE       4096   /* software TX queue depth */
+#define GVE_TX_STOP_THRESH      4      /* stop when < this many HW slots free */
+#define GVE_TX_RESUME_THRESH    8      /* wake when >= this many HW slots free */
+#define GVE_TX_DOORBELL_BATCH   64     /* max packets per doorbell write */
+
+/* Adapter-level atomic flags (use atomic_test_and_set_bit / atomic_clear_bit). */
+#define GVE_FLAG_RESETTING      0      /* reset has been scheduled */
+#define GVE_FLAG_ONGOING_RESET  1      /* reset is actively running */
 
 /* ------------------------------------------------------------------ */
 /* GQI per-queue structs                                                */
@@ -496,6 +521,13 @@ typedef struct gve_tx_queue {
     /* Watchdog: timestamp of last successful TX event-counter advance */
     timestamp last_completion;
     boolean   stuck;
+
+    /* Software TX queue (buf_ring pattern, same as ENA). */
+    queue            br;          /* software queue absorbs burst when HW ring full */
+    boolean          running;     /* false = HW ring full, drain paused */
+    u32              acum_pkts;   /* packets batched since last doorbell */
+    struct spinlock  ring_mtx;
+    closure_struct(thunk, enqueue_task);
 } *gve_tx_queue;
 
 typedef struct gve_rx_queue {
@@ -516,6 +548,11 @@ typedef struct gve_rx_queue {
     struct gve_queue_resources *q_res;
 
     struct gve_stats_rx rx_stats;
+
+    /* Watchdog: MSIX miss and empty-ring detection (same as ENA). */
+    boolean first_interrupt;      /* set to true on first IRQ arrival */
+    u16   no_interrupt_event_cnt; /* increments if completions arrive but no IRQ */
+    int   empty_rx_queue;         /* consecutive watchdog ticks with ring empty */
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -557,6 +594,12 @@ typedef struct gve_tx_dqo_queue {
 
     timestamp last_completion;
     boolean   stuck;
+
+    queue            br;
+    boolean          running;
+    u32              acum_pkts;
+    struct spinlock  ring_mtx;
+    closure_struct(thunk, enqueue_task);
 } *gve_tx_dqo_queue;
 
 /*
@@ -591,6 +634,10 @@ typedef struct gve_rx_dqo_queue {
     struct gve_queue_resources *q_res;
 
     struct gve_stats_rx rx_stats;
+
+    boolean first_interrupt;
+    u16   no_interrupt_event_cnt;
+    int   empty_rx_queue;
 } *gve_rx_dqo_queue;
 
 /* ------------------------------------------------------------------ */
@@ -626,13 +673,22 @@ typedef struct gve {
     closure_struct(thunk, mgmt_irq_handler);
     closure_struct(thunk, link_up_task);
     closure_struct(thunk, link_down_task);
-    closure_struct(thunk, reset_handler);  /* deferred reset from watchdog */
-    boolean resetting;
+    closure_struct(thunk, reset_handler);
+    u64 flags;                    /* GVE_FLAG_* bits, accessed atomically */
+    struct spinlock global_lock;  /* held during full reset sequence */
     struct timer watchdog_timer;
     closure_struct(timer_handler, watchdog_task);
     struct gve_hw_stats hw_stats;
+    struct gve_stats_dev dev_stats;
     u16 mtu;
 } *gve;
+
+/* Schedule a reset exactly once; subsequent callers are no-ops. */
+static inline void gve_trigger_reset(gve adapter)
+{
+    if (!atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_RESETTING))
+        async_apply_bh((thunk)&adapter->reset_handler);
+}
 
 /* ------------------------------------------------------------------ */
 /* Checksum offload shared helper                                       */
@@ -722,8 +778,10 @@ void    gve_teardown_queues(gve adapter);
 void  gve_setup_linkoutput(gve adapter, struct netif *netif);
 void  gve_rx_fill(gve_rx_queue rx);
 void  gve_rx_init(gve_rx_queue rx);
+void  gve_tx_init_gqi(gve_tx_queue tx);
 
 /* gve_dqo.c */
 err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p);
 void  gve_rx_dqo_fill(gve_rx_dqo_queue rx);
 void  gve_rx_dqo_init(gve_rx_dqo_queue rx);
+void  gve_tx_init_dqo(gve_tx_dqo_queue tx);

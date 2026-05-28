@@ -45,23 +45,28 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
 
         u8 type = (u8)((itg >> GVE_DQO_COMPL_TYPE_SHIFT) & 0x7);  /* bits[13:11] */
         if (type == GVE_DQO_COMPL_TYPE_PKT) {
-            u16_t tag = c->completion_tag & tx->mask;
-            if (!tx->seg_counts[tag]) {
-                msg_err("GVE: DQO TX invalid completion tag %u", tag);
-                tx->tx_stats.bad_compl_tag++;
-                gve a = tx->adapter;
-                if (!a->resetting) {
-                    a->resetting = true;
-                    async_apply_bh((thunk)&a->reset_handler);
+            /* Alternate-miss encoding: type=PKT but bit 15 of completion_tag set. */
+            if (c->completion_tag & GVE_DQO_ALT_MISS_COMPL_BIT) {
+                u16_t tag = c->completion_tag & tx->mask;
+                if (!tx->miss_times[tag]) {
+                    tx->miss_times[tag] = now(CLOCK_ID_MONOTONIC);
+                    tx->pending_misses++;
                 }
-                break;
+            } else {
+                u16_t tag = c->completion_tag & tx->mask;
+                if (!tx->seg_counts[tag]) {
+                    msg_err("GVE: DQO TX invalid completion tag %u", tag);
+                    tx->tx_stats.bad_compl_tag++;
+                    gve_trigger_reset(tx->adapter);
+                    break;
+                }
+                tx->desc_tail += tx->seg_counts[tag];
+                if (tx->pending[tag]) {
+                    pbuf_free(tx->pending[tag]);
+                    tx->pending[tag] = NULL;
+                }
+                tx->last_completion = now(CLOCK_ID_MONOTONIC);
             }
-            tx->desc_tail += tx->seg_counts[tag];
-            if (tx->pending[tag]) {
-                pbuf_free(tx->pending[tag]);
-                tx->pending[tag] = NULL;
-            }
-            tx->last_completion = now(CLOCK_ID_MONOTONIC);
         } else if (type == GVE_DQO_COMPL_TYPE_MISS) {
             u16_t tag = c->completion_tag & tx->mask;
             if (!tx->miss_times[tag]) {
@@ -108,11 +113,7 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             tx->miss_times[i] = 0;
             tx->pending_misses--;
             tx->stuck = true;
-            gve a = tx->adapter;
-            if (!a->resetting) {
-                a->resetting = true;
-                async_apply_bh((thunk)&a->reset_handler);
-            }
+            gve_trigger_reset(tx->adapter);
             break;
         }
     }
@@ -130,32 +131,22 @@ static void gve_tx_dqo_fill_csum(struct pbuf *p,
     desc->dtype_flags |= GVE_DQO_TX_CSUM_EN;
 }
 
-err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p)
+/*
+ * gve_tx_write_dqo — post one pbuf chain as DQO TX descriptors.
+ * Must be called with tx->ring_mtx held.
+ * p->ref has already been bumped by the br-enqueue caller; that ref
+ * transfers to pending[eop_slot].
+ * Returns true on success; false if descriptor space exhausted.
+ */
+static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
 {
-    gve adapter = netif->state;
-    u32 qidx = current_cpu()->id % adapter->num_queues;
-    gve_tx_dqo_queue tx = &adapter->tx_dqo[qidx];
-
-    if (tx->stuck)
-        return ERR_IF;
-
-    gve_tx_dqo_cleanup(tx);
-
-    /* Count segments and check for descriptor space.
-     * Space is tracked via desc_tail (descriptor slots retired), not
-     * compl_head (completions consumed), so multi-segment packets are
-     * accounted correctly. */
     int seg_count = 0;
     for (struct pbuf *q = p; q != NULL; q = q->next)
         seg_count++;
     if (tx->head - tx->desc_tail + seg_count > (u32)(tx->mask + 1))
-        return ERR_MEM;
+        return false;
 
-    /* Reference the chain head; released in gve_tx_dqo_cleanup via
-     * the EOP slot's compl_tag. */
-    pbuf_ref(p);
     u32 last_slot = 0;
-
     for (struct pbuf *q = p; q != NULL; q = q->next) {
         u32 slot = tx->head & tx->mask;
         struct gve_tx_pkt_desc_dqo *desc = &tx->desc[slot];
@@ -173,22 +164,96 @@ err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p)
             last_slot = slot;
         }
 
-        tx->pending[slot]    = NULL;  /* only EOP slot gets the pbuf */
-        tx->seg_counts[slot] = 0;     /* only EOP slot stores seg_count */
+        tx->pending[slot]    = NULL;
+        tx->seg_counts[slot] = 0;
         tx->head++;
     }
-    /* EOP slot carries the pbuf chain and the segment count for cleanup. */
-    tx->pending[last_slot]    = p;
+    tx->pending[last_slot]    = p;    /* ref from br-enqueue */
     tx->seg_counts[last_slot] = (u16_t)seg_count;
+    return true;
+}
 
-    tx->tx_stats.cnt++;
-    tx->tx_stats.bytes += p->tot_len;
-    adapter->hw_stats.tx_packets++;
-    adapter->hw_stats.tx_bytes += p->tot_len;
-    write_barrier();
-    pci_bar_write_4(&adapter->db_bar,
-                    be32toh(tx->q_res->db_index) * sizeof(u32),
-                    htobe32(tx->head));
+/*
+ * gve_tx_start_xmit_dqo — drain the software TX queue into the DQO HW ring.
+ * Same stop/wakeup and doorbell-batching logic as gve_tx_start_xmit_gqi.
+ */
+static void gve_tx_start_xmit_dqo(gve_tx_dqo_queue tx)
+{
+    gve adapter = tx->adapter;
+    spin_lock(&tx->ring_mtx);
+
+    gve_tx_dqo_cleanup(tx);
+
+    if (!tx->running) {
+        u32 free = (tx->mask + 1) - (tx->head - tx->desc_tail);
+        if (free < GVE_TX_RESUME_THRESH) {
+            spin_unlock(&tx->ring_mtx);
+            return;
+        }
+        tx->running = true;
+        tx->tx_stats.queue_wakeup++;
+        memory_barrier();
+    }
+
+    u32 pkts = 0;
+    struct pbuf *p;
+    while ((p = dequeue(tx->br)) != INVALID_ADDRESS) {
+        u16_t tot_len = p->tot_len;
+        if (!gve_tx_write_dqo(tx, p)) {
+            enqueue(tx->br, p);
+            tx->running = false;
+            tx->tx_stats.queue_stop++;
+            memory_barrier();
+            break;
+        }
+
+        tx->tx_stats.cnt++;
+        tx->tx_stats.bytes += tot_len;
+        adapter->hw_stats.tx_packets++;
+        adapter->hw_stats.tx_bytes += tot_len;
+
+        if (++pkts >= GVE_TX_DOORBELL_BATCH) {
+            write_barrier();
+            pci_bar_write_4(&adapter->db_bar,
+                            be32toh(tx->q_res->db_index) * sizeof(u32),
+                            htobe32(tx->head));
+            tx->tx_stats.doorbells++;
+            pkts = 0;
+        }
+    }
+    if (pkts > 0) {
+        write_barrier();
+        pci_bar_write_4(&adapter->db_bar,
+                        be32toh(tx->q_res->db_index) * sizeof(u32),
+                        htobe32(tx->head));
+        tx->tx_stats.doorbells++;
+    }
+    tx->acum_pkts = 0;
+    spin_unlock(&tx->ring_mtx);
+}
+
+closure_func_basic(thunk, void, gve_tx_enqueue_dqo)
+{
+    gve_tx_dqo_queue tx = struct_from_field(closure_self(),
+                                            gve_tx_dqo_queue, enqueue_task);
+    gve_tx_start_xmit_dqo(tx);
+}
+
+err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p)
+{
+    gve adapter = netif->state;
+    if (!(netif->flags & NETIF_FLAG_UP))
+        return ERR_IF;
+    u32 qidx = current_cpu()->id % adapter->num_queues;
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[qidx];
+    if (tx->stuck)
+        return ERR_IF;
+    pbuf_ref(p);
+    if (!enqueue(tx->br, p)) {
+        pbuf_free(p);
+        return ERR_MEM;
+    }
+    async_apply_bh((thunk)&tx->enqueue_task);
     return ERR_OK;
 }
 
@@ -233,6 +298,12 @@ void gve_rx_dqo_fill(gve_rx_dqo_queue rx)
         pci_bar_write_4(&adapter->db_bar,
                         be32toh(rx->q_res->db_index) * sizeof(u32),
                         htobe32(rx->buf_head));
+        rx->empty_rx_queue = 0;
+    } else if (((rx->buf_head + 1) & rx->mask) !=
+               (rx->compl_head & rx->mask)) {
+        /* Ring not full but couldn't post: lwIP holds all buffers.
+         * Watchdog uses this counter to detect the deadlock. */
+        rx->empty_rx_queue++;
     }
 }
 
@@ -242,19 +313,24 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                                             gve_rx_dqo_queue, service);
     gve adapter = rx->adapter;
     struct netif *net_if = &adapter->ndev.n;
+    if (!(net_if->flags & NETIF_FLAG_UP))
+        return;
     boolean irq_acked = false;
     spin_lock(&rx->lock);
   begin:
     gve_debug("DQO RX service compl_head %d", rx->compl_head);
 
     for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
+        boolean no_more = false;
         int budget = GVE_RX_BUDGET;
         for (; budget > 0; budget--) {
             u32 slot = rx->compl_head & rx->mask;
             struct gve_rx_compl_desc_dqo *c = &rx->compl_ring[slot];
             u8 gen = !!(c->pkt_len_gen & GVE_DQO_RX_GEN);
-            if (gen != rx->expected_gen)
-                goto done;
+            if (gen != rx->expected_gen) {
+                no_more = true;
+                break;
+            }
 
             if (c->err_flags & GVE_DQO_RX_ERR) {
                 gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
@@ -309,10 +385,12 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
             if (!(rx->compl_head & rx->mask))
                 rx->expected_gen ^= 1;
         }
-        /* budget exhausted: ring may have more — try again */
+        /* Post new buffer descriptors after each budget pass so the device
+         * always has free buffers — avoids RX starvation under high load. */
+        gve_rx_dqo_fill(rx);
+        if (no_more)
+            break;
     }
-  done:
-    gve_rx_dqo_fill(rx);
 
     if (!irq_acked) {
         pci_bar_write_4(&adapter->db_bar,
@@ -329,4 +407,12 @@ void gve_rx_dqo_init(gve_rx_dqo_queue rx)
 {
     init_closure_func(&rx->service, thunk, gve_rx_dqo_service);
     spin_lock_init(&rx->lock);
+}
+
+/* gve_tx_init_dqo: called from gve_adminq.c after a DQO TX queue is
+ * allocated.  Initialises the enqueue_task closure and ring spinlock. */
+void gve_tx_init_dqo(gve_tx_dqo_queue tx)
+{
+    init_closure_func(&tx->enqueue_task, thunk, gve_tx_enqueue_dqo);
+    spin_lock_init(&tx->ring_mtx);
 }

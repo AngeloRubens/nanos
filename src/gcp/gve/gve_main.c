@@ -62,6 +62,7 @@ closure_func_basic(thunk, void, gve_rx_irq)
     gve_debug("GQI RX irq");
     gve_rx_queue rx = struct_from_field(closure_self(),
                                         gve_rx_queue, irq_handler);
+    rx->first_interrupt = true;
     async_apply_bh((thunk)&rx->service);
     /* interrupts remain masked until ack in gve_rx_service */
 }
@@ -71,6 +72,7 @@ closure_func_basic(thunk, void, gve_rx_dqo_irq)
     gve_debug("DQO RX irq");
     gve_rx_dqo_queue rx = struct_from_field(closure_self(),
                                             gve_rx_dqo_queue, irq_handler);
+    rx->first_interrupt = true;
     async_apply_bh((thunk)&rx->service);
 }
 
@@ -90,28 +92,35 @@ closure_func_basic(thunk, void, gve_reset)
     gve adapter = struct_from_field(closure_self(), gve, reset_handler);
     rprintf("GVE: starting adapter reset\n");
 
+    spin_lock(&adapter->global_lock);
+    atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET);
+
     gve_teardown_queues(adapter);
     gve_free_device_resources(adapter);
 
     if (!gve_cfg_device_resources(adapter)) {
         msg_err("GVE: reset: failed to reconfigure device resources");
-        adapter->resetting = false;
-        return;
+        goto done;
     }
     if (!gve_setup_queues(adapter)) {
         msg_err("GVE: reset: failed to recreate queues");
         gve_free_device_resources(adapter);
-        adapter->resetting = false;
-        return;
+        goto done;
     }
 
-    adapter->resetting = false;
     rprintf("GVE: adapter reset complete\n");
-    u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
-    if (status & GVE_DEVICE_STATUS_LINK_STATUS)
-        async_apply_bh((thunk)&adapter->link_up_task);
-    else
-        async_apply_bh((thunk)&adapter->link_down_task);
+    {
+        u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
+        if (status & GVE_DEVICE_STATUS_LINK_STATUS)
+            async_apply_bh((thunk)&adapter->link_up_task);
+        else
+            async_apply_bh((thunk)&adapter->link_down_task);
+    }
+
+  done:
+    atomic_clear_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET);
+    atomic_clear_bit(&adapter->flags, GVE_FLAG_RESETTING);
+    spin_unlock(&adapter->global_lock);
 }
 
 closure_func_basic(timer_handler, void, gve_watchdog_task,
@@ -121,7 +130,9 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
         return;
 
     gve adapter = struct_from_closure(gve, watchdog_task);
-    if (adapter->resetting)
+    read_barrier();
+    if (adapter->flags & ((1ULL << GVE_FLAG_RESETTING) |
+                          (1ULL << GVE_FLAG_ONGOING_RESET)))
         return;
 
     timestamp deadline = milliseconds(GVE_TX_WATCHDOG_MS);
@@ -143,6 +154,27 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                 any_stuck = true;
             }
         }
+        /* Wakeup: stopped DQO TX queues with pending packets that have not
+         * been restarted by new incoming traffic. */
+        for (u32 i = 0; i < adapter->num_queues; i++) {
+            gve_tx_dqo_queue tx = &adapter->tx_dqo[i];
+            if (tx->stuck || tx->running)
+                continue;
+            u32 free = (tx->mask + 1) - (tx->head - tx->desc_tail);
+            if (free >= GVE_TX_RESUME_THRESH)
+                async_apply_bh((thunk)&tx->enqueue_task);
+        }
+        /* Empty-ring detection: if fill posted nothing for several ticks,
+         * the device has no buffers and will send no interrupts — deadlock.
+         * Force a service run to attempt refill. */
+        for (u32 i = 0; i < adapter->num_queues; i++) {
+            gve_rx_dqo_queue rx = &adapter->rx_dqo[i];
+            if (rx->empty_rx_queue > 2) {
+                rx->rx_stats.empty_rx_ring++;
+                rx->empty_rx_queue = 0;
+                async_apply_bh((thunk)&rx->service);
+            }
+        }
     } else {
         for (u32 i = 0; i < adapter->num_queues; i++) {
             gve_tx_queue tx = &adapter->tx[i];
@@ -161,11 +193,30 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                 any_stuck = true;
             }
         }
+        /* Wakeup: stopped GQI TX queues with pending packets. */
+        for (u32 i = 0; i < adapter->num_queues; i++) {
+            gve_tx_queue tx = &adapter->tx[i];
+            if (tx->stuck || tx->running)
+                continue;
+            u32 hw_tail = be32toh(
+                adapter->event_counters[be32toh(tx->q_res->counter_index)]);
+            u32 free = adapter->tx_desc_cnt - (tx->head - hw_tail);
+            if (free >= GVE_TX_RESUME_THRESH)
+                async_apply_bh((thunk)&tx->enqueue_task);
+        }
+        for (u32 i = 0; i < adapter->num_queues; i++) {
+            gve_rx_queue rx = &adapter->rx[i];
+            if (rx->empty_rx_queue > 2) {
+                rx->rx_stats.empty_rx_ring++;
+                rx->empty_rx_queue = 0;
+                async_apply_bh((thunk)&rx->service);
+            }
+        }
     }
 
     if (any_stuck) {
-        adapter->resetting = true;
-        async_apply_bh((thunk)&adapter->reset_handler);
+        adapter->dev_stats.wd_expired++;
+        gve_trigger_reset(adapter);
     }
 }
 
@@ -247,7 +298,8 @@ static boolean gve_init(gve adapter, tuple config)
     init_closure_func(&adapter->link_up_task, thunk, gve_link_up_task);
     init_closure_func(&adapter->link_down_task, thunk, gve_link_down_task);
     init_closure_func(&adapter->reset_handler, thunk, gve_reset);
-    adapter->resetting = false;
+    adapter->flags = 0;
+    spin_lock_init(&adapter->global_lock);
     adapter->adminq_head = 0;
     adapter->adminq_mask =
         PAGESIZE / sizeof(struct gve_adminq_command) - 1;

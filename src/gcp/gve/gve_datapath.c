@@ -39,7 +39,7 @@ static void gve_tx_fill_csum(struct pbuf *p, struct gve_tx_pkt_desc *pkt)
 /* gve_tx_cleanup_rda / _qpl: retire completed TX descriptors.
  * Split by format so there is no raw_addressing branch in the hot path.
  * In RDA mode every retired slot has a non-NULL pending pbuf (set
- * unconditionally in gve_linkoutput_rda before tx->head++), so the
+ * unconditionally in gve_tx_write_rda before tx->head++), so the
  * if (pending) guard is safe to remove. */
 static void gve_tx_cleanup_rda(gve_tx_queue tx)
 {
@@ -89,22 +89,15 @@ static void gve_tx_qpl_cpy(gve_tx_queue tx, struct pbuf *p,
         tx->qpl_head = 0;
 }
 
-static err_t gve_linkoutput_qpl(struct netif *netif, struct pbuf *p)
+/*
+ * gve_tx_write_qpl — copy one pbuf chain into the QPL ring and post
+ * descriptors.  Must be called with tx->ring_mtx held.
+ * p->ref has already been bumped by the br-enqueue caller.
+ * Returns true on success; false if descriptor or QPL space exhausted.
+ */
+static boolean gve_tx_write_qpl(gve_tx_queue tx, struct pbuf *p)
 {
-    gve adapter = netif->state;
-    u32 qidx = current_cpu()->id % adapter->num_queues;
-    gve_tx_queue tx = &adapter->tx[qidx];
-
-    if (tx->stuck)
-        return ERR_IF;
-
-    gve_tx_cleanup_qpl(tx);
-
-    /* Pre-flight: count segments and required QPL bytes.
-     * Mirrors gve_tx_qpl_cpy wrap logic: when a segment does not fit in
-     * the contiguous tail of the ring, the tail fragment is wasted and
-     * the copy restarts from offset 0.  Account for both the wasted tail
-     * (remain) and the segment itself (padded). */
+    gve adapter = tx->adapter;
     int  seg_count  = 0;
     u32  qpl_needed = 0;
     for (struct pbuf *q = p; q != NULL; q = q->next) {
@@ -114,21 +107,18 @@ static err_t gve_linkoutput_qpl(struct netif *netif, struct pbuf *p)
         qpl_needed  += (padded > remain) ? padded + remain : padded;
         seg_count++;
     }
-
     if ((tx->head - tx->tail + seg_count > adapter->tx_desc_cnt) ||
             (tx->qpl_used + qpl_needed > tx->qpl_size))
-        return ERR_MEM;
+        return false;
 
     /* Seed pseudo-header checksum in the pbuf BEFORE the QPL copy so that
-     * the updated checksum field lands in the QPL bounce buffer the device
-     * will DMA-read. gve_tx_fill_csum also records the offload fields in
-     * the descriptor. */
+     * the updated checksum field lands in the QPL bounce buffer. */
     u32 slot = tx->head & tx->mask;
     struct gve_tx_pkt_desc *pkt = &tx->desc[slot].pkt;
     pkt->type_flags     = GVE_TXD_STD;
     pkt->l4_csum_offset = 0;
     pkt->l4_hdr_offset  = 0;
-    gve_tx_fill_csum(p, pkt);  /* may update p->payload checksum field */
+    gve_tx_fill_csum(p, pkt);
 
     u32 offset;
     gve_tx_qpl_cpy(tx, p, &offset, &tx->qpl_allocated[slot]);
@@ -145,58 +135,33 @@ static err_t gve_linkoutput_qpl(struct netif *netif, struct pbuf *p)
         gve_tx_qpl_cpy(tx, q, &seg_off,
                        &tx->qpl_allocated[tx->head & tx->mask]);
         tx->qpl_used += tx->qpl_allocated[tx->head & tx->mask];
-
         struct gve_tx_seg_desc *seg = &tx->desc[tx->head++ & tx->mask].seg;
         seg->type_flags = GVE_TXD_SEG;
         seg->seg_len    = htobe16(q->len);
         seg->seg_addr   = htobe64(seg_off);
     }
-
-    tx->tx_stats.cnt++;
-    tx->tx_stats.bytes += p->tot_len;
-    adapter->hw_stats.tx_packets++;
-    adapter->hw_stats.tx_bytes += p->tot_len;
-    write_barrier();
-    pci_bar_write_4(&adapter->db_bar,
-                    be32toh(tx->q_res->db_index) * sizeof(u32),
-                    htobe32(tx->head));
-    return ERR_OK;
+    return true;
 }
 
 /*
- * GQI-RDA TX path: seg_addr is the physical address of the pbuf payload.
- * No QPL copy — the device DMA-reads directly from the pbuf memory.
- *
- * Each segment pbuf (including chain elements q = p->next) gets its own
- * pbuf_ref(), not just the chain head.  Cleanup retires slots individually
- * via pbuf_free(pending[slot]), so each slot must hold an independent
- * reference.  If only the head were ref'd, cleanup's pbuf_free(q) would
- * bring q->ref to 0 and free q while p->next still points to it, causing
- * a use-after-free when lwIP later frees the chain.  lwIP's pbuf_free()
- * stops cascade propagation as soon as ref > 0, so the double-decrement
- * (cleanup then lwIP) is safe.
+ * gve_tx_write_rda — post one pbuf chain as GQI-RDA descriptors.
+ * Must be called with tx->ring_mtx held.
+ * p->ref has already been bumped by the br-enqueue caller; that ref
+ * transfers to pending[head_slot].  Each segment (p->next, ...) gets an
+ * additional pbuf_ref for its own pending slot.
+ * Returns true on success; false if descriptor space exhausted.
  */
-static err_t gve_linkoutput_rda(struct netif *netif, struct pbuf *p)
+static boolean gve_tx_write_rda(gve_tx_queue tx, struct pbuf *p)
 {
-    gve adapter = netif->state;
-    u32 qidx = current_cpu()->id % adapter->num_queues;
-    gve_tx_queue tx = &adapter->tx[qidx];
-
-    if (tx->stuck)
-        return ERR_IF;
-
-    gve_tx_cleanup_rda(tx);
-
+    gve adapter = tx->adapter;
     int seg_count = 0;
-    for (struct pbuf *q = p; q != NULL; q = q->next)
+    for (struct pbuf *q = p; q; q = q->next)
         seg_count++;
-
     if (tx->head - tx->tail + seg_count > adapter->tx_desc_cnt)
-        return ERR_MEM;
+        return false;
 
     struct gve_tx_pkt_desc *pkt = &tx->desc[tx->head & tx->mask].pkt;
-    pbuf_ref(p);
-    tx->pending[tx->head & tx->mask] = p;
+    tx->pending[tx->head & tx->mask] = p;  /* uses the ref from br-enqueue */
     tx->head++;
 
     pkt->type_flags     = GVE_TXD_STD;
@@ -209,24 +174,116 @@ static err_t gve_linkoutput_rda(struct netif *netif, struct pbuf *p)
     gve_tx_fill_csum(p, pkt);
 
     for (struct pbuf *q = p->next; q != NULL; q = q->next) {
+        pbuf_ref(q);  /* each segment slot owns an independent ref */
         struct gve_tx_seg_desc *seg = &tx->desc[tx->head & tx->mask].seg;
-        pbuf_ref(q);
         tx->pending[tx->head & tx->mask] = q;
         tx->head++;
-
         seg->type_flags = GVE_TXD_SEG;
         seg->seg_len    = htobe16(q->len);
         seg->seg_addr   = htobe64(physical_from_virtual(q->payload));
     }
+    return true;
+}
 
-    tx->tx_stats.cnt++;
-    tx->tx_stats.bytes += p->tot_len;
-    adapter->hw_stats.tx_packets++;
-    adapter->hw_stats.tx_bytes += p->tot_len;
-    write_barrier();
-    pci_bar_write_4(&adapter->db_bar,
-                    be32toh(tx->q_res->db_index) * sizeof(u32),
-                    htobe32(tx->head));
+/*
+ * gve_tx_start_xmit_gqi — drain the software TX queue into the GQI HW ring.
+ *
+ * Retires completions, then drains tx->br into the HW ring until empty or
+ * HW ring full.  Doorbells are batched (GVE_TX_DOORBELL_BATCH) to amortize
+ * PCI transaction overhead.
+ *
+ * Stop/wakeup: when the HW ring is full the queue is marked stopped
+ * (running=false); the watchdog reschedules this drain once enough slots
+ * are free (via async_apply_bh on enqueue_task).
+ */
+static void gve_tx_start_xmit_gqi(gve_tx_queue tx)
+{
+    gve adapter = tx->adapter;
+    boolean qpl = !adapter->raw_addressing;
+    spin_lock(&tx->ring_mtx);
+
+    if (qpl)
+        gve_tx_cleanup_qpl(tx);
+    else
+        gve_tx_cleanup_rda(tx);
+
+    if (!tx->running) {
+        u32 free = adapter->tx_desc_cnt - (tx->head - tx->tail);
+        if (free < GVE_TX_RESUME_THRESH) {
+            spin_unlock(&tx->ring_mtx);
+            return;
+        }
+        tx->running = true;
+        tx->tx_stats.queue_wakeup++;
+        memory_barrier();
+    }
+
+    u32 pkts = 0;
+    struct pbuf *p;
+    while ((p = dequeue(tx->br)) != INVALID_ADDRESS) {
+        u16_t tot_len = p->tot_len;
+        boolean sent  = qpl ? gve_tx_write_qpl(tx, p)
+                            : gve_tx_write_rda(tx, p);
+        if (!sent) {
+            enqueue(tx->br, p);
+            tx->running = false;
+            tx->tx_stats.queue_stop++;
+            memory_barrier();
+            break;
+        }
+        if (qpl)
+            pbuf_free(p);  /* QPL data copied; release our ref */
+
+        tx->tx_stats.cnt++;
+        tx->tx_stats.bytes += tot_len;
+        adapter->hw_stats.tx_packets++;
+        adapter->hw_stats.tx_bytes += tot_len;
+
+        if (++pkts >= GVE_TX_DOORBELL_BATCH) {
+            write_barrier();
+            pci_bar_write_4(&adapter->db_bar,
+                            be32toh(tx->q_res->db_index) * sizeof(u32),
+                            htobe32(tx->head));
+            tx->tx_stats.doorbells++;
+            pkts = 0;
+        }
+    }
+    if (pkts > 0) {
+        write_barrier();
+        pci_bar_write_4(&adapter->db_bar,
+                        be32toh(tx->q_res->db_index) * sizeof(u32),
+                        htobe32(tx->head));
+        tx->tx_stats.doorbells++;
+    }
+    tx->acum_pkts = 0;
+    spin_unlock(&tx->ring_mtx);
+}
+
+closure_func_basic(thunk, void, gve_tx_enqueue_gqi)
+{
+    gve_tx_queue tx = struct_from_field(closure_self(),
+                                        gve_tx_queue, enqueue_task);
+    gve_tx_start_xmit_gqi(tx);
+}
+
+/* gve_linkoutput_gqi — GQI linkoutput (handles both QPL and RDA formats).
+ * Enqueues the pbuf to the per-queue software ring; actual HW-ring write
+ * happens asynchronously in gve_tx_start_xmit_gqi via BH. */
+static err_t gve_linkoutput_gqi(struct netif *netif, struct pbuf *p)
+{
+    gve adapter = netif->state;
+    if (!(netif->flags & NETIF_FLAG_UP))
+        return ERR_IF;
+    u32 qidx = current_cpu()->id % adapter->num_queues;
+    gve_tx_queue tx = &adapter->tx[qidx];
+    if (tx->stuck)
+        return ERR_IF;
+    pbuf_ref(p);
+    if (!enqueue(tx->br, p)) {
+        pbuf_free(p);
+        return ERR_MEM;
+    }
+    async_apply_bh((thunk)&tx->enqueue_task);
     return ERR_OK;
 }
 
@@ -237,10 +294,8 @@ void gve_setup_linkoutput(gve adapter, struct netif *netif)
 {
     if (adapter->dqo)
         netif->linkoutput = gve_linkoutput_dqo;
-    else if (adapter->raw_addressing)
-        netif->linkoutput = gve_linkoutput_rda;
     else
-        netif->linkoutput = gve_linkoutput_qpl;
+        netif->linkoutput = gve_linkoutput_gqi;  /* handles both QPL and RDA */
 }
 
 /* ------------------------------------------------------------------ */
@@ -281,6 +336,12 @@ void gve_rx_fill(gve_rx_queue rx)
         pci_bar_write_4(&adapter->db_bar,
                         be32toh(rx->q_res->db_index) * sizeof(u32),
                         htobe32(rx->head));
+        rx->empty_rx_queue = 0;
+    } else if (rx->head != rx->tail) {
+        /* Fill posted nothing but ring has active completions: device may be
+         * running low on buffers.  Watchdog uses this to detect the deadlock
+         * where device sends no IRQ and driver posts no buffers. */
+        rx->empty_rx_queue++;
     }
 }
 
@@ -290,6 +351,8 @@ closure_func_basic(thunk, void, gve_rx_service)
                                         gve_rx_queue, service);
     gve adapter = rx->adapter;
     struct netif *net_if = &adapter->ndev.n;
+    if (!(net_if->flags & NETIF_FLAG_UP))
+        return;
     boolean irq_acked = false;
     spin_lock(&rx->lock);
   begin:
@@ -372,4 +435,12 @@ void gve_rx_init(gve_rx_queue rx)
 {
     init_closure_func(&rx->service, thunk, gve_rx_service);
     spin_lock_init(&rx->lock);
+}
+
+/* gve_tx_init_gqi: called from gve_adminq.c after a GQI TX queue is
+ * allocated.  Initialises the enqueue_task closure and ring spinlock. */
+void gve_tx_init_gqi(gve_tx_queue tx)
+{
+    init_closure_func(&tx->enqueue_task, thunk, gve_tx_enqueue_gqi);
+    spin_lock_init(&tx->ring_mtx);
 }
