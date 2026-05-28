@@ -371,8 +371,7 @@ closure_func_basic(thunk, void, gve_rx_service)
 
     for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
         int budget = GVE_RX_BUDGET;
-        u32 tail = be32toh(
-            adapter->event_counters[be32toh(rx->q_res->counter_index)]);
+        u32 tail = be32toh(adapter->event_counters[rx->event_counter_idx]);
         for (; rx->tail != tail && budget > 0;
              rx->qpl_available++, rx->tail++, budget--) {
             struct gve_rx_desc *desc = &rx->desc[rx->tail & rx->mask];
