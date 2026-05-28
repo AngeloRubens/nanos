@@ -182,6 +182,11 @@ static void gve_tx_start_xmit_dqo(gve_tx_dqo_queue tx)
     gve adapter = tx->adapter;
     spin_lock(&tx->ring_mtx);
 
+    if (adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET)) {
+        spin_unlock(&tx->ring_mtx);
+        return;
+    }
+
     gve_tx_dqo_cleanup(tx);
 
     if (!tx->running) {

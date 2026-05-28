@@ -90,10 +90,16 @@ closure_func_basic(thunk, void, gve_rx_dqo_irq)
 closure_func_basic(thunk, void, gve_reset)
 {
     gve adapter = struct_from_field(closure_self(), gve, reset_handler);
+    struct netif *net_if = &adapter->ndev.n;
     rprintf("GVE: starting adapter reset\n");
 
     spin_lock(&adapter->global_lock);
     atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET);
+
+    /* Clear NETIF_FLAG_UP so that concurrent gve_rx_service / gve_tx_start_xmit
+     * BHs on other CPUs exit before touching ring memory.  The flag is restored
+     * in the success path below; on failure the adapter is left down. */
+    net_if->flags &= ~NETIF_FLAG_UP;
 
     gve_teardown_queues(adapter);
     gve_free_device_resources(adapter);
@@ -108,6 +114,7 @@ closure_func_basic(thunk, void, gve_reset)
         goto done;
     }
 
+    net_if->flags |= NETIF_FLAG_UP;
     rprintf("GVE: adapter reset complete\n");
     {
         u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
@@ -177,13 +184,23 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
         }
     } else {
         for (u32 i = 0; i < adapter->num_queues; i++) {
+            /* Re-check flags each iteration: event_counters and q_res are
+             * freed during teardown, which runs after ONGOING_RESET is set.
+             * If reset started mid-loop we bail before touching freed state. */
+            read_barrier();
+            if (adapter->flags & ((1ULL << GVE_FLAG_RESETTING) |
+                                  (1ULL << GVE_FLAG_ONGOING_RESET)))
+                return;
+
             gve_tx_queue tx = &adapter->tx[i];
             if (tx->stuck)
                 continue;
             if (tx->head == tx->tail)
                 continue;
+            /* Use cached event_counter_idx (set at queue create) to avoid
+             * dereferencing tx->q_res, which is freed during teardown. */
             u32 tail = be32toh(
-                adapter->event_counters[be32toh(tx->q_res->counter_index)]);
+                adapter->event_counters[tx->event_counter_idx]);
             if (tail != tx->tail) {
                 tx->last_completion = now_ts;
             } else if (now_ts - tx->last_completion > deadline) {

@@ -202,6 +202,14 @@ static void gve_tx_start_xmit_gqi(gve_tx_queue tx)
     boolean qpl = !adapter->raw_addressing;
     spin_lock(&tx->ring_mtx);
 
+    /* Bail if a reset is tearing down this queue.  A stale enqueue_task BH
+     * may fire after gve_destroy_tx_queue releases ring_mtx; the ONGOING_RESET
+     * flag is set before teardown and cleared only after new queues are up. */
+    if (adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET)) {
+        spin_unlock(&tx->ring_mtx);
+        return;
+    }
+
     if (qpl)
         gve_tx_cleanup_qpl(tx);
     else

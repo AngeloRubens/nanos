@@ -296,11 +296,12 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
         tx->qpl_used = 0;
         tx->qpl_size = adapter->tx_pages_per_qpl * PAGESIZE;
     }
-    tx->adapter         = adapter;
-    tx->last_completion = now(CLOCK_ID_MONOTONIC);
-    tx->stuck           = false;
-    tx->running         = true;
-    tx->acum_pkts       = 0;
+    tx->adapter           = adapter;
+    tx->last_completion   = now(CLOCK_ID_MONOTONIC);
+    tx->stuck             = false;
+    tx->running           = true;
+    tx->acum_pkts         = 0;
+    tx->event_counter_idx = be32toh(tx->q_res->counter_index);
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
     gve_tx_init_gqi(tx);
     return true;
@@ -333,6 +334,12 @@ static void gve_destroy_tx_queue(gve adapter, gve_tx_queue tx,
     cmd->destroy_tx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
+    /* Hold ring_mtx to exclude any in-progress gve_tx_start_xmit_gqi BH
+     * running on another CPU.  NETIF_FLAG_UP has been cleared by gve_reset
+     * before we reach here, so no new xmit BH will enqueue after this
+     * point; any already running will complete and release the lock. */
+    spin_lock(&tx->ring_mtx);
+
     /* Drain software TX queue: free any pbufs not yet sent. */
     struct pbuf *p;
     while ((p = dequeue(tx->br)) != INVALID_ADDRESS)
@@ -354,6 +361,8 @@ static void gve_destroy_tx_queue(gve adapter, gve_tx_queue tx,
         gve_destroy_qpl(adapter, tx->qpl_base,
                         adapter->tx_pages_per_qpl, index);
     }
+
+    spin_unlock(&tx->ring_mtx);
 }
 
 static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
@@ -473,13 +482,21 @@ static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
-    /* Wait for any in-flight RX pbufs to be released by lwIP before
-     * freeing the pbuf array (avoids use-after-free on reset). */
+    /* Wait for any in-flight RX pbufs held by lwIP's TCP stack to be
+     * released.  Must NOT hold rx->lock here: gve_rx_service holds the
+     * lock while it passes pbufs to lwIP, and lwIP may keep a ref until
+     * the application reads the socket — spinning with the lock held
+     * would deadlock against the application. */
     for (u32 i = 0; i < rx->qpl_count; i++) {
         struct pbuf *pb = &rx->pbufs[i];
         while (pb->ref > 1)
             read_barrier();
     }
+
+    /* Take rx->lock to exclude any gve_rx_service BH that passed the
+     * NETIF_FLAG_UP check (cleared by gve_reset) before we got here.
+     * Once we hold the lock we know no service is touching ring memory. */
+    spin_lock(&rx->lock);
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
     deallocate(adapter->contiguous, rx->data,
@@ -494,6 +511,8 @@ static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
     else
         gve_destroy_qpl(adapter, rx->qpl_base,
                         adapter->rx_data_slot_cnt, nq + index);
+
+    spin_unlock(&rx->lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -606,6 +625,9 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
     cmd->destroy_tx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
+    /* Hold ring_mtx to exclude any in-progress gve_tx_start_xmit_dqo BH. */
+    spin_lock(&tx->ring_mtx);
+
     /* Drain software TX queue: free any pbufs not yet sent. */
     struct pbuf *p;
     while ((p = dequeue(tx->br)) != INVALID_ADDRESS)
@@ -628,6 +650,8 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
                desc_cnt * sizeof(*tx->compl));
     deallocate(adapter->contiguous, tx->desc,
                desc_cnt * sizeof(*tx->desc));
+
+    spin_unlock(&tx->ring_mtx);
 }
 
 static boolean gve_create_rx_queue_dqo(gve adapter,
@@ -736,13 +760,16 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
-    /* Wait for any in-flight RX pbufs to be released by lwIP before
-     * freeing the pbuf array (avoids use-after-free on reset). */
+    /* Wait for in-flight lwIP refs (without lock — see GQI equivalent). */
     for (u32 i = 0; i < num_bufs; i++) {
         struct pbuf *pb = &rx->pbufs[i];
         while (pb->ref > 1)
             read_barrier();
     }
+
+    /* Take lock to exclude any gve_rx_dqo_service BH that passed the
+     * NETIF_FLAG_UP check before gve_reset cleared it. */
+    spin_lock(&rx->lock);
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
     deallocate(adapter->contiguous, rx->compl_ring,
@@ -753,6 +780,8 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
                num_bufs * sizeof(*rx->pbufs));
     deallocate(adapter->contiguous, rx->qpl_base,
                num_bufs * GVE_DQO_BUF_SIZE);
+
+    spin_unlock(&rx->lock);
 }
 
 /* ------------------------------------------------------------------ */

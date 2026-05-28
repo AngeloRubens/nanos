@@ -526,6 +526,7 @@ typedef struct gve_tx_queue {
     /* Watchdog: timestamp of last successful TX event-counter advance */
     timestamp last_completion;
     boolean   stuck;
+    u32       event_counter_idx;  /* cached from q_res->counter_index at create */
 
     /* Software TX queue (buf_ring pattern, same as ENA). */
     queue            br;          /* software queue absorbs burst when HW ring full */
