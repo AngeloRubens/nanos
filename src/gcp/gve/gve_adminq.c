@@ -678,16 +678,18 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     u32 num_bufs  = adapter->rx_data_slot_cnt;
     u32 nq        = adapter->num_queues;
 
-    rx->qpl_base = allocate(adapter->contiguous,
-                             num_bufs * GVE_DQO_BUF_SIZE);
-    if (rx->qpl_base == INVALID_ADDRESS)
-        return false;
-    rx->rda_base_phys = physical_from_virtual(rx->qpl_base);
-
     rx->pbufs = allocate(adapter->general,
                          num_bufs * sizeof(*rx->pbufs));
     if (rx->pbufs == INVALID_ADDRESS)
-        goto err_pbufs;
+        return false;
+    zero(rx->pbufs, num_bufs * sizeof(*rx->pbufs));
+
+    rx->free_ids = allocate(adapter->general,
+                            num_bufs * sizeof(*rx->free_ids));
+    if (rx->free_ids == INVALID_ADDRESS)
+        goto err_free_ids;
+    for (u32 i = 0; i < num_bufs; i++)
+        rx->free_ids[i] = (u16)i;
 
     rx->buf_ring = allocate(adapter->contiguous,
                             num_bufs * sizeof(*rx->buf_ring));
@@ -725,24 +727,17 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     if (!gve_adminq_execute_cmd(adapter, cmd))
         goto err_cmd;
 
-    rx->mask         = num_bufs - 1;
-    rx->num_bufs     = num_bufs;
-    rx->buf_head     = 0;
-    rx->compl_head   = 0;
-    rx->expected_gen = 1;
-    rx->adapter      = adapter;
-    rx->irq_db_index =
+    rx->mask          = num_bufs - 1;
+    rx->num_bufs      = num_bufs;
+    rx->buf_head      = 0;
+    rx->compl_head    = 0;
+    rx->expected_gen  = 1;
+    rx->next_to_use   = 0;
+    rx->next_to_clean = num_bufs;  /* free list starts full: all IDs available */
+    rx->adapter       = adapter;
+    rx->irq_db_index  =
         &adapter->irq_db_indices[GVE_IRQ_DB_RX(nq, index)].index;
     zero(&rx->rx_stats, sizeof(rx->rx_stats));
-
-    for (u32 i = 0; i < num_bufs; i++) {
-        struct pbuf *pb = &rx->pbufs[i];
-        pb->next          = NULL;
-        pb->type_internal = PBUF_REF;
-        pb->flags         = 0;
-        pb->ref           = 1;
-        pb->if_idx        = NETIF_NO_INDEX;
-    }
 
     /* Init service closure and fill initial buffers (gve_dqo.c). */
     gve_rx_dqo_init(rx);
@@ -761,11 +756,11 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     deallocate(adapter->contiguous, rx->buf_ring,
                num_bufs * sizeof(*rx->buf_ring));
   err_buf_ring:
+    deallocate(adapter->general, rx->free_ids,
+               num_bufs * sizeof(*rx->free_ids));
+  err_free_ids:
     deallocate(adapter->general, rx->pbufs,
                num_bufs * sizeof(*rx->pbufs));
-  err_pbufs:
-    deallocate(adapter->contiguous, rx->qpl_base,
-               num_bufs * GVE_DQO_BUF_SIZE);
     return false;
 }
 
@@ -778,27 +773,23 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
 
-    /* Wait for in-flight lwIP refs to drop.  NETIF_FLAG_UP is already
-     * cleared; any racing BH will exit on its next UP check.  Bound
-     * the wait: after 1000 iterations log and proceed rather than hang. */
-    for (u32 i = 0; i < num_bufs; i++) {
-        struct pbuf *pb = &rx->pbufs[i];
-        for (int retries = 1000; pb->ref > 1 && retries > 0; retries--)
-            read_barrier();
-        if (pb->ref > 1)
-            msg_err("GVE: DQO RX teardown: pbuf[%u] still held (ref %d), "
-                    "proceeding", i, (int)pb->ref);
-    }
+    /* Free any pbufs still posted to the device.  NETIF_FLAG_UP was
+     * cleared before teardown so no new completions arrive; each slot
+     * is either NULL (already completed and returned) or holds the only
+     * reference to the pbuf (the device's reference is gone). */
+    for (u32 i = 0; i < num_bufs; i++)
+        if (rx->pbufs[i])
+            pbuf_free(rx->pbufs[i]);
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
     deallocate(adapter->contiguous, rx->compl_ring,
                num_bufs * sizeof(*rx->compl_ring));
     deallocate(adapter->contiguous, rx->buf_ring,
                num_bufs * sizeof(*rx->buf_ring));
+    deallocate(adapter->general,    rx->free_ids,
+               num_bufs * sizeof(*rx->free_ids));
     deallocate(adapter->general,    rx->pbufs,
                num_bufs * sizeof(*rx->pbufs));
-    deallocate(adapter->contiguous, rx->qpl_base,
-               num_bufs * GVE_DQO_BUF_SIZE);
 }
 
 /* ------------------------------------------------------------------ */

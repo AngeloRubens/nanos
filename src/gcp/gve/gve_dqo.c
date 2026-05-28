@@ -250,30 +250,39 @@ err_t gve_linkoutput_dqo(struct netif *netif, struct pbuf *p)
 /* ------------------------------------------------------------------ */
 
 /*
- * gve_rx_dqo_fill — post available buffer descriptors to the device.
- * Each entry in buf_ring[] gives the device a physical buffer address
- * identified by buf_id (= ring slot index).
+ * gve_rx_dqo_fill — allocate per-packet pbufs and post buffer descriptors.
+ *
+ * Each slot gets a freshly allocated PBUF_RAM buffer.  The buf_id comes
+ * from the free_ids circular list (same pattern as ENA free_rx_ids[]).
+ * Physical address is derived per-packet via physical_from_virtual(), which
+ * is trivial on Nanos (identity-mapped address space).
  */
 void gve_rx_dqo_fill(gve_rx_dqo_queue rx)
 {
     gve adapter = rx->adapter;
     u32 posted = 0;
 
-    /* Post until the buffer ring is full or we run out of free slots.
-     * A slot is "free" when the pbuf ref count is back to 1
-     * (lwIP has released its reference). */
     while (((rx->buf_head + 1) & rx->mask) !=
            (rx->compl_head & rx->mask)) {
-        u32 buf_id = rx->buf_head & rx->mask;
-        if (rx->pbufs[buf_id].ref > 1)
-            break;  /* buffer still owned by lwIP */
+        /* No free IDs — should not happen in normal operation since IDs
+         * are returned before net_if->input() in the completion path. */
+        if (rx->next_to_clean == rx->next_to_use)
+            break;
 
-        struct gve_rx_buf_desc_dqo *bd = &rx->buf_ring[buf_id];
-        bd->buf_id          = (u16_t)buf_id;
+        u16 buf_id = rx->free_ids[rx->next_to_use & rx->mask];
+        struct pbuf *pb = pbuf_alloc(PBUF_RAW, GVE_DQO_BUF_SIZE, PBUF_RAM);
+        if (!pb) {
+            rx->rx_stats.refil_partial++;
+            break;
+        }
+        rx->pbufs[buf_id] = pb;
+        rx->next_to_use++;
+
+        struct gve_rx_buf_desc_dqo *bd = &rx->buf_ring[rx->buf_head & rx->mask];
+        bd->buf_id          = buf_id;
         bd->reserved0       = 0;
         bd->reserved1       = 0;
-        bd->buf_addr        = rx->rda_base_phys +
-                              (u64)buf_id * GVE_DQO_BUF_SIZE;
+        bd->buf_addr        = physical_from_virtual(pb->payload);
         bd->header_buf_addr = 0;
         bd->reserved2       = 0;
 
@@ -289,8 +298,6 @@ void gve_rx_dqo_fill(gve_rx_dqo_queue rx)
         rx->empty_rx_queue = 0;
     } else if (((rx->buf_head + 1) & rx->mask) !=
                (rx->compl_head & rx->mask)) {
-        /* Ring not full but couldn't post: lwIP holds all buffers.
-         * Watchdog uses this counter to detect the deadlock. */
         rx->empty_rx_queue++;
     }
 }
@@ -321,42 +328,37 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                 break;
             }
 
+            /* Claim the buffer slot and return the ID to the free list
+             * before calling net_if->input() — same pattern as ENA
+             * (rx_info->mbuf = NULL before input).  This makes the slot
+             * immediately available for refill even if lwIP holds the
+             * pbuf for a while. */
+            u16_t buf_id = c->buf_id & rx->mask;
+            struct pbuf *inp = rx->pbufs[buf_id];
+            rx->pbufs[buf_id] = NULL;
+            rx->free_ids[rx->next_to_clean & rx->mask] = buf_id;
+            rx->next_to_clean++;
+
+            if (!inp) {
+                rx->rx_stats.bad_req_id++;
+                goto advance;
+            }
+
             if (c->err_flags & GVE_DQO_RX_ERR) {
                 gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
                 rx->rx_stats.rx_dropped++;
+                pbuf_free(inp);
                 goto advance;
             }
 
             u16_t pkt_len = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
-            u16_t buf_id  = c->buf_id & rx->mask;
-
-            if (pkt_len <= GVE_RX_PADDING)
+            if (pkt_len <= GVE_RX_PADDING) {
+                pbuf_free(inp);
                 goto advance;
-            u16_t data_len = pkt_len - GVE_RX_PADDING;
-
-            void *virt_buf = (u8 *)rx->qpl_base +
-                             (u64)buf_id * GVE_DQO_BUF_SIZE;
-            void *payload  = (u8 *)virt_buf + GVE_RX_PADDING;
-
-            struct pbuf *pb = &rx->pbufs[buf_id];
-            struct pbuf *inp;
-            if (pb->ref == 1) {
-                pb->payload   = payload;
-                pb->len       = pb->tot_len = data_len;
-                pbuf_ref(pb);
-                inp = pb;
-            } else {
-                gve_debug("DQO RX: pbuf copy (ref %d)", pb->ref);
-                inp = pbuf_alloc(PBUF_RAW, data_len, PBUF_RAM);
-                if (inp) {
-                    pbuf_take(inp, payload, data_len);
-                    rx->rx_stats.rx_copy++;
-                } else {
-                    msg_err("%s: pbuf_alloc failed", func_ss);
-                    rx->rx_stats.rx_dropped++;
-                    goto advance;
-                }
             }
+            u16_t data_len = pkt_len - GVE_RX_PADDING;
+            inp->payload = (u8 *)inp->payload + GVE_RX_PADDING;
+            inp->len = inp->tot_len = data_len;
 
             {
                 err_t err = net_if->input(inp, net_if);

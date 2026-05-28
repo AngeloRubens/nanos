@@ -654,12 +654,12 @@ typedef struct gve_rx_dqo_queue {
     u16  mask;               /* num_bufs - 1 */
     u32  num_bufs;
 
-    void *qpl_base;          /* virtual base of all RX buffers */
-    u64  rda_base_phys;      /* physical_from_virtual(qpl_base) */
-
     struct gve_rx_buf_desc_dqo   *buf_ring;
     struct gve_rx_compl_desc_dqo *compl_ring;
-    struct pbuf                  *pbufs;     /* one PBUF_REF per buf slot */
+    struct pbuf                 **pbufs;     /* per-slot pbuf pointer (NULL when free) */
+    u16                          *free_ids;  /* circular free-buffer-id list */
+    u32                           next_to_use;   /* free_ids take cursor (post path) */
+    u32                           next_to_clean; /* free_ids put cursor (completion path) */
 
     u32 *irq_db_index;
     closure_struct(thunk, irq_handler);
