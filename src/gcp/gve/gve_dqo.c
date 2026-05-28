@@ -328,21 +328,25 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                 break;
             }
 
-            /* Claim the buffer slot and return the ID to the free list
-             * before calling net_if->input() — same pattern as ENA
-             * (rx_info->mbuf = NULL before input).  This makes the slot
-             * immediately available for refill even if lwIP holds the
-             * pbuf for a while. */
             u16_t buf_id = c->buf_id & rx->mask;
             struct pbuf *inp = rx->pbufs[buf_id];
-            rx->pbufs[buf_id] = NULL;
-            rx->free_ids[rx->next_to_clean & rx->mask] = buf_id;
-            rx->next_to_clean++;
 
+            /* Guard against spurious completions: only return the ID to
+             * the free list if we actually had a buffer posted to this
+             * slot.  An unconditional return would insert a duplicate
+             * and cause a future double-free. */
             if (!inp) {
                 rx->rx_stats.bad_req_id++;
                 goto advance;
             }
+
+            /* Claim the slot and return the ID before net_if->input() —
+             * same pattern as ENA (rx_info->mbuf = NULL before input).
+             * Makes the slot immediately available for refill regardless
+             * of how long lwIP holds the pbuf. */
+            rx->pbufs[buf_id] = NULL;
+            rx->free_ids[rx->next_to_clean & rx->mask] = buf_id;
+            rx->next_to_clean++;
 
             if (c->err_flags & GVE_DQO_RX_ERR) {
                 gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
