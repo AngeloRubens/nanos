@@ -305,8 +305,8 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
     tx->adapter           = adapter;
     tx->stuck             = false;
     tx->running           = true;
-    tx->acum_pkts         = 0;
     tx->event_counter_idx = be32toh(tx->q_res->counter_index);
+    tx->db_idx            = be32toh(tx->q_res->db_index);
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
     gve_tx_init_gqi(tx);
     return true;
@@ -461,6 +461,7 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     rx->no_interrupt_event_cnt = 0;
     rx->empty_rx_queue         = 0;
     rx->event_counter_idx      = be32toh(rx->q_res->counter_index);
+    rx->db_idx                 = be32toh(rx->q_res->db_index);
     gve_rx_fill(rx);
     return true;
 
@@ -602,8 +603,8 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     tx->adapter          = adapter;
     tx->stuck            = false;
     tx->running          = true;
-    tx->acum_pkts        = 0;
     tx->pending_misses   = 0;
+    tx->db_idx           = be32toh(tx->q_res->db_index);
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
     gve_tx_init_dqo(tx);
     return true;
@@ -737,6 +738,7 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     rx->adapter       = adapter;
     rx->irq_db_index  =
         &adapter->irq_db_indices[GVE_IRQ_DB_RX(nq, index)].index;
+    rx->db_idx        = be32toh(rx->q_res->db_index);
     zero(&rx->rx_stats, sizeof(rx->rx_stats));
 
     /* Init service closure and fill initial buffers (gve_dqo.c). */

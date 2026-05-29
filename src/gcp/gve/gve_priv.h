@@ -57,7 +57,6 @@
 #define GVE_REG_ADMINQ_EVT_CNT  0x18
 #define GVE_REG_DRIVER_VERSION  0x1F
 
-#define GVE_DEVICE_STATUS_RESET         htobe32(U32_FROM_BIT(1))
 #define GVE_DEVICE_STATUS_LINK_STATUS   htobe32(U32_FROM_BIT(2))
 #define GVE_DEVICE_STATUS_REPORT_STATS  htobe32(U32_FROM_BIT(3))
 
@@ -266,8 +265,6 @@ struct gve_adminq_command {
 /* IRQ / event counter structs                                          */
 /* ------------------------------------------------------------------ */
 
-#define GVE_IRQ_EVENT   htobe32(U32_FROM_BIT(29))
-#define GVE_IRQ_MASK    htobe32(U32_FROM_BIT(30))
 #define GVE_IRQ_ACK     htobe32(U32_FROM_BIT(31))
 
 /*
@@ -297,7 +294,6 @@ struct gve_queue_resources {
 #define GVE_TXD_STD 0x00
 #define GVE_TXD_TSO 0x10   /* TSO: not used (lwIP always segments at MSS) */
 #define GVE_TXD_SEG 0x20
-#define GVE_TXD_MTD 0x30
 
 /* GQI TX checksum offload: set in type_flags to enable CHECKSUM_PARTIAL.
  * Driver seeds the L4 checksum field with the pseudo-header sum;
@@ -426,11 +422,6 @@ struct gve_tx_seg_desc {
 /* RX descriptor format                                                 */
 /* ------------------------------------------------------------------ */
 
-#define GVE_RXF_FRAG        htobe16(1 << 6)
-#define GVE_RXF_IPV4        htobe16(1 << 7)
-#define GVE_RXF_IPV6        htobe16(1 << 8)
-#define GVE_RXF_TCP         htobe16(1 << 9)
-#define GVE_RXF_UDP         htobe16(1 << 10)
 #define GVE_RXF_ERR         htobe16(1 << 11)
 #define GVE_RXF_PKT_CONT    htobe16(1 << 13)
 
@@ -486,7 +477,6 @@ struct gve_hw_stats {
 
 /* TX software queue constants (buf_ring pattern, same as ENA). */
 #define GVE_BUF_RING_SIZE       4096   /* software TX queue depth */
-#define GVE_TX_STOP_THRESH      4      /* stop when < this many HW slots free */
 #define GVE_TX_RESUME_THRESH    8      /* wake when >= this many HW slots free */
 #define GVE_TX_DOORBELL_BATCH   64     /* max packets per doorbell write */
 
@@ -554,11 +544,11 @@ typedef struct gve_tx_queue {
     timestamp *tx_timestamps;
     boolean    stuck;
     u32        event_counter_idx;  /* cached from q_res->counter_index at create */
+    u32        db_idx;             /* cached from q_res->db_index at create */
 
     /* Software TX queue (buf_ring pattern, same as ENA). */
     queue            br;          /* software queue absorbs burst when HW ring full */
     boolean          running;     /* false = HW ring full, drain paused */
-    u32              acum_pkts;   /* packets batched since last doorbell */
     struct spinlock  ring_mtx;
     closure_struct(thunk, enqueue_task);
 } *gve_tx_queue;
@@ -586,6 +576,7 @@ typedef struct gve_rx_queue {
     u16   no_interrupt_event_cnt; /* increments if completions arrive but no IRQ */
     int   empty_rx_queue;         /* consecutive watchdog ticks with ring empty */
     u32   event_counter_idx;      /* cached from q_res->counter_index at create */
+    u32   db_idx;                 /* cached from q_res->db_index at create */
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -631,7 +622,7 @@ typedef struct gve_tx_dqo_queue {
 
     queue            br;
     boolean          running;
-    u32              acum_pkts;
+    u32              db_idx;   /* cached from q_res->db_index at create */
     struct spinlock  ring_mtx;
     closure_struct(thunk, enqueue_task);
 } *gve_tx_dqo_queue;
@@ -665,6 +656,7 @@ typedef struct gve_rx_dqo_queue {
     closure_struct(thunk, irq_handler);
     closure_struct(thunk, service);
     struct gve_queue_resources *q_res;
+    u32                          db_idx;  /* cached from q_res->db_index at create */
 
     struct gve_stats_rx rx_stats;
 

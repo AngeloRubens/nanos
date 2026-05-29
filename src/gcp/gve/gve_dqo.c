@@ -80,6 +80,12 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             }
         } else if (type == GVE_DQO_COMPL_TYPE_REINJECT) {
             u16_t tag = c->completion_tag & tx->mask;
+            if (!tx->seg_counts[tag]) {
+                msg_err("GVE: DQO TX invalid reinject tag %u", tag);
+                tx->tx_stats.bad_compl_tag++;
+                gve_trigger_reset(tx->adapter);
+                break;
+            }
             u16_t seg_cnt = tx->seg_counts[tag];
             for (u16_t k = 0; k < seg_cnt; k++)
                 tx->tx_timestamps[(u16_t)(tag - k) & tx->mask] = 0;
@@ -198,7 +204,7 @@ static void gve_tx_drain_dqo(gve_tx_dqo_queue tx)
         if (++pkts >= GVE_TX_DOORBELL_BATCH) {
             write_barrier();
             pci_bar_write_4(&adapter->db_bar,
-                            be32toh(tx->q_res->db_index) * sizeof(u32),
+                            tx->db_idx * sizeof(u32),
                             htobe32(tx->head));
             tx->tx_stats.doorbells++;
             pkts = 0;
@@ -207,11 +213,10 @@ static void gve_tx_drain_dqo(gve_tx_dqo_queue tx)
     if (pkts > 0) {
         write_barrier();
         pci_bar_write_4(&adapter->db_bar,
-                        be32toh(tx->q_res->db_index) * sizeof(u32),
+                        tx->db_idx * sizeof(u32),
                         htobe32(tx->head));
         tx->tx_stats.doorbells++;
     }
-    tx->acum_pkts = 0;
 }
 
 closure_func_basic(thunk, void, gve_tx_enqueue_dqo)
@@ -293,7 +298,7 @@ void gve_rx_dqo_fill(gve_rx_dqo_queue rx)
     if (posted) {
         write_barrier();
         pci_bar_write_4(&adapter->db_bar,
-                        be32toh(rx->q_res->db_index) * sizeof(u32),
+                        rx->db_idx * sizeof(u32),
                         htobe32(rx->buf_head));
         rx->empty_rx_queue = 0;
     } else if (((rx->buf_head + 1) & rx->mask) !=

@@ -246,7 +246,7 @@ static void gve_tx_drain_gqi(gve_tx_queue tx)
         if (++pkts >= GVE_TX_DOORBELL_BATCH) {
             write_barrier();
             pci_bar_write_4(&adapter->db_bar,
-                            be32toh(tx->q_res->db_index) * sizeof(u32),
+                            tx->db_idx * sizeof(u32),
                             htobe32(tx->head));
             tx->tx_stats.doorbells++;
             pkts = 0;
@@ -255,11 +255,10 @@ static void gve_tx_drain_gqi(gve_tx_queue tx)
     if (pkts > 0) {
         write_barrier();
         pci_bar_write_4(&adapter->db_bar,
-                        be32toh(tx->q_res->db_index) * sizeof(u32),
+                        tx->db_idx * sizeof(u32),
                         htobe32(tx->head));
         tx->tx_stats.doorbells++;
     }
-    tx->acum_pkts = 0;
 }
 
 closure_func_basic(thunk, void, gve_tx_enqueue_gqi)
@@ -344,7 +343,7 @@ void gve_rx_fill(gve_rx_queue rx)
     if (slot_count) {
         write_barrier();
         pci_bar_write_4(&adapter->db_bar,
-                        be32toh(rx->q_res->db_index) * sizeof(u32),
+                        rx->db_idx * sizeof(u32),
                         htobe32(rx->head));
         rx->empty_rx_queue = 0;
     } else if (rx->head != rx->tail) {
