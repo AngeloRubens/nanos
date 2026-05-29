@@ -91,6 +91,13 @@ boolean gve_describe_device(gve adapter)
         adapter->tx_pages_per_qpl  = be16toh(desc->tx_pages_per_qpl);
         adapter->rx_data_slot_cnt  = be16toh(desc->rx_pages_per_qpl);
 
+        /* Stash the device-reported sizes as canonical; gve_setup_queues
+         * restores the working sizes to these on every (re)setup attempt. */
+        adapter->tx_desc_cnt_dev      = adapter->tx_desc_cnt;
+        adapter->rx_desc_cnt_dev      = adapter->rx_desc_cnt;
+        adapter->tx_pages_per_qpl_dev = adapter->tx_pages_per_qpl;
+        adapter->rx_data_slot_cnt_dev = adapter->rx_data_slot_cnt;
+
         /* Walk device option list.
          * Priority: DQO-RDA > GQI-RDA > GQI-QPL. */
         u16 num_opts   = be16toh(desc->num_device_options);
@@ -927,9 +934,19 @@ static boolean gve_try_setup_queues(gve adapter)
  * (and the QPL page counts for GQI-QPL mode) and retry until we reach
  * GVE_MIN_RING_SIZE.  This matches the ENA driver pattern and avoids
  * probe failure under memory pressure at boot or after reset.
+ *
+ * The working sizes are reset to the device-reported (canonical) values
+ * first, so that a backoff from an earlier setup (e.g. before a reset)
+ * does not leave the rings permanently small once memory is available
+ * again.  Mirrors ENA set_io_rings_size (ena.c:1042).
  */
 boolean gve_setup_queues(gve adapter)
 {
+    adapter->tx_desc_cnt      = adapter->tx_desc_cnt_dev;
+    adapter->rx_desc_cnt      = adapter->rx_desc_cnt_dev;
+    adapter->tx_pages_per_qpl = adapter->tx_pages_per_qpl_dev;
+    adapter->rx_data_slot_cnt = adapter->rx_data_slot_cnt_dev;
+
     for (;;) {
         if (gve_try_setup_queues(adapter))
             return true;

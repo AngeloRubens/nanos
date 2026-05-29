@@ -688,6 +688,14 @@ typedef struct gve {
     boolean adminq_running;   /* cleared on timeout; reset before any admin cmds */
     u16    tx_desc_cnt, rx_desc_cnt;
     u16    tx_pages_per_qpl, rx_data_slot_cnt;
+
+    /* Device-reported (canonical) ring sizes. The working fields above may
+     * be halved by gve_setup_queues backoff under memory pressure;
+     * gve_setup_queues resets the working fields to these before each
+     * attempt, so a transient shortage does not shrink the rings forever.
+     * Mirrors ENA requested_*_ring_size + set_io_rings_size (ena.c:1042). */
+    u16    tx_desc_cnt_dev, rx_desc_cnt_dev;
+    u16    tx_pages_per_qpl_dev, rx_data_slot_cnt_dev;
     u16    num_event_counters;
     u32   *event_counters;
     struct gve_irq_db *irq_db_indices;

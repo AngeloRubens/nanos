@@ -4,8 +4,15 @@
  *   - multi-queue TX/RX (up to GVE_MAX_IO_QUEUES, limited by device,
  *     MSI-X vectors, CPU count, and the "io-queues" manifest option)
  *   - io-queues manifest support (same pattern as virtio_net)
+ *   - queue format negotiation: DQO-RDA > GQI-RDA > GQI-QPL
+ *   - DQO format (Andromeda 2.x): generation-bit completion polling,
+ *     separate TX-completion and RX-buffer/completion rings
+ *   - TX checksum offload (GQI GVE_TXF_L4CSUM, DQO checksum-enable bit)
  *   - TX QPL integer-overflow fix (was: head < qpl_head wrap)
- *   - TX completion timeout / watchdog (prevents silent TX hang)
+ *   - TX completion timeout / watchdog + deferred reset (prevents
+ *     silent TX hang)
+ *   - ring-size backoff under memory pressure, restored to device
+ *     sizes on each (re)setup
  *   - cacheline padding uses DEFAULT_CACHELINE_SIZE
  */
 void init_gve(kernel_heaps kh);
