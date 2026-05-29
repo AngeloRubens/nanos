@@ -95,6 +95,7 @@ closure_func_basic(thunk, void, gve_reset)
 
     spin_lock(&adapter->global_lock);
     atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET);
+    atomic_clear_bit(&adapter->flags, GVE_FLAG_DEVICE_RUNNING);
 
     /* Clear NETIF_FLAG_UP so that concurrent gve_rx_service / gve_tx_start_xmit
      * BHs on other CPUs exit before touching ring memory.  The flag is restored
@@ -114,6 +115,7 @@ closure_func_basic(thunk, void, gve_reset)
         goto done;
     }
 
+    atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_DEVICE_RUNNING);
     net_if->flags |= NETIF_FLAG_UP;
     rprintf("GVE: adapter reset complete\n");
     {
@@ -138,6 +140,8 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
 
     gve adapter = struct_from_closure(gve, watchdog_task);
     read_barrier();
+    if (!(adapter->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING)))
+        return;
     if (adapter->flags & ((1ULL << GVE_FLAG_RESETTING) |
                           (1ULL << GVE_FLAG_ONGOING_RESET)))
         return;
@@ -434,6 +438,7 @@ static boolean gve_init(gve adapter, tuple config)
         msg_err("GVE: failed to set up TX/RX queues");
         goto err3;
     }
+    atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_DEVICE_RUNNING);
 
     /* Start TX completion watchdog (fires every GVE_WATCHDOG_INTERVAL_MS). */
     timestamp watchdog_interval = milliseconds(GVE_WATCHDOG_INTERVAL_MS);

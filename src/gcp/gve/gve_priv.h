@@ -498,6 +498,7 @@ struct gve_hw_stats {
 /* Adapter-level atomic flags (use atomic_test_and_set_bit / atomic_clear_bit). */
 #define GVE_FLAG_RESETTING      0      /* reset has been scheduled */
 #define GVE_FLAG_ONGOING_RESET  1      /* reset is actively running */
+#define GVE_FLAG_DEVICE_RUNNING 2      /* queues allocated and device operational */
 
 /* ------------------------------------------------------------------ */
 /* GQI per-queue structs                                                */
