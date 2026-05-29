@@ -353,23 +353,30 @@ static void gve_destroy_tx_queue(gve adapter, gve_tx_queue tx,
     while ((p = dequeue(tx->br)) != INVALID_ADDRESS)
         pbuf_free(p);
     deallocate_queue(tx->br);
+    tx->br = NULL;
 
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+    tx->q_res = NULL;
     deallocate(adapter->general, tx->tx_timestamps,
                adapter->tx_desc_cnt * sizeof(*tx->tx_timestamps));
+    tx->tx_timestamps = NULL;
     deallocate(adapter->contiguous, tx->desc,
                adapter->tx_desc_cnt * sizeof(*tx->desc));
+    tx->desc = NULL;
     if (adapter->raw_addressing) {
         for (u32 i = 0; i <= tx->mask; i++)
             if (tx->pending[i])
                 pbuf_free(tx->pending[i]);
         deallocate(adapter->general, tx->pending,
                    adapter->tx_desc_cnt * sizeof(*tx->pending));
+        tx->pending = NULL;
     } else {
         deallocate(adapter->general, tx->qpl_allocated,
                    adapter->tx_desc_cnt * sizeof(*tx->qpl_allocated));
+        tx->qpl_allocated = NULL;
         gve_destroy_qpl(adapter, tx->qpl_base,
                         adapter->tx_pages_per_qpl, index);
+        tx->qpl_base = NULL;
     }
 
     spin_unlock(&tx->ring_mtx);
@@ -510,18 +517,24 @@ static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
     }
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
+    rx->q_res = NULL;
     deallocate(adapter->contiguous, rx->data,
                adapter->rx_data_slot_cnt * sizeof(*rx->data));
+    rx->data = NULL;
     deallocate(adapter->contiguous, rx->desc,
                adapter->rx_desc_cnt * sizeof(*rx->desc));
+    rx->desc = NULL;
     deallocate(adapter->general, rx->pbufs,
                rx->qpl_count * sizeof(*rx->pbufs));
-    if (adapter->raw_addressing)
+    rx->pbufs = NULL;
+    if (adapter->raw_addressing) {
         deallocate(adapter->contiguous, rx->qpl_base,
                    adapter->rx_data_slot_cnt * PAGESIZE);
-    else
+    } else {
         gve_destroy_qpl(adapter, rx->qpl_base,
                         adapter->rx_data_slot_cnt, nq + index);
+    }
+    rx->qpl_base = NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -650,6 +663,7 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
     while ((p = dequeue(tx->br)) != INVALID_ADDRESS)
         pbuf_free(p);
     deallocate_queue(tx->br);
+    tx->br = NULL;
 
     u16 desc_cnt = adapter->tx_desc_cnt;
     /* Free any in-flight pbufs. */
@@ -657,18 +671,25 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
         if (tx->pending[i])
             pbuf_free(tx->pending[i]);
     deallocate(adapter->contiguous, tx->q_res, sizeof(*tx->q_res));
+    tx->q_res = NULL;
     deallocate(adapter->general,    tx->tx_timestamps,
                desc_cnt * sizeof(*tx->tx_timestamps));
+    tx->tx_timestamps = NULL;
     deallocate(adapter->general,    tx->miss_times,
                desc_cnt * sizeof(*tx->miss_times));
+    tx->miss_times = NULL;
     deallocate(adapter->general,    tx->seg_counts,
                desc_cnt * sizeof(*tx->seg_counts));
+    tx->seg_counts = NULL;
     deallocate(adapter->general,    tx->pending,
                desc_cnt * sizeof(*tx->pending));
+    tx->pending = NULL;
     deallocate(adapter->contiguous, tx->compl,
                desc_cnt * sizeof(*tx->compl));
+    tx->compl = NULL;
     deallocate(adapter->contiguous, tx->desc,
                desc_cnt * sizeof(*tx->desc));
+    tx->desc = NULL;
 
     spin_unlock(&tx->ring_mtx);
 }
@@ -784,14 +805,19 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
             pbuf_free(rx->pbufs[i]);
 
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
+    rx->q_res = NULL;
     deallocate(adapter->contiguous, rx->compl_ring,
                num_bufs * sizeof(*rx->compl_ring));
+    rx->compl_ring = NULL;
     deallocate(adapter->contiguous, rx->buf_ring,
                num_bufs * sizeof(*rx->buf_ring));
+    rx->buf_ring = NULL;
     deallocate(adapter->general,    rx->free_ids,
                num_bufs * sizeof(*rx->free_ids));
+    rx->free_ids = NULL;
     deallocate(adapter->general,    rx->pbufs,
                num_bufs * sizeof(*rx->pbufs));
+    rx->pbufs = NULL;
 }
 
 /* ------------------------------------------------------------------ */
