@@ -103,6 +103,7 @@ closure_func_basic(thunk, void, gve_reset)
      * BHs on other CPUs exit before touching ring memory.  The flag is restored
      * in the success path below; on failure the adapter is left down. */
     net_if->flags &= ~NETIF_FLAG_UP;
+    adapter->adminq_running = true;
 
     gve_teardown_queues(adapter);
     gve_free_device_resources(adapter);
@@ -419,6 +420,7 @@ static boolean gve_init(gve adapter, tuple config)
     pci_bar_write_4(&adapter->reg_bar, GVE_REG_ADMINQ_PFN,
                     htobe32(physical_from_virtual(adapter->adminq)
                             >> PAGELOG));
+    adapter->adminq_running = true;
 
     if (!gve_describe_device(adapter)) {
         msg_err("GVE: failed to describe device");

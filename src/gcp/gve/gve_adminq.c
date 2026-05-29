@@ -16,15 +16,21 @@
 
 static boolean gve_adminq_wait(gve adapter, u32 cmd_index)
 {
+    u32 delay_us = 0;
     int retries = 0;
     do {
-        if (retries)
-            kernel_delay(milliseconds(20));
+        if (delay_us)
+            kernel_delay(microseconds(delay_us));
         u32 tail = be32toh(pci_bar_read_4(&adapter->reg_bar,
                                           GVE_REG_ADMINQ_EVT_CNT));
         if (((s32)(tail - cmd_index)) >= 0)
             return true;
+        delay_us = delay_us < GVE_ADMINQ_MIN_POLL_US ?
+                   GVE_ADMINQ_MIN_POLL_US :
+                   MIN(delay_us * 2, GVE_ADMINQ_MAX_POLL_US);
     } while (retries++ < 64);
+    msg_err("GVE: admin queue command timed out, marking dead");
+    adapter->adminq_running = false;
     return false;
 }
 
@@ -47,11 +53,11 @@ static u32 gve_adminq_issue_cmd(gve adapter)
 static boolean gve_adminq_execute_cmd(gve adapter,
                                       struct gve_adminq_command *cmd)
 {
-    u32 index = gve_adminq_issue_cmd(adapter);
-    if (!gve_adminq_wait(adapter, index)) {
-        msg_err("%s: command %d timed out", func_ss, be32toh(cmd->opcode));
+    if (!adapter->adminq_running)
         return false;
-    }
+    u32 index = gve_adminq_issue_cmd(adapter);
+    if (!gve_adminq_wait(adapter, index))
+        return false;
     read_barrier();
     u32 status = be32toh(cmd->status);
     gve_debug("cmd %d, status %d", be32toh(cmd->opcode), status);
@@ -168,8 +174,10 @@ void gve_free_device_resources(gve adapter)
     gve_adminq_execute_cmd(adapter, cmd);
     deallocate(adapter->contiguous, adapter->irq_db_indices,
                sizeof(struct gve_irq_db) * GVE_IRQ_DB_COUNT(nq));
+    adapter->irq_db_indices = NULL;
     deallocate(adapter->contiguous, adapter->event_counters,
                MAX(adapter->num_event_counters * sizeof(u32), PAGESIZE));
+    adapter->event_counters = NULL;
 }
 
 /* ------------------------------------------------------------------ */

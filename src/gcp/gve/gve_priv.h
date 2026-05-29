@@ -109,6 +109,12 @@
 #define GVE_DEV_OPT_ID_GQI_QPL             0x3
 #define GVE_DEV_OPT_ID_DQO_RDA             0x4
 
+/* Admin queue polling: exponential backoff from GVE_ADMINQ_MIN_POLL_US to
+ * GVE_ADMINQ_MAX_POLL_US (mirrors ENA ena_delay_exponential_backoff_us).
+ * On timeout, gve_adminq_wait sets adminq_running = false. */
+#define GVE_ADMINQ_MIN_POLL_US  100
+#define GVE_ADMINQ_MAX_POLL_US  5000
+
 /* ------------------------------------------------------------------ */
 /* Admin queue opcodes and structs                                      */
 /* ------------------------------------------------------------------ */
@@ -679,6 +685,7 @@ typedef struct gve {
     struct gve_adminq_command *adminq;
     u32    adminq_head;
     u32    adminq_mask;
+    boolean adminq_running;   /* cleared on timeout; reset before any admin cmds */
     u16    tx_desc_cnt, rx_desc_cnt;
     u16    tx_pages_per_qpl, rx_data_slot_cnt;
     u16    num_event_counters;
