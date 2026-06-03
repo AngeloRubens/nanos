@@ -32,7 +32,7 @@ closure_func_basic(thunk, void, gve_link_up_task)
 {
     gve adapter = struct_from_closure(gve, link_up_task);
     gve_debug("link up task");
-    if (!atomic_test_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET))
+    if (!(adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET)))
         netif_set_link_up(&adapter->ndev.n);
 }
 
@@ -40,7 +40,7 @@ closure_func_basic(thunk, void, gve_link_down_task)
 {
     gve adapter = struct_from_closure(gve, link_down_task);
     gve_debug("link down task");
-    if (!atomic_test_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET))
+    if (!(adapter->flags & (1ULL << GVE_FLAG_ONGOING_RESET)))
         netif_set_link_down(&adapter->ndev.n);
 }
 
