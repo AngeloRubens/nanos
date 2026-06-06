@@ -17,6 +17,7 @@
 
 #include <kernel.h>
 #include <lwip.h>
+#include <net/net.h>
 #include <netif/ethernet.h>
 #include <pci.h>
 
@@ -574,6 +575,7 @@ typedef struct gve_rx_queue {
     int   empty_rx_queue;         /* consecutive watchdog ticks with ring empty */
     u32   event_counter_idx;      /* cached from q_res->counter_index at create */
     u32   db_idx;                 /* cached from q_res->db_index at create */
+    u16   idx;                    /* RX queue index, for SO_INCOMING_NAPI_ID */
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -660,6 +662,7 @@ typedef struct gve_rx_dqo_queue {
     boolean first_interrupt;
     u16   no_interrupt_event_cnt;
     int   empty_rx_queue;
+    u16   idx;                    /* RX queue index, for SO_INCOMING_NAPI_ID */
 } *gve_rx_dqo_queue;
 
 /* ------------------------------------------------------------------ */

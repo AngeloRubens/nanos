@@ -491,6 +491,7 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     rx->empty_rx_queue         = 0;
     rx->event_counter_idx      = be32toh(rx->q_res->counter_index);
     rx->db_idx                 = be32toh(rx->q_res->db_index);
+    rx->idx                    = index;
     gve_rx_fill(rx);
     return true;
 
@@ -789,6 +790,7 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     rx->first_interrupt        = false;
     rx->no_interrupt_event_cnt = 0;
     rx->empty_rx_queue         = 0;
+    rx->idx                    = index;
     gve_rx_dqo_fill(rx);
     return true;
 

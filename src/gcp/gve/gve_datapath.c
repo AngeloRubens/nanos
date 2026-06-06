@@ -391,6 +391,7 @@ closure_func_basic(thunk, void, gve_rx_service)
                     continue;
                 }
             }
+            p->napi_id = net_get_napi_id(net_if->num, rx->idx);
             err_t err = net_if->input(p, net_if);
             if (err != ERR_OK)
                 pbuf_free(p);

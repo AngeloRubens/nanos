@@ -355,6 +355,7 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
             inp->payload = (u8 *)inp->payload + GVE_RX_PADDING;
             inp->len = inp->tot_len = data_len;
 
+            inp->napi_id = net_get_napi_id(net_if->num, rx->idx);
             {
                 err_t err = net_if->input(inp, net_if);
                 if (err != ERR_OK)
