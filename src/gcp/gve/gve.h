@@ -7,7 +7,6 @@
  *   - queue format negotiation: DQO-RDA > GQI-RDA > GQI-QPL
  *   - DQO format (Andromeda 2.x): generation-bit completion polling,
  *     separate TX-completion and RX-buffer/completion rings
- *   - TX checksum offload (GQI GVE_TXF_L4CSUM, DQO checksum-enable bit)
  *   - TX QPL integer-overflow fix (was: head < qpl_head wrap)
  *   - TX completion timeout / watchdog + deferred reset (prevents
  *     silent TX hang)

@@ -12,8 +12,9 @@
  *   6. GQI-RDA format negotiation (no QPL bounce copy).
  *   7. DQO format (Andromeda 2.x): generation-bit completion polling,
  *      separate TX-completion and RX-buffer/completion rings.
- *   8. TX checksum offload (GQI and DQO): CHECKSUM_PARTIAL model,
- *      pseudo-header seeded by driver, completed by device.
+ *
+ * Checksums are computed in software by lwIP (no HW offload), same model
+ * as the ENA driver: gVNIC offloads only L4, not the IPv4 header checksum.
  *
  * Nanos-specific simplifications vs Linux driver:
  *   - No DMA map/unmap (single address space, identity mapped).
@@ -480,12 +481,9 @@ static err_t gve_if_init(struct netif *netif)
     gve_setup_linkoutput(adapter, netif);
     netif->hwaddr_len = ETH_HWADDR_LEN;
 
-    /* Disable SW checksum generation for IP/TCP/UDP: the NIC handles it.
-     * Keep generation for ICMP/ICMPv6 (not offloaded) and all RX checks. */
-    NETIF_SET_CHECKSUM_CTRL(netif,
-        NETIF_CHECKSUM_ENABLE_ALL &
-        ~(NETIF_CHECKSUM_GEN_IP | NETIF_CHECKSUM_GEN_UDP |
-          NETIF_CHECKSUM_GEN_TCP));
+    /* Checksums (IP/TCP/UDP) are generated and verified in software by
+     * lwIP: gVNIC offloads only L4, never the IPv4 header checksum, so
+     * the safe model is full software checksumming, same as the ENA driver. */
 
     return ERR_OK;
 }

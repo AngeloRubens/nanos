@@ -3,8 +3,8 @@
  * TX: QPL mode copies packet payload into registered bounce pages;
  *     RDA mode passes physical_from_virtual(pbuf->payload) directly to
  *     the device — no memcpy per packet.
- *     Both modes call gve_tx_fill_csum() to offload TCP/UDP checksum
- *     computation to the NIC (GVE_TXF_L4CSUM + pseudo-header seed).
+ *     Checksums are computed in software by lwIP (no HW offload), same
+ *     model as the ENA driver.
  * RX: QPL mode uses a pre-registered page pool; RDA mode uses a
  *     directly allocated contiguous buffer with physical addresses.
  *     Both modes are unified via rda_base_phys (0 for QPL).
@@ -12,25 +12,6 @@
  */
 
 #include "gve_priv.h"
-
-/* ------------------------------------------------------------------ */
-/* TX checksum offload (GQI QPL and RDA)                                */
-/* ------------------------------------------------------------------ */
-
-/* gve_tx_fill_csum — GQI wrapper around gve_pseudo_csum (gve_priv.h).
- * l4_hdr_offset and l4_csum_offset are in 2-byte units per GQI spec:
- *   TCP chksum at byte 16 of TCP header → offset 8.
- *   UDP chksum at byte  6 of UDP header → offset 3. */
-static void gve_tx_fill_csum(struct pbuf *p, struct gve_tx_pkt_desc *pkt)
-{
-    u8    proto;
-    u16_t l4_hdr_off;
-    if (!gve_pseudo_csum(p, &proto, &l4_hdr_off))
-        return;
-    pkt->type_flags    |= GVE_TXF_L4CSUM;
-    pkt->l4_hdr_offset  = l4_hdr_off / 2;
-    pkt->l4_csum_offset = (proto == GVE_IP_PROTO_TCP) ? 8 : 3;
-}
 
 /* ------------------------------------------------------------------ */
 /* TX path                                                              */
@@ -115,14 +96,11 @@ static boolean gve_tx_write_qpl(gve_tx_queue tx, struct pbuf *p)
             (tx->qpl_used + qpl_needed > tx->qpl_size))
         return false;
 
-    /* Seed pseudo-header checksum in the pbuf BEFORE the QPL copy so that
-     * the updated checksum field lands in the QPL bounce buffer. */
     u32 slot = tx->head & tx->mask;
     struct gve_tx_pkt_desc *pkt = &tx->desc[slot].pkt;
     pkt->type_flags     = GVE_TXD_STD;
     pkt->l4_csum_offset = 0;
     pkt->l4_hdr_offset  = 0;
-    gve_tx_fill_csum(p, pkt);
     tx->tx_timestamps[slot] = now(CLOCK_ID_MONOTONIC);
 
     u32 offset;
@@ -180,7 +158,6 @@ static boolean gve_tx_write_rda(gve_tx_queue tx, struct pbuf *p)
     pkt->len            = htobe16(p->tot_len);
     pkt->seg_len        = htobe16(p->len);
     pkt->seg_addr       = htobe64(physical_from_virtual(p->payload));
-    gve_tx_fill_csum(p, pkt);
 
     for (struct pbuf *q = p->next; q != NULL; q = q->next) {
         pbuf_ref(q);  /* each segment slot owns an independent ref */

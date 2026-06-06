@@ -11,8 +11,8 @@
  *               little-endian, generation-bit polling.
  *
  * TSO is not implementable: lwIP always segments TCP at MSS before
- * calling linkoutput.  TX checksum offload is available for GQI
- * (GVE_TXF_L4CSUM) and DQO (checksum_offload_enable bit).
+ * calling linkoutput.  TX/RX checksums are computed in software by lwIP
+ * (same model as the ENA driver): no hardware checksum offload.
  */
 
 #include <kernel.h>
@@ -301,11 +301,6 @@ struct gve_queue_resources {
 #define GVE_TXD_TSO 0x10   /* TSO: not used (lwIP always segments at MSS) */
 #define GVE_TXD_SEG 0x20
 
-/* GQI TX checksum offload: set in type_flags to enable CHECKSUM_PARTIAL.
- * Driver seeds the L4 checksum field with the pseudo-header sum;
- * device adds the payload checksum and completes the field. */
-#define GVE_TXF_L4CSUM  0x01
-
 /* ------------------------------------------------------------------ */
 /* DQO descriptor formats (Andromeda 2.x, little-endian)               */
 /* ------------------------------------------------------------------ */
@@ -327,7 +322,6 @@ struct gve_tx_pkt_desc_dqo {
 /* dtype must be GVE_DQO_TX_DTYPE_PKT (0xc) for packet descriptors. */
 #define GVE_DQO_TX_DTYPE_PKT    0x0cu
 #define GVE_DQO_TX_EOP          0x20u   /* end_of_packet */
-#define GVE_DQO_TX_CSUM_EN      0x40u   /* checksum_offload_enable */
 #define GVE_DQO_TX_REPORT       0x80u   /* report_event: generate TX completion */
 
 /*
@@ -730,78 +724,6 @@ static inline void gve_trigger_reset(gve adapter)
 {
     if (!atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_RESETTING))
         async_apply_bh((thunk)&adapter->reset_handler);
-}
-
-/* ------------------------------------------------------------------ */
-/* Checksum offload shared helper                                       */
-/* ------------------------------------------------------------------ */
-
-#define GVE_ETHERTYPE_IP4   0x0800u
-#define GVE_ETHERTYPE_IP6   0x86DDu
-#define GVE_IP_PROTO_TCP    6u
-#define GVE_IP_PROTO_UDP    17u
-
-/* gve_pseudo_csum — parse pbuf for TCP/UDP, compute pseudo-header
- * checksum and seed the L4 checksum field (CHECKSUM_PARTIAL model).
- * Returns false for non-TCP/UDP or too-short packets.
- * On true: L4 checksum field already seeded; *proto and *l4_off filled
- * for callers that need them to program TX descriptor offload fields. */
-static inline boolean gve_pseudo_csum(struct pbuf *p,
-                                       u8 *proto_out, u16_t *l4_off_out)
-{
-    if (p->len < 14 + 20)
-        return false;
-
-    u8 *frame = (u8 *)p->payload;
-    u16_t ethertype = ((u16_t)frame[12] << 8) | frame[13];
-    u8    proto;
-    u16_t l4_hdr_off;
-    u32_t sum = 0;
-
-    if (ethertype == GVE_ETHERTYPE_IP4) {
-        struct ip_hdr *iph = (struct ip_hdr *)(frame + 14);
-        proto = IPH_PROTO(iph);
-        if (proto != GVE_IP_PROTO_TCP && proto != GVE_IP_PROTO_UDP)
-            return false;
-        u8_t ihl = IPH_HL_BYTES(iph);
-        l4_hdr_off = 14 + ihl;
-        u16_t l4_len = be16toh(IPH_LEN(iph)) - ihl;
-        const u8_t *sb = (const u8_t *)&iph->src;
-        const u8_t *db = (const u8_t *)&iph->dest;
-        sum = (((u32_t)sb[0] << 8) | sb[1]) + (((u32_t)sb[2] << 8) | sb[3]);
-        sum += (((u32_t)db[0] << 8) | db[1]) + (((u32_t)db[2] << 8) | db[3]);
-        sum += (u32_t)proto + (u32_t)l4_len;
-    } else if (ethertype == GVE_ETHERTYPE_IP6) {
-        if (p->len < 14 + 40)
-            return false;
-        struct ip6_hdr *ip6h = (struct ip6_hdr *)(frame + 14);
-        proto = IP6H_NEXTH(ip6h);
-        if (proto != GVE_IP_PROTO_TCP && proto != GVE_IP_PROTO_UDP)
-            return false;
-        l4_hdr_off = 14 + 40;
-        u16_t l4_len = IP6H_PLEN(ip6h);
-        const u8_t *sb = (const u8_t *)ip6h->src.addr;
-        const u8_t *db = (const u8_t *)ip6h->dest.addr;
-        for (int i = 0; i < 8; i++) {
-            sum += (((u32_t)sb[2*i] << 8) | sb[2*i+1]);
-            sum += (((u32_t)db[2*i] << 8) | db[2*i+1]);
-        }
-        sum += (u32_t)l4_len + (u32_t)proto;
-    } else {
-        return false;
-    }
-
-    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
-    u16_t pseudo_csum = htobe16(~(u16_t)sum);
-
-    if (proto == GVE_IP_PROTO_TCP)
-        ((struct tcp_hdr *)(frame + l4_hdr_off))->chksum = pseudo_csum;
-    else
-        ((struct udp_hdr *)(frame + l4_hdr_off))->chksum = pseudo_csum;
-
-    *proto_out  = proto;
-    *l4_off_out = l4_hdr_off;
-    return true;
 }
 
 /* ------------------------------------------------------------------ */

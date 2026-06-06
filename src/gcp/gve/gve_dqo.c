@@ -7,9 +7,8 @@
  *     rather than reading the event counter.
  *   - RX uses a buffer ring (driver posts) + completion ring (device fills).
  *   - Always raw addressing (no QPL); physical_from_virtual() for all bufs.
- *   - TX checksum offload: set checksum_offload_enable in dtype_flags and
- *     seed pseudo-header in the L4 checksum field (same CHECKSUM_PARTIAL
- *     model as GQI, but via the DQO descriptor flag instead of GVE_TXF_L4CSUM).
+ *   - Checksums are computed in software by lwIP (no HW offload), same
+ *     model as the ENA driver.
  *
  * Nanos-specific simplifications:
  *   - Identity-mapped address space: physical_from_virtual() is trivial.
@@ -107,18 +106,6 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
     }
 }
 
-/* gve_tx_dqo_fill_csum — DQO wrapper around gve_pseudo_csum (gve_priv.h).
- * The pseudo-header is seeded in the pbuf by the helper; DQO only needs
- * the checksum_offload_enable bit set in the descriptor. */
-static void gve_tx_dqo_fill_csum(struct pbuf *p,
-                                  struct gve_tx_pkt_desc_dqo *desc)
-{
-    u8 proto; u16_t l4_off;
-    if (!gve_pseudo_csum(p, &proto, &l4_off))
-        return;
-    desc->dtype_flags |= GVE_DQO_TX_CSUM_EN;
-}
-
 /*
  * gve_tx_write_dqo — post one pbuf chain as DQO TX descriptors.
  * Must be called with tx->ring_mtx held.
@@ -148,7 +135,6 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
 
         if (q->next == NULL) {
             desc->dtype_flags |= GVE_DQO_TX_EOP | GVE_DQO_TX_REPORT;
-            gve_tx_dqo_fill_csum(p, desc);
             last_slot = slot;
         }
 
