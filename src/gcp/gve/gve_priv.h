@@ -17,10 +17,6 @@
 
 #include <kernel.h>
 #include <lwip.h>
-#include <lwip/prot/ip4.h>
-#include <lwip/prot/ip6.h>
-#include <lwip/prot/tcp.h>
-#include <lwip/prot/udp.h>
 #include <netif/ethernet.h>
 #include <pci.h>
 

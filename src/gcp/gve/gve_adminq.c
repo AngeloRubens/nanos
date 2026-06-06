@@ -432,6 +432,13 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     if (rx->desc == INVALID_ADDRESS)
         goto err_after_pbufs;
 
+    /* The completion-descriptor ring (rx->desc, rx_desc_cnt entries) and the
+     * data ring (rx->data, rx_data_slot_cnt entries) are both indexed with
+     * rx->mask (= rx_desc_cnt - 1) in the hot path.  This relies on the
+     * GQI invariant rx_queue_entries == rx_pages_per_qpl: GVE reports equal
+     * values for both, so the single mask is valid for both rings.  If a
+     * device ever reported rx_data_slot_cnt < rx_desc_cnt, rx->data would be
+     * indexed out of bounds. */
     rx->data = allocate(adapter->contiguous,
                         adapter->rx_data_slot_cnt * sizeof(*rx->data));
     if (rx->data == INVALID_ADDRESS)
