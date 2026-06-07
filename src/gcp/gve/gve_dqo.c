@@ -66,6 +66,8 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
                 for (u16_t k = 0; k < seg_cnt; k++)
                     tx->tx_timestamps[(u16_t)(tag - k) & tx->mask] = 0;
                 tx->desc_tail += seg_cnt;
+                if (tx->adapter->dqo_qpl)
+                    tx->qpl_used -= tx->qpl_allocated[tag];
                 if (tx->pending[tag]) {
                     pbuf_free(tx->pending[tag]);
                     tx->pending[tag] = NULL;
@@ -89,6 +91,8 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             for (u16_t k = 0; k < seg_cnt; k++)
                 tx->tx_timestamps[(u16_t)(tag - k) & tx->mask] = 0;
             tx->desc_tail += seg_cnt;
+            if (tx->adapter->dqo_qpl)
+                tx->qpl_used -= tx->qpl_allocated[tag];
             if (tx->pending[tag]) {
                 pbuf_free(tx->pending[tag]);
                 tx->pending[tag] = NULL;
@@ -115,6 +119,7 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
  */
 static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
 {
+    boolean qpl = tx->adapter->dqo_qpl;
     int seg_count = 0;
     for (struct pbuf *q = p; q != NULL; q = q->next)
         seg_count++;
@@ -135,6 +140,20 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
     if (tx->head - tx->desc_tail + total_descs > (u32)(tx->mask + 1))
         return false;
 
+    /* DQO-QPL: the payload is bounce-copied into the registered QPL ring, so
+     * also check there is room for it (wrap-aware, same as GQI-QPL). */
+    if (qpl) {
+        u32 qpl_needed = 0;
+        for (struct pbuf *q = p; q != NULL; q = q->next) {
+            u32 padded   = pad(q->len, GVE_TX_PAD);
+            u32 sim_head = (tx->qpl_head + qpl_needed) % tx->qpl_size;
+            u32 remain   = tx->qpl_size - sim_head;
+            qpl_needed  += (padded > remain) ? padded + remain : padded;
+        }
+        if (tx->qpl_used + qpl_needed > tx->qpl_size)
+            return false;
+    }
+
     /* One completion tag per packet, stamped on every packet descriptor: the
      * EOP slot is unique among outstanding packets, so we reuse it as the tag
      * (the device echoes a single tag in the packet completion). */
@@ -153,11 +172,30 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
         tx->head++;
     }
 
+    u32 qpl_total = 0;
     for (struct pbuf *q = p; q != NULL; q = q->next) {
         u32 slot = tx->head & tx->mask;
         struct gve_tx_pkt_desc_dqo *desc = &tx->desc[slot];
 
-        desc->buf_addr    = physical_from_virtual(q->payload);
+        if (qpl) {
+            /* Copy the segment into the QPL ring; the descriptor carries the
+             * physical address of the copy (wrap-aware, same as GQI-QPL). */
+            u32 padded = pad(q->len, GVE_TX_PAD);
+            u32 remain = tx->qpl_size - tx->qpl_head;
+            if (padded > remain) {
+                qpl_total += remain;
+                tx->qpl_head = 0;
+            }
+            u32 offset = tx->qpl_head;
+            runtime_memcpy((u8 *)tx->qpl_base + offset, q->payload, q->len);
+            tx->qpl_head += padded;
+            if (tx->qpl_head == tx->qpl_size)
+                tx->qpl_head = 0;
+            qpl_total += padded;
+            desc->buf_addr = tx->qpl_base_phys + offset;
+        } else {
+            desc->buf_addr = physical_from_virtual(q->payload);
+        }
         desc->dtype_flags = GVE_DQO_TX_DTYPE_PKT;
         desc->reserved0   = 0;
         desc->reserved1   = 0;
@@ -184,7 +222,18 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
         tx->last_re_idx = last_desc_idx;
     }
 
-    tx->pending[eop_slot]    = p;            /* ref from br-enqueue */
+    /* In QPL mode the payload has been copied, so the pbuf is freed by the
+     * caller and nothing is pending; we only need to release the QPL bytes on
+     * completion.  In RDA mode the descriptor references the pbuf directly, so
+     * it stays pending until the completion. */
+    if (qpl) {
+        tx->qpl_allocated[eop_slot] = qpl_total;
+        tx->qpl_used += qpl_total;
+        tx->pending[eop_slot] = NULL;
+        pbuf_free(p);          /* payload copied into the QPL; pbuf done */
+    } else {
+        tx->pending[eop_slot] = p;           /* ref from br-enqueue */
+    }
     tx->seg_counts[eop_slot] = (u16_t)total_descs;
     return true;
 }
@@ -302,19 +351,27 @@ void gve_rx_dqo_fill(gve_rx_dqo_queue rx)
             break;
 
         u16 buf_id = rx->free_ids[rx->next_to_use & rx->mask];
-        struct pbuf *pb = pbuf_alloc(PBUF_RAW, GVE_DQO_BUF_SIZE, PBUF_RAM);
-        if (!pb) {
-            rx->rx_stats.refil_partial++;
-            break;
+        u64 buf_addr;
+        if (adapter->dqo_qpl) {
+            /* QPL: the buffer is a fixed slot in the registered region; the
+             * descriptor carries its physical address (no per-buffer pbuf). */
+            buf_addr = rx->qpl_base_phys + (u64)buf_id * GVE_DQO_BUF_SIZE;
+        } else {
+            struct pbuf *pb = pbuf_alloc(PBUF_RAW, GVE_DQO_BUF_SIZE, PBUF_RAM);
+            if (!pb) {
+                rx->rx_stats.refil_partial++;
+                break;
+            }
+            rx->pbufs[buf_id] = pb;
+            buf_addr = physical_from_virtual(pb->payload);
         }
-        rx->pbufs[buf_id] = pb;
         rx->next_to_use++;
 
         struct gve_rx_buf_desc_dqo *bd = &rx->buf_ring[rx->buf_head & rx->mask];
         bd->buf_id          = buf_id;
         bd->reserved0       = 0;
         bd->reserved1       = 0;
-        bd->buf_addr        = physical_from_virtual(pb->payload);
+        bd->buf_addr        = buf_addr;
         bd->header_buf_addr = 0;
         bd->reserved2       = 0;
 
@@ -360,44 +417,66 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                 break;
             }
 
-            u16_t buf_id = c->buf_id & rx->mask;
-            struct pbuf *inp = rx->pbufs[buf_id];
+            u16_t buf_id   = c->buf_id & rx->mask;
+            boolean eop    = !!(c->status0 & GVE_DQO_RX_EOP);
+            boolean rx_err = !!(c->err_flags & GVE_DQO_RX_ERR);
+            /* DQO has no leading IP-alignment pad: packet_len is this buffer's
+             * data length, data at offset 0 (verified against Google). */
+            u16_t pkt_len  = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
+            struct pbuf *inp;
 
-            /* Guard against spurious completions: only return the ID to
-             * the free list if we actually had a buffer posted to this
-             * slot.  An unconditional return would insert a duplicate
-             * and cause a future double-free. */
-            if (!inp) {
-                rx->rx_stats.bad_req_id++;
-                goto advance;
-            }
-
-            /* Claim the slot and return the ID before net_if->input() —
-             * same pattern as ENA (rx_info->mbuf = NULL before input).
-             * Makes the slot immediately available for refill regardless
-             * of how long lwIP holds the pbuf. */
-            rx->pbufs[buf_id] = NULL;
-            rx->free_ids[rx->next_to_clean & rx->mask] = buf_id;
-            rx->next_to_clean++;
-
-            boolean eop = !!(c->status0 & GVE_DQO_RX_EOP);
-
-            if (c->err_flags & GVE_DQO_RX_ERR) {
-                gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
-                rx->rx_stats.rx_dropped++;
-                pbuf_free(inp);
-                if (rx->ctx_head) {     /* discard the partial packet too */
-                    pbuf_free(rx->ctx_head);
-                    rx->ctx_head = NULL;
+            if (adapter->dqo_qpl) {
+                /* QPL: data is in the registered page; copy it out into a fresh
+                 * pbuf and recycle the buffer id immediately. */
+                rx->free_ids[rx->next_to_clean & rx->mask] = buf_id;
+                rx->next_to_clean++;
+                if (rx_err || pkt_len == 0) {
+                    if (rx_err)
+                        rx->rx_stats.rx_dropped++;
+                    if (rx->ctx_head) {
+                        pbuf_free(rx->ctx_head);
+                        rx->ctx_head = NULL;
+                    }
+                    goto advance;
                 }
-                goto advance;
+                inp = pbuf_alloc(PBUF_RAW, pkt_len, PBUF_RAM);
+                if (!inp) {
+                    rx->rx_stats.rx_dropped++;
+                    if (rx->ctx_head) {
+                        pbuf_free(rx->ctx_head);
+                        rx->ctx_head = NULL;
+                    }
+                    goto advance;
+                }
+                pbuf_take(inp,
+                          (u8 *)rx->qpl_base + (u64)buf_id * GVE_DQO_BUF_SIZE,
+                          pkt_len);
+                rx->rx_stats.rx_copy++;
+            } else {
+                /* RDA: the posted pbuf is the data buffer. */
+                inp = rx->pbufs[buf_id];
+                /* Guard against spurious completions (no pbuf was posted). */
+                if (!inp) {
+                    rx->rx_stats.bad_req_id++;
+                    goto advance;
+                }
+                /* Claim the slot and return the ID before net_if->input(),
+                 * same pattern as ENA (rx_info->mbuf = NULL before input). */
+                rx->pbufs[buf_id] = NULL;
+                rx->free_ids[rx->next_to_clean & rx->mask] = buf_id;
+                rx->next_to_clean++;
+                if (rx_err) {
+                    gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
+                    rx->rx_stats.rx_dropped++;
+                    pbuf_free(inp);
+                    if (rx->ctx_head) {
+                        pbuf_free(rx->ctx_head);
+                        rx->ctx_head = NULL;
+                    }
+                    goto advance;
+                }
+                inp->len = inp->tot_len = pkt_len;
             }
-
-            /* DQO has no leading IP-alignment pad (unlike GQI, which pads 2
-             * bytes on the first buffer): packet_len is this buffer's data
-             * length and the data starts at offset 0.  Verified against the
-             * official Google driver (buf_len = packet_len, page pad = 0). */
-            inp->len = inp->tot_len = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
 
             /* Accumulate the buffers of a multi-buffer packet (same pbuf_cat
              * loop as ena_rx_mbuf); deliver the chain on end_of_packet. */

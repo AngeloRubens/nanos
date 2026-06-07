@@ -139,11 +139,10 @@ enum gve_adminq_opcode {
  * offers one we cannot handle (e.g. DQO-QPL, flexible buffer sizes). */
 #define GVE_CAP1_GQI_QPL    (1ull << 0)
 #define GVE_CAP1_GQI_RDA    (1ull << 1)
+#define GVE_CAP1_DQO_QPL    (1ull << 2)
 #define GVE_CAP1_DQO_RDA    (1ull << 3)
-/* DQO-QPL (bit 2) not declared until its datapath is implemented, so the
- * device will not offer that format. */
 #define GVE_DRIVER_CAPABILITY_FLAGS1 \
-    (GVE_CAP1_GQI_QPL | GVE_CAP1_GQI_RDA | GVE_CAP1_DQO_RDA)
+    (GVE_CAP1_GQI_QPL | GVE_CAP1_GQI_RDA | GVE_CAP1_DQO_QPL | GVE_CAP1_DQO_RDA)
 
 #define GVE_VERSION_STR_LEN 128
 

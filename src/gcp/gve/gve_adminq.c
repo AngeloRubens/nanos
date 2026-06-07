@@ -152,14 +152,12 @@ boolean gve_describe_device(gve adapter)
         }
         if (opt_dqo_rda) {
             adapter->dqo = true;
+        } else if (opt_dqo_qpl) {
+            adapter->dqo = true;
+            adapter->dqo_qpl = true;
         } else if (opt_gqi_rda) {
             adapter->raw_addressing = true;
-        }   /* else: GQI-QPL fallback (both flags false) */
-        /* DQO-QPL addressing verified against Google (physical addresses into
-         * a registered QPL, 2048-byte buffers): datapath = DQO-RDA + bounce
-         * copy.  Not yet wired into the create/datapath, so detected but not
-         * selected (safe GQI-QPL fallback). */
-        (void)opt_dqo_qpl;
+        }   /* else: GQI-QPL fallback (all flags false) */
 
         const char *fmt =
             adapter->dqo ? (adapter->dqo_qpl ? "DQO-QPL" : "DQO-RDA") :
@@ -687,6 +685,21 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     if (tx->br == INVALID_ADDRESS)
         goto err_timestamps;
 
+    /* DQO-QPL: bounce ring from a registered QPL (the device addresses it by
+     * physical address, same as RDA, but requires the pages to be registered). */
+    if (adapter->dqo_qpl) {
+        tx->qpl_base = gve_create_qpl(adapter, adapter->tx_pages_per_qpl, index);
+        if (tx->qpl_base == INVALID_ADDRESS)
+            goto err_br;
+        tx->qpl_allocated = allocate(adapter->general,
+                                     desc_cnt * sizeof(*tx->qpl_allocated));
+        if (tx->qpl_allocated == INVALID_ADDRESS) {
+            gve_destroy_qpl(adapter, tx->qpl_base,
+                            adapter->tx_pages_per_qpl, index);
+            goto err_br;
+        }
+    }
+
     struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
     cmd->opcode = htobe32(GVE_ADMINQ_CREATE_TX_QUEUE);
     cmd->create_tx_queue.queue_id             = htobe32(index);
@@ -695,7 +708,7 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     cmd->create_tx_queue.tx_ring_addr         =
         htobe64(physical_from_virtual(tx->desc));
     cmd->create_tx_queue.queue_page_list_id   =
-        htobe32(GVE_RAW_ADDRESSING_QPL_ID);
+        htobe32(adapter->dqo_qpl ? index : GVE_RAW_ADDRESSING_QPL_ID);
     cmd->create_tx_queue.ntfy_id              =
         htobe32(GVE_IRQ_DB_TX(adapter->num_queues, index));
     cmd->create_tx_queue.tx_ring_size         = htobe16(desc_cnt);
@@ -717,11 +730,24 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     tx->pending_misses   = 0;
     tx->last_re_idx      = 0;
     tx->db_idx           = be32toh(tx->q_res->db_index);
+    if (adapter->dqo_qpl) {
+        tx->qpl_base_phys = physical_from_virtual(tx->qpl_base);
+        tx->qpl_head = 0;
+        tx->qpl_used = 0;
+        tx->qpl_size = adapter->tx_pages_per_qpl * PAGESIZE;
+    }
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
     gve_tx_init_dqo(tx);
     return true;
 
   err_cmd:
+    if (adapter->dqo_qpl) {
+        deallocate(adapter->general, tx->qpl_allocated,
+                   desc_cnt * sizeof(*tx->qpl_allocated));
+        gve_destroy_qpl(adapter, tx->qpl_base,
+                        adapter->tx_pages_per_qpl, index);
+    }
+  err_br:
     deallocate_queue(tx->br);
   err_timestamps:
     deallocate(adapter->general, tx->tx_timestamps,
@@ -789,6 +815,14 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
     deallocate(adapter->contiguous, tx->desc,
                desc_cnt * sizeof(*tx->desc));
     tx->desc = NULL;
+    if (adapter->dqo_qpl) {
+        deallocate(adapter->general, tx->qpl_allocated,
+                   desc_cnt * sizeof(*tx->qpl_allocated));
+        tx->qpl_allocated = NULL;
+        gve_destroy_qpl(adapter, tx->qpl_base,
+                        adapter->tx_pages_per_qpl, index);
+        tx->qpl_base = NULL;
+    }
 
     spin_unlock(&tx->ring_mtx);
 }
@@ -798,6 +832,9 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
 {
     u32 num_bufs  = adapter->rx_data_slot_cnt;
     u32 nq        = adapter->num_queues;
+    /* DQO-QPL: contiguous registered region of num_bufs buffers, GVE_DQO_BUF_SIZE
+     * each (buf_id i lives at qpl_base + i*GVE_DQO_BUF_SIZE). */
+    u32 qpl_pages = (num_bufs * GVE_DQO_BUF_SIZE + PAGESIZE - 1) >> PAGELOG;
 
     rx->pbufs = allocate(adapter->general,
                          num_bufs * sizeof(*rx->pbufs));
@@ -828,6 +865,13 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     if (rx->q_res == INVALID_ADDRESS)
         goto err_q_res;
 
+    if (adapter->dqo_qpl) {
+        rx->qpl_base = gve_create_qpl(adapter, qpl_pages, nq + index);
+        if (rx->qpl_base == INVALID_ADDRESS)
+            goto err_qpl;
+        rx->qpl_base_phys = physical_from_virtual(rx->qpl_base);
+    }
+
     struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
     cmd->opcode = htobe32(GVE_ADMINQ_CREATE_RX_QUEUE);
     cmd->create_rx_queue.queue_id =
@@ -840,7 +884,7 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     cmd->create_rx_queue.rx_data_ring_addr =   /* buffer ring */
         htobe64(physical_from_virtual(rx->buf_ring));
     cmd->create_rx_queue.queue_page_list_id  =
-        htobe32(GVE_RAW_ADDRESSING_QPL_ID);
+        htobe32(adapter->dqo_qpl ? (nq + index) : GVE_RAW_ADDRESSING_QPL_ID);
     cmd->create_rx_queue.rx_ring_size        = htobe16(num_bufs);
     cmd->create_rx_queue.packet_buffer_size  = htobe16(GVE_DQO_BUF_SIZE);
     cmd->create_rx_queue.rx_buff_ring_size   = htobe16(num_bufs);
@@ -872,6 +916,9 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     return true;
 
   err_cmd:
+    if (adapter->dqo_qpl)
+        gve_destroy_qpl(adapter, rx->qpl_base, qpl_pages, nq + index);
+  err_qpl:
     deallocate(adapter->contiguous, rx->q_res, sizeof(*rx->q_res));
   err_q_res:
     deallocate(adapter->contiguous, rx->compl_ring,
@@ -925,6 +972,12 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
     deallocate(adapter->general,    rx->pbufs,
                num_bufs * sizeof(*rx->pbufs));
     rx->pbufs = NULL;
+    if (adapter->dqo_qpl) {
+        u32 qpl_pages = (num_bufs * GVE_DQO_BUF_SIZE + PAGESIZE - 1) >> PAGELOG;
+        gve_destroy_qpl(adapter, rx->qpl_base, qpl_pages,
+                        adapter->num_queues + index);
+        rx->qpl_base = NULL;
+    }
 }
 
 /* ------------------------------------------------------------------ */
