@@ -640,6 +640,7 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     tx->stuck            = false;
     tx->running          = true;
     tx->pending_misses   = 0;
+    tx->last_re_idx      = 0;
     tx->db_idx           = be32toh(tx->q_res->db_index);
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
     gve_tx_init_dqo(tx);

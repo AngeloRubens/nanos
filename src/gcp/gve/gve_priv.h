@@ -269,6 +269,8 @@ struct gve_adminq_command {
 /* ------------------------------------------------------------------ */
 
 #define GVE_IRQ_ACK     htobe32(U32_FROM_BIT(31))
+#define GVE_IRQ_MASK    htobe32(U32_FROM_BIT(30))
+#define GVE_IRQ_EVENT   htobe32(U32_FROM_BIT(29))
 
 /*
  * IRQ DB slots: one TX + one RX per queue pair, plus one management.
@@ -319,7 +321,32 @@ struct gve_tx_pkt_desc_dqo {
 /* dtype must be GVE_DQO_TX_DTYPE_PKT (0xc) for packet descriptors. */
 #define GVE_DQO_TX_DTYPE_PKT    0x0cu
 #define GVE_DQO_TX_EOP          0x20u   /* end_of_packet */
-#define GVE_DQO_TX_REPORT       0x80u   /* report_event: generate TX completion */
+#define GVE_DQO_TX_REPORT       0x80u   /* report_event: request a DESC completion */
+
+/*
+ * DQO TX general context descriptor — 16 bytes, little-endian.
+ * The device requires a context descriptor (dtype 0x4) ahead of the packet
+ * descriptors of every TX packet (matches the official Google driver, which
+ * always emits gve_tx_general_context_desc_dqo).  We carry no metadata, so
+ * the flex fields are left zero; only cmd_dtype must be set.
+ */
+struct gve_tx_ctx_desc_dqo {
+    u8  flex_hi[8];     /* bytes 0-7: metadata flex (zero) */
+    u8  cmd_dtype;      /* byte 8: dtype[4:0] | tso[5] */
+    u8  reserved0;      /* byte 9 */
+    u16 reserved1;      /* bytes 10-11 */
+    u8  flex_lo[4];     /* bytes 12-15: metadata flex (zero) */
+} __attribute__((packed));
+
+#define GVE_DQO_TX_DTYPE_CTX    0x04u   /* general context descriptor dtype */
+
+/* report_event spacing: the device requires DESC completions (requested via
+ * report_event) to be at least this many descriptors apart (Google
+ * GVE_TX_MIN_RE_INTERVAL). */
+#define GVE_TX_MIN_RE_INTERVAL  32
+
+/* Max data descriptors per TX packet (Google GVE_TX_MAX_DATA_DESCS). */
+#define GVE_TX_MAX_DATA_DESCS   10
 
 /*
  * DQO TX completion descriptor — 8 bytes, little-endian.
@@ -618,6 +645,8 @@ typedef struct gve_tx_dqo_queue {
     /* Watchdog: per-slot submission timestamp (same model as GQI above). */
     timestamp *tx_timestamps;
     boolean    stuck;
+
+    u32              last_re_idx;  /* desc idx of last report_event (DESC compl spacing) */
 
     queue            br;
     boolean          running;

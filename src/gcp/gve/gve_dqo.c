@@ -118,10 +118,41 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
     int seg_count = 0;
     for (struct pbuf *q = p; q != NULL; q = q->next)
         seg_count++;
-    if (tx->head - tx->desc_tail + seg_count > (u32)(tx->mask + 1))
+
+    /* The device caps a packet at GVE_TX_MAX_DATA_DESCS data descriptors.
+     * lwIP virtually never produces such long chains for non-TSO traffic;
+     * drop rather than wedge the queue (returning false would re-enqueue the
+     * same unsendable packet forever). */
+    if (seg_count > GVE_TX_MAX_DATA_DESCS) {
+        pbuf_free(p);
+        return true;   /* consumed (dropped) */
+    }
+
+    /* Every packet is one general context descriptor (dtype 0x4) followed by
+     * seg_count packet descriptors — the context descriptor is mandatory
+     * (matches the official Google driver). */
+    u32 total_descs = 1 + seg_count;
+    if (tx->head - tx->desc_tail + total_descs > (u32)(tx->mask + 1))
         return false;
 
-    u32 last_slot = 0;
+    /* One completion tag per packet, stamped on every packet descriptor: the
+     * EOP slot is unique among outstanding packets, so we reuse it as the tag
+     * (the device echoes a single tag in the packet completion). */
+    u16_t eop_slot = (u16_t)((tx->head + seg_count) & tx->mask);
+
+    /* General context descriptor: no metadata, so all flex fields stay zero. */
+    {
+        u32 slot = tx->head & tx->mask;
+        struct gve_tx_ctx_desc_dqo *ctx =
+            (struct gve_tx_ctx_desc_dqo *)&tx->desc[slot];
+        zero(ctx, sizeof(*ctx));
+        ctx->cmd_dtype = GVE_DQO_TX_DTYPE_CTX;
+        tx->pending[slot]       = NULL;
+        tx->seg_counts[slot]    = 0;
+        tx->tx_timestamps[slot] = now(CLOCK_ID_MONOTONIC);
+        tx->head++;
+    }
+
     for (struct pbuf *q = p; q != NULL; q = q->next) {
         u32 slot = tx->head & tx->mask;
         struct gve_tx_pkt_desc_dqo *desc = &tx->desc[slot];
@@ -130,21 +161,31 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
         desc->dtype_flags = GVE_DQO_TX_DTYPE_PKT;
         desc->reserved0   = 0;
         desc->reserved1   = 0;
-        desc->compl_tag   = (u16_t)slot;
+        desc->compl_tag   = eop_slot;
         desc->buf_size    = (u16_t)(q->len);
 
-        if (q->next == NULL) {
-            desc->dtype_flags |= GVE_DQO_TX_EOP | GVE_DQO_TX_REPORT;
-            last_slot = slot;
-        }
+        if (q->next == NULL)
+            desc->dtype_flags |= GVE_DQO_TX_EOP;
 
         tx->pending[slot]       = NULL;
         tx->seg_counts[slot]    = 0;
         tx->tx_timestamps[slot] = now(CLOCK_ID_MONOTONIC);
         tx->head++;
     }
-    tx->pending[last_slot]    = p;    /* ref from br-enqueue */
-    tx->seg_counts[last_slot] = (u16_t)seg_count;
+
+    /* Request a DESC completion only every GVE_TX_MIN_RE_INTERVAL descriptors.
+     * report_event generates a (type 0x4) descriptor completion; per-packet
+     * packet completions are produced regardless, so we keep these sparse to
+     * avoid flooding the completion ring (matches Google). */
+    u32 last_desc_idx = (tx->head - 1) & tx->mask;
+    if (((last_desc_idx - tx->last_re_idx) & tx->mask) >= GVE_TX_MIN_RE_INTERVAL) {
+        ((struct gve_tx_pkt_desc_dqo *)&tx->desc[last_desc_idx])->dtype_flags
+            |= GVE_DQO_TX_REPORT;
+        tx->last_re_idx = last_desc_idx;
+    }
+
+    tx->pending[eop_slot]    = p;            /* ref from br-enqueue */
+    tx->seg_counts[eop_slot] = (u16_t)total_descs;
     return true;
 }
 
@@ -384,9 +425,11 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
     }
 
     if (!irq_acked) {
+        /* DQO re-arms the interrupt with ACK|EVENT (matches the official
+         * Google driver's NAPI path); GQI uses ACK alone (gve_rx_service). */
         pci_bar_write_4(&adapter->db_bar,
                         be32toh(*rx->irq_db_index) * sizeof(u32),
-                        GVE_IRQ_ACK);
+                        GVE_IRQ_ACK | GVE_IRQ_EVENT);
         irq_acked = true;
         memory_barrier();
         goto begin;
