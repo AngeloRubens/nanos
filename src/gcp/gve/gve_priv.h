@@ -105,6 +105,7 @@
 #define GVE_DEV_OPT_ID_GQI_RDA             0x2
 #define GVE_DEV_OPT_ID_GQI_QPL             0x3
 #define GVE_DEV_OPT_ID_DQO_RDA             0x4
+#define GVE_DEV_OPT_ID_DQO_QPL             0x7
 
 /* Admin queue polling: exponential backoff from GVE_ADMINQ_MIN_POLL_US to
  * GVE_ADMINQ_MAX_POLL_US (mirrors ENA ena_delay_exponential_backoff_us).
@@ -139,6 +140,8 @@ enum gve_adminq_opcode {
 #define GVE_CAP1_GQI_QPL    (1ull << 0)
 #define GVE_CAP1_GQI_RDA    (1ull << 1)
 #define GVE_CAP1_DQO_RDA    (1ull << 3)
+/* DQO-QPL (bit 2) is intentionally not declared: its datapath is not
+ * implemented, so we must not let the device offer that format. */
 #define GVE_DRIVER_CAPABILITY_FLAGS1 \
     (GVE_CAP1_GQI_QPL | GVE_CAP1_GQI_RDA | GVE_CAP1_DQO_RDA)
 
@@ -218,6 +221,7 @@ enum gve_queue_format {
     GVE_GQI_RDA_FORMAT,
     GVE_GQI_QPL_FORMAT,
     GVE_DQO_RDA_FORMAT,
+    GVE_DQO_QPL_FORMAT,
 };
 
 struct gve_adminq_configure_device_resources {
@@ -769,6 +773,7 @@ typedef struct gve {
     u32    num_queues;
     boolean raw_addressing;  /* GQI-RDA when true; GQI-QPL when false */
     boolean dqo;             /* DQO format (Andromeda 2.x) overrides GQI */
+    boolean dqo_qpl;         /* DQO-QPL (bounce pages) when true; DQO-RDA when false */
 
     /* GQI queues (used when !dqo) */
     struct gve_tx_queue tx[GVE_MAX_IO_QUEUES];

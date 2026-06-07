@@ -128,8 +128,10 @@ boolean gve_describe_device(gve adapter)
         adapter->tx_pages_per_qpl_dev = adapter->tx_pages_per_qpl;
         adapter->rx_data_slot_cnt_dev = adapter->rx_data_slot_cnt;
 
-        /* Walk device option list.
-         * Priority: DQO-RDA > GQI-RDA > GQI-QPL. */
+        /* Walk device option list, collecting which formats the device
+         * offers, then pick the best by priority (order-independent):
+         * DQO-RDA > DQO-QPL > GQI-RDA > GQI-QPL. */
+        boolean opt_dqo_rda = false, opt_dqo_qpl = false, opt_gqi_rda = false;
         u16 num_opts   = be16toh(desc->num_device_options);
         u16 total_len  = be16toh(desc->total_length);
         struct gve_device_option *opt =
@@ -140,16 +142,29 @@ boolean gve_describe_device(gve adapter)
             u16 id  = be16toh(opt->option_id);
             u16 len = be16toh(opt->option_length);
             if (id == GVE_DEV_OPT_ID_DQO_RDA)
-                adapter->dqo = true;
-            else if (!adapter->dqo &&
-                     (id == GVE_DEV_OPT_ID_GQI_RDA ||
-                      id == GVE_DEV_OPT_ID_GQI_RAW_ADDRESSING))
-                adapter->raw_addressing = true;
+                opt_dqo_rda = true;
+            else if (id == GVE_DEV_OPT_ID_DQO_QPL)
+                opt_dqo_qpl = true;
+            else if (id == GVE_DEV_OPT_ID_GQI_RDA ||
+                     id == GVE_DEV_OPT_ID_GQI_RAW_ADDRESSING)
+                opt_gqi_rda = true;
             opt = (struct gve_device_option *)((u8 *)(opt + 1) + len);
         }
+        if (opt_dqo_rda) {
+            adapter->dqo = true;
+        } else if (opt_gqi_rda) {
+            adapter->raw_addressing = true;
+        }   /* else: GQI-QPL fallback (both flags false) */
+        /* DQO-QPL (opt_dqo_qpl) is detected but its bounce-buffer datapath is
+         * not implemented yet, so we do not select it — falling back to
+         * GQI-QPL (always available) on a DQO-QPL-only device.  Implementing
+         * it requires verifying the QPL buffer addressing against the Google
+         * driver first. */
+        (void)opt_dqo_qpl;
 
-        const char *fmt = adapter->dqo    ? "DQO-RDA" :
-                          adapter->raw_addressing ? "GQI-RDA" : "GQI-QPL";
+        const char *fmt =
+            adapter->dqo ? (adapter->dqo_qpl ? "DQO-QPL" : "DQO-RDA") :
+            adapter->raw_addressing ? "GQI-RDA" : "GQI-QPL";
         rprintf("GVE: MAC %02x:%02x:%02x:%02x:%02x:%02x MTU %d "
                 "TX-desc %d RX-desc %d format %s\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -188,7 +203,7 @@ boolean gve_cfg_device_resources(gve adapter)
         htobe32(sizeof(*adapter->irq_db_indices));
     cmd->cfg_dev_resources.ntfy_blk_msix_base_idx = htobe32(0);
     cmd->cfg_dev_resources.queue_format =
-        adapter->dqo ? GVE_DQO_RDA_FORMAT :
+        adapter->dqo ? (adapter->dqo_qpl ? GVE_DQO_QPL_FORMAT : GVE_DQO_RDA_FORMAT) :
         adapter->raw_addressing ? GVE_GQI_RDA_FORMAT : GVE_GQI_QPL_FORMAT;
 
     boolean success = gve_adminq_execute_cmd(adapter, cmd);
