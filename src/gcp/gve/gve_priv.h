@@ -248,6 +248,15 @@ struct gve_adminq_destroy_rx_queue {
     u32 queue_id;
 } __attribute__((packed));
 
+struct gve_adminq_get_ptype_map {
+    u64 ptype_map_len;
+    u64 ptype_map_addr;
+} __attribute__((packed));
+
+/* Packet-type map: GVE_NUM_PTYPES (10-bit space) entries of 2 bytes each. */
+#define GVE_NUM_PTYPES      1024
+#define GVE_PTYPE_MAP_SIZE  (GVE_NUM_PTYPES * 2)
+
 struct gve_adminq_command {
     u32 opcode;
     u32 status;
@@ -260,6 +269,7 @@ struct gve_adminq_command {
         struct gve_adminq_create_rx_queue           create_rx_queue;
         struct gve_adminq_destroy_tx_queue          destroy_tx_queue;
         struct gve_adminq_destroy_rx_queue          destroy_rx_queue;
+        struct gve_adminq_get_ptype_map             get_ptype_map;
         u8 padding[56];     /* struct size = 64 bytes */
     };
 } __attribute__((packed));
@@ -762,6 +772,7 @@ static inline void gve_trigger_reset(gve adapter)
 boolean gve_describe_device(gve adapter);
 boolean gve_cfg_device_resources(gve adapter);
 void    gve_free_device_resources(gve adapter);
+boolean gve_get_ptype_map_dqo(gve adapter);
 u32     gve_calc_num_queues(gve adapter, tuple config);
 boolean gve_setup_queues(gve adapter);
 void    gve_teardown_queues(gve adapter);

@@ -113,6 +113,11 @@ closure_func_basic(thunk, void, gve_reset)
         msg_err("GVE: reset: failed to reconfigure device resources");
         goto done;
     }
+    if (adapter->dqo && !gve_get_ptype_map_dqo(adapter)) {
+        msg_err("GVE: reset: failed to get DQO ptype map");
+        gve_free_device_resources(adapter);
+        goto done;
+    }
     if (!gve_setup_queues(adapter)) {
         msg_err("GVE: reset: failed to recreate queues");
         gve_free_device_resources(adapter);
@@ -434,6 +439,11 @@ static boolean gve_init(gve adapter, tuple config)
     if (!gve_cfg_device_resources(adapter)) {
         msg_err("GVE: failed to configure device resources");
         goto err1;
+    }
+    /* DQO requires the driver to fetch the packet-type map before queues. */
+    if (adapter->dqo && !gve_get_ptype_map_dqo(adapter)) {
+        msg_err("GVE: failed to get DQO ptype map");
+        goto err2;
     }
     if (!gve_init_interrupts(adapter)) {
         msg_err("GVE: failed to initialize interrupts");

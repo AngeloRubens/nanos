@@ -187,6 +187,30 @@ void gve_free_device_resources(gve adapter)
     adapter->event_counters = NULL;
 }
 
+/*
+ * gve_get_ptype_map_dqo — fetch the packet-type map (DQO only).
+ *
+ * The device requires the driver to issue GET_PTYPE_MAP for DQO queue
+ * formats (the official Google driver does this at init and aborts on
+ * failure).  We compute checksums in software and do not consume the map,
+ * so we issue the command only to satisfy the device and discard the
+ * result.
+ */
+boolean gve_get_ptype_map_dqo(gve adapter)
+{
+    void *ptype_map = allocate(adapter->contiguous, PAGESIZE);
+    if (ptype_map == INVALID_ADDRESS)
+        return false;
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_GET_PTYPE_MAP);
+    cmd->get_ptype_map.ptype_map_len  = htobe64(GVE_PTYPE_MAP_SIZE);
+    cmd->get_ptype_map.ptype_map_addr =
+        htobe64(physical_from_virtual(ptype_map));
+    boolean success = gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, ptype_map, PAGESIZE);
+    return success;
+}
+
 /* ------------------------------------------------------------------ */
 /* QPL management                                                       */
 /* ------------------------------------------------------------------ */
