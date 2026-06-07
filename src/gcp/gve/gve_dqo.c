@@ -346,13 +346,17 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                 goto advance;
             }
 
+            /* DQO has no leading IP-alignment pad (unlike GQI, which pads 2
+             * bytes on the first buffer): packet_len is the full frame length
+             * and the data starts at buffer offset 0.  Verified against the
+             * official Google driver (gve_rx_dqo.c: buf_len = packet_len with
+             * page_info.pad = 0 for the non-XDP case). */
             u16_t pkt_len = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
-            if (pkt_len <= GVE_RX_PADDING) {
+            if (pkt_len == 0) {
                 pbuf_free(inp);
                 goto advance;
             }
-            u16_t data_len = pkt_len - GVE_RX_PADDING;
-            inp->payload = (u8 *)inp->payload + GVE_RX_PADDING;
+            u16_t data_len = pkt_len;
             inp->len = inp->tot_len = data_len;
 
             inp->napi_id = net_get_napi_id(net_if->num, rx->idx);
