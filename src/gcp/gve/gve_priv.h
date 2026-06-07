@@ -140,8 +140,8 @@ enum gve_adminq_opcode {
 #define GVE_CAP1_GQI_QPL    (1ull << 0)
 #define GVE_CAP1_GQI_RDA    (1ull << 1)
 #define GVE_CAP1_DQO_RDA    (1ull << 3)
-/* DQO-QPL (bit 2) is intentionally not declared: its datapath is not
- * implemented, so we must not let the device offer that format. */
+/* DQO-QPL (bit 2) not declared until its datapath is implemented, so the
+ * device will not offer that format. */
 #define GVE_DRIVER_CAPABILITY_FLAGS1 \
     (GVE_CAP1_GQI_QPL | GVE_CAP1_GQI_RDA | GVE_CAP1_DQO_RDA)
 
@@ -694,6 +694,16 @@ typedef struct gve_tx_dqo_queue {
     timestamp *tx_timestamps;
     boolean    stuck;
 
+    /* DQO-QPL only: bounce-page ring.  DQO addresses buffers by physical
+     * address even in QPL mode, so the data is copied here and the descriptor
+     * carries qpl_base_phys + offset. */
+    void *qpl_base;
+    u64   qpl_base_phys;
+    u32   qpl_head;        /* write cursor (bytes) */
+    u32   qpl_used;        /* bytes owned by device */
+    u32   qpl_size;        /* QPL ring size (bytes) */
+    u32  *qpl_allocated;   /* QPL bytes per packet (indexed by eop slot) */
+
     u32              last_re_idx;  /* desc idx of last report_event (DESC compl spacing) */
 
     queue            br;
@@ -741,6 +751,11 @@ typedef struct gve_rx_dqo_queue {
     int   empty_rx_queue;
     u16   idx;                    /* RX queue index, for SO_INCOMING_NAPI_ID */
     struct pbuf *ctx_head;        /* in-progress multi-buffer packet (NULL = none) */
+
+    /* DQO-QPL only: bounce pages.  buf_id i maps to qpl_base + i*GVE_DQO_BUF_SIZE;
+     * data is copied out on completion (descriptor carries the physical addr). */
+    void *qpl_base;
+    u64   qpl_base_phys;
 } *gve_rx_dqo_queue;
 
 /* ------------------------------------------------------------------ */

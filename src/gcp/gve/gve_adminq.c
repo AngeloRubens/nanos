@@ -155,11 +155,10 @@ boolean gve_describe_device(gve adapter)
         } else if (opt_gqi_rda) {
             adapter->raw_addressing = true;
         }   /* else: GQI-QPL fallback (both flags false) */
-        /* DQO-QPL (opt_dqo_qpl) is detected but its bounce-buffer datapath is
-         * not implemented yet, so we do not select it — falling back to
-         * GQI-QPL (always available) on a DQO-QPL-only device.  Implementing
-         * it requires verifying the QPL buffer addressing against the Google
-         * driver first. */
+        /* DQO-QPL addressing verified against Google (physical addresses into
+         * a registered QPL, 2048-byte buffers): datapath = DQO-RDA + bounce
+         * copy.  Not yet wired into the create/datapath, so detected but not
+         * selected (safe GQI-QPL fallback). */
         (void)opt_dqo_qpl;
 
         const char *fmt =
