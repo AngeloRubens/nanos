@@ -428,6 +428,11 @@ static boolean gve_init(gve adapter, tuple config)
                             >> PAGELOG));
     adapter->adminq_running = true;
 
+    /* Identify the driver to the device before describe (best-effort: older
+     * devices that do not support this command simply return an error). */
+    if (!gve_verify_driver_compatibility(adapter))
+        gve_debug("driver compatibility verification not accepted, continuing");
+
     if (!gve_describe_device(adapter)) {
         msg_err("GVE: failed to describe device");
         goto err1;

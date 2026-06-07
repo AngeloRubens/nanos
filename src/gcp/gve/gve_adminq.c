@@ -64,6 +64,36 @@ static boolean gve_adminq_execute_cmd(gve adapter,
     return (status == GVE_ADMINQ_COMMAND_PASSED);
 }
 
+/*
+ * gve_verify_driver_compatibility — advertise the driver to the device.
+ *
+ * Newer gVNIC devices expect the driver to identify itself and declare its
+ * capabilities before describe-device.  We declare only the queue formats we
+ * implement (GQI-QPL/RDA, DQO-RDA), so the device never offers one we cannot
+ * handle.  Best-effort: older devices that do not support this command return
+ * an error and we proceed regardless (the original single-queue driver never
+ * sent it).  Mirrors the official Google driver.
+ */
+boolean gve_verify_driver_compatibility(gve adapter)
+{
+    struct gve_driver_info *info = allocate(adapter->contiguous, PAGESIZE);
+    if (info == INVALID_ADDRESS)
+        return false;
+    zero(info, sizeof(*info));
+    info->os_type = 1;      /* Linux-compatible protocol */
+    info->driver_capability_flags[0] = htobe64(GVE_DRIVER_CAPABILITY_FLAGS1);
+    runtime_memcpy(info->os_version_str1, "nanos", 5);
+
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_VERIFY_DRIVER_COMPATIBILITY);
+    cmd->verify_driver_compat.driver_info_len  = htobe64(sizeof(*info));
+    cmd->verify_driver_compat.driver_info_addr =
+        htobe64(physical_from_virtual(info));
+    boolean success = gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, info, PAGESIZE);
+    return success;
+}
+
 /* ------------------------------------------------------------------ */
 /* Device describe / configure                                          */
 /* ------------------------------------------------------------------ */

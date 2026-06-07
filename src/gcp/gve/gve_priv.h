@@ -130,7 +130,37 @@ enum gve_adminq_opcode {
     GVE_ADMINQ_REPORT_STATS,
     GVE_ADMINQ_REPORT_LINK_SPEED,
     GVE_ADMINQ_GET_PTYPE_MAP,
+    GVE_ADMINQ_VERIFY_DRIVER_COMPATIBILITY = 15,
 };
+
+/* Driver capability flags advertised in VERIFY_DRIVER_COMPATIBILITY.  We
+ * declare only the queue formats we actually implement, so the device never
+ * offers one we cannot handle (e.g. DQO-QPL, flexible buffer sizes). */
+#define GVE_CAP1_GQI_QPL    (1ull << 0)
+#define GVE_CAP1_GQI_RDA    (1ull << 1)
+#define GVE_CAP1_DQO_RDA    (1ull << 3)
+#define GVE_DRIVER_CAPABILITY_FLAGS1 \
+    (GVE_CAP1_GQI_QPL | GVE_CAP1_GQI_RDA | GVE_CAP1_DQO_RDA)
+
+#define GVE_VERSION_STR_LEN 128
+
+struct gve_driver_info {
+    u8  os_type;        /* 1 = Linux-compatible protocol */
+    u8  driver_major;
+    u8  driver_minor;
+    u8  driver_sub;
+    u32 os_version_major;
+    u32 os_version_minor;
+    u32 os_version_sub;
+    u64 driver_capability_flags[4];
+    u8  os_version_str1[GVE_VERSION_STR_LEN];
+    u8  os_version_str2[GVE_VERSION_STR_LEN];
+} __attribute__((packed));
+
+struct gve_adminq_verify_driver_compatibility {
+    u64 driver_info_len;
+    u64 driver_info_addr;
+} __attribute__((packed));
 
 enum gve_adminq_status {
     GVE_ADMINQ_COMMAND_UNSET = 0,
@@ -270,6 +300,7 @@ struct gve_adminq_command {
         struct gve_adminq_destroy_tx_queue          destroy_tx_queue;
         struct gve_adminq_destroy_rx_queue          destroy_rx_queue;
         struct gve_adminq_get_ptype_map             get_ptype_map;
+        struct gve_adminq_verify_driver_compatibility verify_driver_compat;
         u8 padding[56];     /* struct size = 64 bytes */
     };
 } __attribute__((packed));
@@ -769,6 +800,7 @@ static inline void gve_trigger_reset(gve adapter)
 /* ------------------------------------------------------------------ */
 
 /* gve_adminq.c */
+boolean gve_verify_driver_compatibility(gve adapter);
 boolean gve_describe_device(gve adapter);
 boolean gve_cfg_device_resources(gve adapter);
 void    gve_free_device_resources(gve adapter);
