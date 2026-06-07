@@ -380,37 +380,49 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
             rx->free_ids[rx->next_to_clean & rx->mask] = buf_id;
             rx->next_to_clean++;
 
+            boolean eop = !!(c->status0 & GVE_DQO_RX_EOP);
+
             if (c->err_flags & GVE_DQO_RX_ERR) {
                 gve_debug("DQO RX: rx_error 0x%x, dropping", c->err_flags);
                 rx->rx_stats.rx_dropped++;
                 pbuf_free(inp);
+                if (rx->ctx_head) {     /* discard the partial packet too */
+                    pbuf_free(rx->ctx_head);
+                    rx->ctx_head = NULL;
+                }
                 goto advance;
             }
 
             /* DQO has no leading IP-alignment pad (unlike GQI, which pads 2
-             * bytes on the first buffer): packet_len is the full frame length
-             * and the data starts at buffer offset 0.  Verified against the
-             * official Google driver (gve_rx_dqo.c: buf_len = packet_len with
-             * page_info.pad = 0 for the non-XDP case). */
-            u16_t pkt_len = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
-            if (pkt_len == 0) {
-                pbuf_free(inp);
-                goto advance;
-            }
-            u16_t data_len = pkt_len;
-            inp->len = inp->tot_len = data_len;
+             * bytes on the first buffer): packet_len is this buffer's data
+             * length and the data starts at offset 0.  Verified against the
+             * official Google driver (buf_len = packet_len, page pad = 0). */
+            inp->len = inp->tot_len = c->pkt_len_gen & GVE_DQO_RX_PKT_LEN_MASK;
 
-            inp->napi_id = net_get_napi_id(net_if->num, rx->idx);
-            {
-                err_t err = net_if->input(inp, net_if);
-                if (err != ERR_OK)
-                    pbuf_free(inp);
-            }
+            /* Accumulate the buffers of a multi-buffer packet (same pbuf_cat
+             * loop as ena_rx_mbuf); deliver the chain on end_of_packet. */
+            if (rx->ctx_head == NULL)
+                rx->ctx_head = inp;
+            else
+                pbuf_cat(rx->ctx_head, inp);
 
-            rx->rx_stats.cnt++;
-            rx->rx_stats.bytes += data_len;
-            adapter->hw_stats.rx_packets++;
-            adapter->hw_stats.rx_bytes += data_len;
+            if (eop) {
+                struct pbuf *pkt = rx->ctx_head;
+                rx->ctx_head = NULL;
+                u16_t tot = pkt->tot_len;
+                if (tot == 0) {
+                    pbuf_free(pkt);
+                } else {
+                    pkt->napi_id = net_get_napi_id(net_if->num, rx->idx);
+                    err_t err = net_if->input(pkt, net_if);
+                    if (err != ERR_OK)
+                        pbuf_free(pkt);
+                    rx->rx_stats.cnt++;
+                    rx->rx_stats.bytes += tot;
+                    adapter->hw_stats.rx_packets++;
+                    adapter->hw_stats.rx_bytes += tot;
+                }
+            }
 
           advance:
             rx->compl_head++;

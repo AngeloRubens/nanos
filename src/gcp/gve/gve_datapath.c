@@ -352,14 +352,26 @@ closure_func_basic(thunk, void, gve_rx_service)
              rx->qpl_available++, rx->tail++, budget--) {
             struct gve_rx_desc *desc = &rx->desc[rx->tail & rx->mask];
             u16 length = be16toh(desc->len);
-            if (length <= GVE_RX_PADDING) {
+            if (desc->flags_seq & GVE_RXF_ERR) {
                 rx->rx_stats.rx_dropped++;
+                if (rx->ctx_head) {         /* discard the partial packet */
+                    pbuf_free(rx->ctx_head);
+                    rx->ctx_head = NULL;
+                }
                 continue;
             }
-            if (desc->flags_seq & (GVE_RXF_ERR | GVE_RXF_PKT_CONT)) {
-                msg_err("%s: unexpected flags 0x%x", func_ss,
-                        desc->flags_seq);
+            /* GQI prepends a 2-byte IP-alignment pad on the FIRST buffer of a
+             * packet only (Google gve_rx.c: pad = is_first_frag ? GVE_RX_PAD
+             * : 0); PKT_CONT marks a non-final buffer. */
+            boolean cont  = !!(desc->flags_seq & GVE_RXF_PKT_CONT);
+            boolean first = (rx->ctx_head == NULL);
+            u16 pad = first ? GVE_RX_PADDING : 0;
+            if (length <= pad) {
                 rx->rx_stats.rx_dropped++;
+                if (rx->ctx_head) {
+                    pbuf_free(rx->ctx_head);
+                    rx->ctx_head = NULL;
+                }
                 continue;
             }
             /* qpl_head is stable during this loop (fill runs after).
@@ -371,34 +383,67 @@ closure_func_basic(thunk, void, gve_rx_service)
                 qpl_index -= rx->qpl_count;
             u64 qpl_offset = be64toh(rx->data[rx->tail & rx->mask]) -
                              rx->rda_base_phys;
-            void *payload = rx->qpl_base + qpl_offset + GVE_RX_PADDING;
-            length -= GVE_RX_PADDING;
-            struct pbuf *p;
-            if (qpl_offset == (u64)qpl_index * PAGESIZE) {
-                p = &rx->pbufs[qpl_index];
-                p->payload = payload;
-                p->len = p->tot_len = length;
-                pbuf_ref(p);
-            } else {
-                gve_debug("RX packet copy");
-                p = pbuf_alloc(PBUF_RAW, length, PBUF_RAM);
-                if (p) {
-                    pbuf_take(p, payload, length);
-                    rx->rx_stats.rx_copy++;
+            void *payload = rx->qpl_base + qpl_offset + pad;
+            u16 frag_len = length - pad;
+
+            if (first && !cont) {
+                /* Single-buffer packet: keep the zero-copy fast path. */
+                struct pbuf *p;
+                if (qpl_offset == (u64)qpl_index * PAGESIZE) {
+                    p = &rx->pbufs[qpl_index];
+                    p->payload = payload;
+                    p->len = p->tot_len = frag_len;
+                    pbuf_ref(p);
                 } else {
-                    msg_err("%s: failed to allocate pbuf", func_ss);
+                    p = pbuf_alloc(PBUF_RAW, frag_len, PBUF_RAM);
+                    if (!p) {
+                        rx->rx_stats.rx_dropped++;
+                        continue;
+                    }
+                    pbuf_take(p, payload, frag_len);
+                    rx->rx_stats.rx_copy++;
+                }
+                p->napi_id = net_get_napi_id(net_if->num, rx->idx);
+                err_t err = net_if->input(p, net_if);
+                if (err != ERR_OK)
+                    pbuf_free(p);
+                rx->rx_stats.cnt++;
+                rx->rx_stats.bytes += frag_len;
+                adapter->hw_stats.rx_packets++;
+                adapter->hw_stats.rx_bytes += frag_len;
+            } else {
+                /* Multi-buffer packet: copy this fragment and chain it (same
+                 * pbuf_cat accumulation as ena_rx_mbuf).  Zero-copy is not
+                 * used here because the QPL pbufs are single-buffer slots. */
+                struct pbuf *p = pbuf_alloc(PBUF_RAW, frag_len, PBUF_RAM);
+                if (!p) {
                     rx->rx_stats.rx_dropped++;
+                    if (rx->ctx_head) {
+                        pbuf_free(rx->ctx_head);
+                        rx->ctx_head = NULL;
+                    }
                     continue;
                 }
+                pbuf_take(p, payload, frag_len);
+                rx->rx_stats.rx_copy++;
+                if (first)
+                    rx->ctx_head = p;
+                else
+                    pbuf_cat(rx->ctx_head, p);
+                if (!cont) {               /* end of packet: deliver chain */
+                    struct pbuf *pkt = rx->ctx_head;
+                    rx->ctx_head = NULL;
+                    u16 tot = pkt->tot_len;
+                    pkt->napi_id = net_get_napi_id(net_if->num, rx->idx);
+                    err_t err = net_if->input(pkt, net_if);
+                    if (err != ERR_OK)
+                        pbuf_free(pkt);
+                    rx->rx_stats.cnt++;
+                    rx->rx_stats.bytes += tot;
+                    adapter->hw_stats.rx_packets++;
+                    adapter->hw_stats.rx_bytes += tot;
+                }
             }
-            p->napi_id = net_get_napi_id(net_if->num, rx->idx);
-            err_t err = net_if->input(p, net_if);
-            if (err != ERR_OK)
-                pbuf_free(p);
-            rx->rx_stats.cnt++;
-            rx->rx_stats.bytes += length;
-            adapter->hw_stats.rx_packets++;
-            adapter->hw_stats.rx_bytes += length;
         }
         if (rx->head - rx->tail <= (rx->mask + 1) / 2)
             gve_rx_fill(rx);

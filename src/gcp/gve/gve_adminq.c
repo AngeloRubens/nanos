@@ -546,6 +546,7 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     rx->event_counter_idx      = be32toh(rx->q_res->counter_index);
     rx->db_idx                 = be32toh(rx->q_res->db_index);
     rx->idx                    = index;
+    rx->ctx_head               = NULL;
     gve_rx_fill(rx);
     return true;
 
@@ -577,6 +578,12 @@ static void gve_destroy_rx_queue(gve adapter, gve_rx_queue rx,
     cmd->opcode = htobe32(GVE_ADMINQ_DESTROY_RX_QUEUE);
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
+
+    /* Free a partially-assembled multi-buffer packet, if any. */
+    if (rx->ctx_head) {
+        pbuf_free(rx->ctx_head);
+        rx->ctx_head = NULL;
+    }
 
     /* Wait for any in-flight RX pbufs held by lwIP to be released.
      * NETIF_FLAG_UP was cleared by gve_reset before this point; any
@@ -846,6 +853,7 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     rx->no_interrupt_event_cnt = 0;
     rx->empty_rx_queue         = 0;
     rx->idx                    = index;
+    rx->ctx_head               = NULL;
     gve_rx_dqo_fill(rx);
     return true;
 
@@ -874,6 +882,12 @@ static void gve_destroy_rx_queue_dqo(gve adapter,
     cmd->opcode = htobe32(GVE_ADMINQ_DESTROY_RX_QUEUE);
     cmd->destroy_rx_queue.queue_id = htobe32(index);
     gve_adminq_execute_cmd(adapter, cmd);
+
+    /* Free a partially-assembled multi-buffer packet, if any. */
+    if (rx->ctx_head) {
+        pbuf_free(rx->ctx_head);
+        rx->ctx_head = NULL;
+    }
 
     /* Free any pbufs still posted to the device.  NETIF_FLAG_UP was
      * cleared before teardown so no new completions arrive; each slot

@@ -450,7 +450,8 @@ struct gve_rx_compl_desc_dqo {
     u16  reserved1;       /* bytes 2-3 */
     u16  pkt_len_gen;     /* bytes 4-5: packet_len[13:0] | generation[14] */
     u16  reserved2;       /* bytes 6-7 */
-    u8   reserved3[4];    /* bytes 8-11 */
+    u8   status0;         /* byte  8: descriptor_done[0] | end_of_packet[1] */
+    u8   reserved3[3];    /* bytes 9-11 */
     u16  buf_id;          /* bytes 12-13 */
     u8   reserved4[18];   /* bytes 14-31 */
 } __attribute__((packed));
@@ -458,6 +459,7 @@ struct gve_rx_compl_desc_dqo {
 #define GVE_DQO_RX_GEN          0x4000u  /* generation bit in pkt_len_gen */
 #define GVE_DQO_RX_PKT_LEN_MASK 0x3FFFu  /* packet_len field in pkt_len_gen */
 #define GVE_DQO_RX_ERR          0x04u    /* rx_error bit in err_flags */
+#define GVE_DQO_RX_EOP          0x02u    /* end_of_packet bit in status0 */
 
 /* Per-buffer size used for DQO RX.  Sized for standard MTU 1500:
  * 1500 + 14 (Ethernet) + 2 (GVE_RX_PADDING) = 1516 < 2048.
@@ -644,6 +646,7 @@ typedef struct gve_rx_queue {
     u32   event_counter_idx;      /* cached from q_res->counter_index at create */
     u32   db_idx;                 /* cached from q_res->db_index at create */
     u16   idx;                    /* RX queue index, for SO_INCOMING_NAPI_ID */
+    struct pbuf *ctx_head;        /* in-progress multi-buffer packet (NULL = none) */
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -733,6 +736,7 @@ typedef struct gve_rx_dqo_queue {
     u16   no_interrupt_event_cnt;
     int   empty_rx_queue;
     u16   idx;                    /* RX queue index, for SO_INCOMING_NAPI_ID */
+    struct pbuf *ctx_head;        /* in-progress multi-buffer packet (NULL = none) */
 } *gve_rx_dqo_queue;
 
 /* ------------------------------------------------------------------ */
