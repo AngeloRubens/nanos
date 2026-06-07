@@ -121,14 +121,19 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
 {
     boolean qpl = tx->adapter->dqo_qpl;
     int seg_count = 0;
-    for (struct pbuf *q = p; q != NULL; q = q->next)
+    boolean oversize = false;
+    for (struct pbuf *q = p; q != NULL; q = q->next) {
         seg_count++;
+        if (q->len > GVE_DQO_BUF_SIZE)
+            oversize = true;
+    }
 
-    /* The device caps a packet at GVE_TX_MAX_DATA_DESCS data descriptors.
-     * lwIP virtually never produces such long chains for non-TSO traffic;
-     * drop rather than wedge the queue (returning false would re-enqueue the
-     * same unsendable packet forever). */
-    if (seg_count > GVE_TX_MAX_DATA_DESCS) {
+    /* The device caps a packet at GVE_TX_MAX_DATA_DESCS data descriptors.  In
+     * QPL mode each segment must also fit one GVE_DQO_BUF_SIZE bounce slot (so
+     * a buffer never crosses a registered QPL page).  lwIP virtually never
+     * produces such chains/segments for non-TSO traffic; drop rather than
+     * wedge the queue (returning false would re-enqueue it forever). */
+    if (seg_count > GVE_TX_MAX_DATA_DESCS || (qpl && oversize)) {
         pbuf_free(p);
         return true;   /* consumed (dropped) */
     }
@@ -140,19 +145,10 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
     if (tx->head - tx->desc_tail + total_descs > (u32)(tx->mask + 1))
         return false;
 
-    /* DQO-QPL: the payload is bounce-copied into the registered QPL ring, so
-     * also check there is room for it (wrap-aware, same as GQI-QPL). */
-    if (qpl) {
-        u32 qpl_needed = 0;
-        for (struct pbuf *q = p; q != NULL; q = q->next) {
-            u32 padded   = pad(q->len, GVE_TX_PAD);
-            u32 sim_head = (tx->qpl_head + qpl_needed) % tx->qpl_size;
-            u32 remain   = tx->qpl_size - sim_head;
-            qpl_needed  += (padded > remain) ? padded + remain : padded;
-        }
-        if (tx->qpl_used + qpl_needed > tx->qpl_size)
-            return false;
-    }
+    /* DQO-QPL: the payload is bounce-copied into the registered QPL, one
+     * GVE_DQO_BUF_SIZE slot per segment.  Check there is room. */
+    if (qpl && tx->qpl_used + (u32)seg_count * GVE_DQO_BUF_SIZE > tx->qpl_size)
+        return false;
 
     /* One completion tag per packet, stamped on every packet descriptor: the
      * EOP slot is unique among outstanding packets, so we reuse it as the tag
@@ -178,20 +174,16 @@ static boolean gve_tx_write_dqo(gve_tx_dqo_queue tx, struct pbuf *p)
         struct gve_tx_pkt_desc_dqo *desc = &tx->desc[slot];
 
         if (qpl) {
-            /* Copy the segment into the QPL ring; the descriptor carries the
-             * physical address of the copy (wrap-aware, same as GQI-QPL). */
-            u32 padded = pad(q->len, GVE_TX_PAD);
-            u32 remain = tx->qpl_size - tx->qpl_head;
-            if (padded > remain) {
-                qpl_total += remain;
-                tx->qpl_head = 0;
-            }
+            /* Copy the segment into one GVE_DQO_BUF_SIZE-aligned slot of the
+             * QPL ring; the descriptor carries the slot's physical address.
+             * Slots are buffer-size aligned (2 per page) so a buffer never
+             * crosses a registered QPL page — matching the Google driver. */
             u32 offset = tx->qpl_head;
             runtime_memcpy((u8 *)tx->qpl_base + offset, q->payload, q->len);
-            tx->qpl_head += padded;
-            if (tx->qpl_head == tx->qpl_size)
+            tx->qpl_head += GVE_DQO_BUF_SIZE;
+            if (tx->qpl_head >= tx->qpl_size)
                 tx->qpl_head = 0;
-            qpl_total += padded;
+            qpl_total += GVE_DQO_BUF_SIZE;
             desc->buf_addr = tx->qpl_base_phys + offset;
         } else {
             desc->buf_addr = physical_from_virtual(q->payload);
