@@ -11,7 +11,9 @@
  *   5. GVE_REG_MAX_TX/RX_QUEUES actually read and used.
  *   6. GQI-RDA format negotiation (no QPL bounce copy).
  *   7. DQO format (Andromeda 2.x): generation-bit completion polling,
- *      separate TX-completion and RX-buffer/completion rings.
+ *      separate TX-completion and RX-buffer/completion rings; both DQO-RDA
+ *      (direct addressing) and DQO-QPL (registered bounce pages).
+ *   8. Multi-buffer RX packet reassembly (pbuf_cat to end-of-packet).
  *
  * Checksums are computed in software by lwIP (no HW offload), same model
  * as the ENA driver: gVNIC offloads only L4, not the IPv4 header checksum.

@@ -6,13 +6,20 @@
  *   - TX has a separate completion ring; driver polls generation bits
  *     rather than reading the event counter.
  *   - RX uses a buffer ring (driver posts) + completion ring (device fills).
- *   - Always raw addressing (no QPL); physical_from_virtual() for all bufs.
+ *   - DQO-RDA: buffers addressed directly by physical address.
+ *     DQO-QPL: buffers come from a registered queue page list (the device
+ *     requires registered pages on IOMMU-restricted VMs); the descriptors
+ *     still carry physical addresses, so the payload is bounce-copied to/from
+ *     the QPL.  Selected per adapter->dqo_qpl.
+ *   - Multi-buffer packets are reassembled with pbuf_cat up to the
+ *     end_of_packet completion (same as the GQI path).
  *   - Checksums are computed in software by lwIP (no HW offload), same
  *     model as the ENA driver.
  *
  * Nanos-specific simplifications:
  *   - Identity-mapped address space: physical_from_virtual() is trivial.
- *   - No scatter-gather: pbuf payload is physically contiguous per segment.
+ *   - No scatter-gather within a segment: each pbuf segment is physically
+ *     contiguous and maps to one descriptor.
  *   - Single-process unikernel: no per-CPU queue affinity complexity.
  */
 

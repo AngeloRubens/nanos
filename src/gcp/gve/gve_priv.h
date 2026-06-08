@@ -9,6 +9,9 @@
  *   DQO-RDA   — Andromeda 2.x: completely different descriptor set,
  *               separate TX-completion and RX-buffer/completion rings,
  *               little-endian, generation-bit polling.
+ *   DQO-QPL   — DQO rings with buffers from a registered QPL (bounce
+ *               copy); required on VMs that restrict DMA to registered
+ *               pages.
  *
  * TSO is not implementable: lwIP always segments TCP at MSS before
  * calling linkoutput.  TX/RX checksums are computed in software by lwIP
@@ -464,9 +467,10 @@ struct gve_rx_compl_desc_dqo {
 #define GVE_DQO_RX_ERR          0x04u    /* rx_error bit in err_flags */
 #define GVE_DQO_RX_EOP          0x02u    /* end_of_packet bit in status0 */
 
-/* Per-buffer size used for DQO RX.  Sized for standard MTU 1500:
- * 1500 + 14 (Ethernet) + 2 (GVE_RX_PADDING) = 1516 < 2048.
- * Jumbo frames (MTU 9000) are not supported in this driver. */
+/* Per-buffer size used for DQO RX (and the DQO-QPL TX bounce slot): two
+ * buffers per page, so a buffer never crosses a registered QPL page.  A
+ * standard 1500-MTU frame fits one buffer; larger frames are split by the
+ * device across several buffers and reassembled by the multi-buffer RX path. */
 #define GVE_DQO_BUF_SIZE    (PAGESIZE / 2)
 
 struct gve_tx_pkt_desc {
@@ -664,11 +668,13 @@ typedef struct gve_rx_queue {
  * via compl_head.  expected_gen tracks the generation bit convention:
  * 0 → 1 → 0 → ... with each full pass through the ring.
  *
- * desc_tail tracks how many descriptor ring slots have been freed.
- * A completion for a packet of seg_count descriptors frees seg_count
- * slots.  We store seg_count in seg_counts[] indexed by compl_tag so
- * that gve_tx_dqo_cleanup can advance desc_tail by the right amount.
- * Space check: head - desc_tail + seg_count <= desc_cnt.
+ * Each packet occupies one general context descriptor (dtype 0x4) followed
+ * by one packet descriptor per pbuf segment, so total_descs = 1 + seg_count.
+ * desc_tail tracks how many descriptor ring slots have been freed; a packet
+ * completion frees total_descs of them.  We store total_descs in seg_counts[]
+ * indexed by the completion tag (the EOP slot) so that gve_tx_dqo_cleanup can
+ * advance desc_tail by the right amount.
+ * Space check: head - desc_tail + total_descs <= desc_cnt.
  */
 typedef struct gve_tx_dqo_queue {
     u32  head;               /* next descriptor slot to write */
@@ -681,8 +687,8 @@ typedef struct gve_tx_dqo_queue {
 
     struct gve_tx_pkt_desc_dqo  *desc;
     struct gve_tx_compl_desc_dqo *compl;
-    struct pbuf                 **pending;    /* pbuf per compl_tag slot */
-    u16                         *seg_counts;  /* seg_count per compl_tag slot */
+    struct pbuf                 **pending;    /* in-flight pbuf at the EOP slot (RDA); NULL in QPL */
+    u16                         *seg_counts;  /* total_descs (ctx+pkt) at the EOP/compl-tag slot */
     timestamp                   *miss_times;  /* non-zero after miss, cleared on reinject */
     u16                          pending_misses;
     struct gve_queue_resources  *q_res;
