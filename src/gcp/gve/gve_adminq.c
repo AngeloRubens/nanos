@@ -69,8 +69,8 @@ static boolean gve_adminq_execute_cmd(gve adapter,
  *
  * Newer gVNIC devices expect the driver to identify itself and declare its
  * capabilities before describe-device.  We declare only the queue formats we
- * implement (GQI-QPL/RDA, DQO-RDA), so the device never offers one we cannot
- * handle.  Best-effort: older devices that do not support this command return
+ * implement (GQI-QPL/RDA, DQO-RDA/QPL), so the device never offers one we
+ * cannot handle.  Best-effort: older devices that do not support this command return
  * an error and we proceed regardless (the original single-queue driver never
  * sent it).  Mirrors the official Google driver.
  */
@@ -210,8 +210,10 @@ boolean gve_cfg_device_resources(gve adapter)
     }
 
     deallocate(adapter->contiguous, adapter->irq_db_indices, irq_db_size);
+    adapter->irq_db_indices = NULL;
   err_evt:
     deallocate(adapter->contiguous, adapter->event_counters, evt_cnt_size);
+    adapter->event_counters = NULL;
     return false;
 }
 
@@ -559,6 +561,7 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     rx->db_idx                 = be32toh(rx->q_res->db_index);
     rx->idx                    = index;
     rx->ctx_head               = NULL;
+    rx->drop_pkt               = false;
     gve_rx_fill(rx);
     return true;
 
@@ -685,19 +688,34 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     if (tx->br == INVALID_ADDRESS)
         goto err_timestamps;
 
-    /* DQO-QPL: bounce ring from a registered QPL (the device addresses it by
-     * physical address, same as RDA, but requires the pages to be registered). */
+    tx->free_tags = allocate(adapter->general,
+                             desc_cnt * sizeof(*tx->free_tags));
+    if (tx->free_tags == INVALID_ADDRESS)
+        goto err_br;
+
+    /* DQO-QPL: bounce buffers from a registered QPL (the device addresses
+     * them by physical address, same as RDA, but requires the pages to be
+     * registered).  Managed as a free-list of GVE_DQO_BUF_SIZE slots. */
     if (adapter->dqo_qpl) {
         tx->qpl_base = gve_create_qpl(adapter, adapter->tx_pages_per_qpl, index);
         if (tx->qpl_base == INVALID_ADDRESS)
-            goto err_br;
-        tx->qpl_allocated = allocate(adapter->general,
-                                     desc_cnt * sizeof(*tx->qpl_allocated));
-        if (tx->qpl_allocated == INVALID_ADDRESS) {
-            gve_destroy_qpl(adapter, tx->qpl_base,
-                            adapter->tx_pages_per_qpl, index);
-            goto err_br;
-        }
+            goto err_free_tags;
+        tx->qpl_num_slots = (u32)adapter->tx_pages_per_qpl *
+                            (PAGESIZE / GVE_DQO_BUF_SIZE);
+        tx->qpl_slot_list = allocate(adapter->general,
+                                     tx->qpl_num_slots *
+                                     sizeof(*tx->qpl_slot_list));
+        if (tx->qpl_slot_list == INVALID_ADDRESS)
+            goto err_qpl;
+        tx->tag_qpl_slots = allocate(adapter->general,
+                                     desc_cnt * sizeof(*tx->tag_qpl_slots));
+        if (tx->tag_qpl_slots == INVALID_ADDRESS)
+            goto err_slot_list;
+        tx->tag_qpl_n = allocate(adapter->general,
+                                 desc_cnt * sizeof(*tx->tag_qpl_n));
+        if (tx->tag_qpl_n == INVALID_ADDRESS)
+            goto err_tag_slots;
+        zero(tx->tag_qpl_n, desc_cnt * sizeof(*tx->tag_qpl_n));
     }
 
     struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
@@ -730,23 +748,41 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     tx->pending_misses   = 0;
     tx->last_re_idx      = 0;
     tx->db_idx           = be32toh(tx->q_res->db_index);
+    for (u16 i = 0; i < desc_cnt; i++)
+        tx->free_tags[i] = i;
+    tx->tags_ntu = 0;
+    tx->tags_ntc = desc_cnt;   /* tag pool starts full */
     if (adapter->dqo_qpl) {
         tx->qpl_base_phys = physical_from_virtual(tx->qpl_base);
-        tx->qpl_head = 0;
-        tx->qpl_used = 0;
-        tx->qpl_size = adapter->tx_pages_per_qpl * PAGESIZE;
+        for (u32 i = 0; i < tx->qpl_num_slots; i++)
+            tx->qpl_slot_list[i] = (u16)i;
+        tx->qpl_slot_head  = 0;
+        tx->qpl_slot_tail  = 0;
+        tx->qpl_free_slots = tx->qpl_num_slots;
     }
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
     gve_tx_init_dqo(tx);
     return true;
 
   err_cmd:
-    if (adapter->dqo_qpl) {
-        deallocate(adapter->general, tx->qpl_allocated,
-                   desc_cnt * sizeof(*tx->qpl_allocated));
+    if (adapter->dqo_qpl)
+        deallocate(adapter->general, tx->tag_qpl_n,
+                   desc_cnt * sizeof(*tx->tag_qpl_n));
+  err_tag_slots:
+    if (adapter->dqo_qpl)
+        deallocate(adapter->general, tx->tag_qpl_slots,
+                   desc_cnt * sizeof(*tx->tag_qpl_slots));
+  err_slot_list:
+    if (adapter->dqo_qpl)
+        deallocate(adapter->general, tx->qpl_slot_list,
+                   tx->qpl_num_slots * sizeof(*tx->qpl_slot_list));
+  err_qpl:
+    if (adapter->dqo_qpl)
         gve_destroy_qpl(adapter, tx->qpl_base,
                         adapter->tx_pages_per_qpl, index);
-    }
+  err_free_tags:
+    deallocate(adapter->general, tx->free_tags,
+               desc_cnt * sizeof(*tx->free_tags));
   err_br:
     deallocate_queue(tx->br);
   err_timestamps:
@@ -815,10 +851,19 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
     deallocate(adapter->contiguous, tx->desc,
                desc_cnt * sizeof(*tx->desc));
     tx->desc = NULL;
+    deallocate(adapter->general, tx->free_tags,
+               desc_cnt * sizeof(*tx->free_tags));
+    tx->free_tags = NULL;
     if (adapter->dqo_qpl) {
-        deallocate(adapter->general, tx->qpl_allocated,
-                   desc_cnt * sizeof(*tx->qpl_allocated));
-        tx->qpl_allocated = NULL;
+        deallocate(adapter->general, tx->tag_qpl_n,
+                   desc_cnt * sizeof(*tx->tag_qpl_n));
+        tx->tag_qpl_n = NULL;
+        deallocate(adapter->general, tx->tag_qpl_slots,
+                   desc_cnt * sizeof(*tx->tag_qpl_slots));
+        tx->tag_qpl_slots = NULL;
+        deallocate(adapter->general, tx->qpl_slot_list,
+                   tx->qpl_num_slots * sizeof(*tx->qpl_slot_list));
+        tx->qpl_slot_list = NULL;
         gve_destroy_qpl(adapter, tx->qpl_base,
                         adapter->tx_pages_per_qpl, index);
         tx->qpl_base = NULL;
@@ -830,7 +875,11 @@ static void gve_destroy_tx_queue_dqo(gve adapter,
 static boolean gve_create_rx_queue_dqo(gve adapter,
                                         gve_rx_dqo_queue rx, u32 index)
 {
-    u32 num_bufs  = adapter->rx_data_slot_cnt;
+    /* DQO ring sizes come from rx_queue_entries (rx_desc_cnt), matching the
+     * official driver: rx_pages_per_qpl is a GQI-QPL descriptor field and may
+     * be 0 on DQO devices.  Buffer ring and completion ring share this size
+     * (Google sets rx_ring_size and rx_buff_ring_size both to rx_desc_cnt). */
+    u32 num_bufs  = adapter->rx_desc_cnt;
     u32 nq        = adapter->num_queues;
     /* DQO-QPL: contiguous registered region of num_bufs buffers, GVE_DQO_BUF_SIZE
      * each (buf_id i lives at qpl_base + i*GVE_DQO_BUF_SIZE). */
@@ -912,7 +961,20 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     rx->empty_rx_queue         = 0;
     rx->idx                    = index;
     rx->ctx_head               = NULL;
+    rx->drop_pkt               = false;
+    rx->db_head                = 0;
     gve_rx_dqo_fill(rx);
+
+    /* Arm the RX interrupt: DQO interrupts start disabled and become active
+     * only after the ITR doorbell is written (the analogue of Linux
+     * gve_turnup and of ENA ena_unmask_all_io_irqs).  Initial throttling
+     * interval has 2 us granularity; gve_rx_dqo_service re-arms with
+     * NO_UPDATE after each pass.  Native little-endian, unlike GQI. */
+    pci_bar_write_4(&adapter->db_bar,
+                    be32toh(*rx->irq_db_index) * sizeof(u32),
+                    GVE_DQO_ITR_ENABLE |
+                    ((GVE_DQO_RX_IRQ_THROTTLE_US / 2) <<
+                     GVE_DQO_ITR_INTERVAL_SHIFT));
     return true;
 
   err_cmd:

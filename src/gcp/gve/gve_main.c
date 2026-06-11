@@ -14,6 +14,7 @@
  *      separate TX-completion and RX-buffer/completion rings; both DQO-RDA
  *      (direct addressing) and DQO-QPL (registered bounce pages).
  *   8. Multi-buffer RX packet reassembly (pbuf_cat to end-of-packet).
+ *   9. Device-requested reset (DEVICE_STATUS bit 1, e.g. live migration).
  *
  * Checksums are computed in software by lwIP (no HW offload), same model
  * as the ENA driver: gVNIC offloads only L4, not the IPv4 header checksum.
@@ -52,6 +53,13 @@ closure_func_basic(thunk, void, gve_mgmt_irq)
     gve adapter = struct_from_field(closure_self(), gve, mgmt_irq_handler);
     u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
     gve_debug("mgmt irq, status 0x%x", status);
+    if (status & GVE_DEVICE_STATUS_RESET) {
+        /* Device-requested reset (e.g. live migration); mirrors the official
+         * driver's gve_handle_status.  Link state is re-read after reset. */
+        msg_err("GVE: device requested reset");
+        gve_trigger_reset(adapter);
+        return;
+    }
     if (status & GVE_DEVICE_STATUS_LINK_STATUS)
         async_apply_bh((thunk)&adapter->link_up_task);
     else
@@ -79,6 +87,7 @@ closure_func_basic(thunk, void, gve_rx_dqo_irq)
                                             gve_rx_dqo_queue, irq_handler);
     rx->first_interrupt = true;
     async_apply_bh((thunk)&rx->service);
+    /* interrupt stays disarmed until the ITR re-arm in gve_rx_dqo_service */
 }
 
 /* ------------------------------------------------------------------ */
@@ -169,13 +178,23 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
         u32 ri;
         for (ri = adapter->next_monitored_tx_qid;
              ri < adapter->num_queues; ri++) {
+            /* Re-check reset flags each iteration (same as the GQI loop):
+             * tx_timestamps/miss_times/compl_ring are freed during teardown
+             * after ONGOING_RESET is set. */
+            read_barrier();
+            if (adapter->flags & ((1ULL << GVE_FLAG_RESETTING) |
+                                  (1ULL << GVE_FLAG_ONGOING_RESET)))
+                return;
+
             gve_tx_dqo_queue tx = &adapter->tx_dqo[ri];
             if (!tx->stuck) {
                 u32 missed_tx = 0;
-                for (u32 s = tx->desc_tail; s != tx->head; s++) {
-                    timestamp ts = tx->tx_timestamps[s & tx->mask];
+                /* tx_timestamps is per-tag (one stamp per packet, set at
+                 * submit and cleared on retire): scan the whole tag space. */
+                for (u32 s = 0; s <= tx->mask; s++) {
+                    timestamp ts = tx->tx_timestamps[s];
                     if (!ts)
-                        continue;  /* non-EOP slot or already retired */
+                        continue;  /* tag not in flight */
                     if (now_ts - ts > deadline) {
                         tx->tx_stats.missing_tx_comp++;
                         missed_tx++;
@@ -198,7 +217,7 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                             continue;
                         if (now_ts - tx->miss_times[mi] <= deadline)
                             continue;
-                        msg_err("GVE: DQO TX queue %d slot %u: miss not "
+                        msg_err("GVE: DQO TX queue %d tag %u: miss not "
                                 "reinjected after %d ms, scheduling reset",
                                 ri, mi, GVE_TX_WATCHDOG_MS);
                         if (tx->pending[mi]) {
@@ -518,7 +537,10 @@ closure_function(3, 1, boolean, gve_probe,
         return false;
     gve_debug("probing device");
     heap h = bound(general);
-    gve adapter = allocate(h, sizeof(struct gve));
+    /* allocate_zero: several adapter fields are only conditionally assigned
+     * (format booleans in gve_describe_device, watchdog cursor, dev_stats)
+     * and rely on a zeroed start. */
+    gve adapter = allocate_zero(h, sizeof(struct gve));
     if (adapter == INVALID_ADDRESS)
         return false;
     adapter->general   = h;

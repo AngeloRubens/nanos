@@ -57,8 +57,8 @@
 #define GVE_REG_ADMINQ_EVT_CNT  0x18
 #define GVE_REG_DRIVER_VERSION  0x1F
 
+#define GVE_DEVICE_STATUS_RESET         htobe32(U32_FROM_BIT(1))
 #define GVE_DEVICE_STATUS_LINK_STATUS   htobe32(U32_FROM_BIT(2))
-#define GVE_DEVICE_STATUS_REPORT_STATS  htobe32(U32_FROM_BIT(3))
 
 /* ------------------------------------------------------------------ */
 /* Queue limits and driver constants                                    */
@@ -139,7 +139,7 @@ enum gve_adminq_opcode {
 
 /* Driver capability flags advertised in VERIFY_DRIVER_COMPATIBILITY.  We
  * declare only the queue formats we actually implement, so the device never
- * offers one we cannot handle (e.g. DQO-QPL, flexible buffer sizes). */
+ * offers one we cannot handle (e.g. flexible buffer sizes). */
 #define GVE_CAP1_GQI_QPL    (1ull << 0)
 #define GVE_CAP1_GQI_RDA    (1ull << 1)
 #define GVE_CAP1_DQO_QPL    (1ull << 2)
@@ -315,9 +315,26 @@ struct gve_adminq_command {
 /* IRQ / event counter structs                                          */
 /* ------------------------------------------------------------------ */
 
+/* GQI IRQ doorbell bits (big-endian, like all GQI doorbell writes).  The
+ * driver acks GQI RX interrupts with ACK alone, as the HW-proven original
+ * src/drivers/gve.c did; MASK and EVENT document the remaining register
+ * bits.  DQO does NOT use these — see GVE_DQO_ITR_* below. */
 #define GVE_IRQ_ACK     htobe32(U32_FROM_BIT(31))
 #define GVE_IRQ_MASK    htobe32(U32_FROM_BIT(30))
 #define GVE_IRQ_EVENT   htobe32(U32_FROM_BIT(29))
+
+/*
+ * DQO IRQ doorbell format (ITR control word).  Unlike GQI, the DQO IRQ
+ * doorbell does NOT take the big-endian ACK/MASK/EVENT bits above: it takes
+ * a native little-endian ITR word (Google gve_dqo.h, written with iowrite32):
+ *   bit 0       = enable (arm/re-arm) the interrupt
+ *   bits [4:3]  = 3 -> NO_UPDATE: keep the current throttling interval
+ *   bits [16:5] = throttling interval, 2 us granularity
+ */
+#define GVE_DQO_ITR_ENABLE          (1u << 0)
+#define GVE_DQO_ITR_NO_UPDATE       (3u << 3)
+#define GVE_DQO_ITR_INTERVAL_SHIFT  5
+#define GVE_DQO_RX_IRQ_THROTTLE_US  20  /* Google GVE_RX_IRQ_RATELIMIT_US_DQO */
 
 /*
  * IRQ DB slots: one TX + one RX per queue pair, plus one management.
@@ -394,6 +411,15 @@ struct gve_tx_ctx_desc_dqo {
 
 /* Max data descriptors per TX packet (Google GVE_TX_MAX_DATA_DESCS). */
 #define GVE_TX_MAX_DATA_DESCS   10
+
+/* Minimum free-slot gap kept between TX head and retired tail so the device
+ * never fetches a descriptor from the cacheline the driver is writing
+ * (Google GVE_TX_MIN_DESC_PREVENT_CACHE_OVERLAP). */
+#define GVE_TX_DQO_MIN_DESC_GAP 4
+
+/* DQO RX buffer doorbell spacing: ring when the post counter crosses a
+ * multiple of this (Google GVE_RX_BUF_THRESH_DQO; HW requires >= 8). */
+#define GVE_RX_BUF_THRESH_DQO   32
 
 /*
  * DQO TX completion descriptor — 8 bytes, little-endian.
@@ -654,6 +680,8 @@ typedef struct gve_rx_queue {
     u32   db_idx;                 /* cached from q_res->db_index at create */
     u16   idx;                    /* RX queue index, for SO_INCOMING_NAPI_ID */
     struct pbuf *ctx_head;        /* in-progress multi-buffer packet (NULL = none) */
+    boolean drop_pkt;             /* discard fragments until end-of-packet
+                                     (official driver: ctx->drop_pkt) */
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -671,10 +699,15 @@ typedef struct gve_rx_queue {
  * Each packet occupies one general context descriptor (dtype 0x4) followed
  * by one packet descriptor per pbuf segment, so total_descs = 1 + seg_count.
  * desc_tail tracks how many descriptor ring slots have been freed; a packet
- * completion frees total_descs of them.  We store total_descs in seg_counts[]
- * indexed by the completion tag (the EOP slot) so that gve_tx_dqo_cleanup can
- * advance desc_tail by the right amount.
- * Space check: head - desc_tail + total_descs <= desc_cnt.
+ * completion frees total_descs of them (count-based: safe because the device
+ * fetches descriptors in order, so it is only ever conservative).
+ * The completion tag is allocated from the free_tags pool (ENA free_tx_ids
+ * pattern; equivalent to Google's pending_packets free list), NOT derived
+ * from a ring slot: a MISSed packet keeps its tag (and its per-tag state and
+ * QPL slots) until REINJECT, so tags can never collide while outstanding.
+ * Space check: head - desc_tail + total_descs + GVE_TX_DQO_MIN_DESC_GAP
+ * <= desc_cnt (the gap keeps the device from fetching descriptors on the
+ * cacheline being written).
  */
 typedef struct gve_tx_dqo_queue {
     u32  head;               /* next descriptor slot to write */
@@ -687,27 +720,38 @@ typedef struct gve_tx_dqo_queue {
 
     struct gve_tx_pkt_desc_dqo  *desc;
     struct gve_tx_compl_desc_dqo *compl;
-    struct pbuf                 **pending;    /* in-flight pbuf at the EOP slot (RDA); NULL in QPL */
-    u16                         *seg_counts;  /* total_descs (ctx+pkt) at the EOP/compl-tag slot */
-    timestamp                   *miss_times;  /* non-zero after miss, cleared on reinject */
-    u16                          pending_misses;
+
+    /* Completion-tag pool (ENA free_tx_ids pattern): a tag is taken at
+     * submit and returned on the PKT or REINJECT completion that retires
+     * the packet.  Free count = tags_ntc - tags_ntu. */
+    u16 *free_tags;           /* circular list of free completion tags */
+    u32  tags_ntu;            /* take cursor (next_to_use) */
+    u32  tags_ntc;            /* return cursor (next_to_clean) */
+
+    /* Per-tag state, indexed by completion tag (desc_cnt entries each). */
+    struct pbuf **pending;     /* in-flight pbuf (RDA); NULL in QPL */
+    u16         *seg_counts;   /* total descs (ctx+pkt); 0 = tag not in flight */
+    timestamp   *miss_times;   /* non-zero after miss, cleared on reinject */
+    timestamp   *tx_timestamps; /* per-packet submit time (watchdog) */
+    u16          pending_misses;
     struct gve_queue_resources  *q_res;
 
     struct gve_stats_tx tx_stats;
-
-    /* Watchdog: per-slot submission timestamp (same model as GQI above). */
-    timestamp *tx_timestamps;
     boolean    stuck;
 
-    /* DQO-QPL only: bounce-page ring.  DQO addresses buffers by physical
-     * address even in QPL mode, so the data is copied here and the descriptor
-     * carries qpl_base_phys + offset. */
+    /* DQO-QPL only: bounce buffers managed as a free-list of
+     * GVE_DQO_BUF_SIZE slots (same pattern as the DQO RX buf_ids), so a
+     * MISSed packet's slots are never reused while outstanding.  The
+     * descriptor carries qpl_base_phys + slot * GVE_DQO_BUF_SIZE. */
     void *qpl_base;
     u64   qpl_base_phys;
-    u32   qpl_head;        /* write cursor (bytes) */
-    u32   qpl_used;        /* bytes owned by device */
-    u32   qpl_size;        /* QPL ring size (bytes) */
-    u32  *qpl_allocated;   /* QPL bytes per packet (indexed by eop slot) */
+    u16  *qpl_slot_list;      /* circular list of free bounce-slot indices */
+    u32   qpl_slot_head;      /* take cursor */
+    u32   qpl_slot_tail;      /* return cursor */
+    u32   qpl_free_slots;     /* count of free slots */
+    u32   qpl_num_slots;
+    u16 (*tag_qpl_slots)[GVE_TX_MAX_DATA_DESCS];  /* slots taken, per tag */
+    u8   *tag_qpl_n;          /* number of slots taken, per tag */
 
     u32              last_re_idx;  /* desc idx of last report_event (DESC compl spacing) */
 
@@ -743,6 +787,8 @@ typedef struct gve_rx_dqo_queue {
     u32                           next_to_use;   /* free_ids take cursor (post path) */
     u32                           next_to_clean; /* free_ids put cursor (completion path) */
 
+    u32  db_head;            /* buf_head value last written to the doorbell */
+
     u32 *irq_db_index;
     closure_struct(thunk, irq_handler);
     closure_struct(thunk, service);
@@ -756,6 +802,8 @@ typedef struct gve_rx_dqo_queue {
     int   empty_rx_queue;
     u16   idx;                    /* RX queue index, for SO_INCOMING_NAPI_ID */
     struct pbuf *ctx_head;        /* in-progress multi-buffer packet (NULL = none) */
+    boolean drop_pkt;             /* discard buffers until end_of_packet
+                                     (official driver: ctx->drop_pkt) */
 
     /* DQO-QPL only: bounce pages.  buf_id i maps to qpl_base + i*GVE_DQO_BUF_SIZE;
      * data is copied out on completion (descriptor carries the physical addr). */

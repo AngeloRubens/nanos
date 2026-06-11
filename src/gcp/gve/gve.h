@@ -9,6 +9,7 @@
  *     separate TX-completion and RX-buffer/completion rings, in both
  *     RDA and QPL (bounce) addressing
  *   - multi-buffer RX packet reassembly (pbuf_cat to end-of-packet)
+ *   - device-requested reset handling (e.g. live migration)
  *   - SO_INCOMING_NAPI_ID: per-queue napi_id tagged on received packets
  *   - TX QPL integer-overflow fix (was: head < qpl_head wrap)
  *   - TX completion timeout / watchdog + deferred reset (prevents

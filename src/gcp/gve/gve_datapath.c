@@ -101,6 +101,8 @@ static boolean gve_tx_write_qpl(gve_tx_queue tx, struct pbuf *p)
     pkt->type_flags     = GVE_TXD_STD;
     pkt->l4_csum_offset = 0;
     pkt->l4_hdr_offset  = 0;
+    /* One watchdog stamp per packet, on the pkt-descriptor slot; seg slots
+     * stay 0 (cleared on retire) and the watchdog skips them. */
     tx->tx_timestamps[slot] = now(CLOCK_ID_MONOTONIC);
 
     u32 offset;
@@ -118,7 +120,6 @@ static boolean gve_tx_write_qpl(gve_tx_queue tx, struct pbuf *p)
         u32 seg_off;
         gve_tx_qpl_cpy(tx, q, &seg_off, &tx->qpl_allocated[seg_slot]);
         tx->qpl_used += tx->qpl_allocated[seg_slot];
-        tx->tx_timestamps[seg_slot] = now(CLOCK_ID_MONOTONIC);
         struct gve_tx_seg_desc *seg = &tx->desc[seg_slot].seg;
         seg->type_flags = GVE_TXD_SEG;
         seg->seg_len    = htobe16(q->len);
@@ -148,6 +149,7 @@ static boolean gve_tx_write_rda(gve_tx_queue tx, struct pbuf *p)
     u32 pkt_slot = tx->head & tx->mask;
     struct gve_tx_pkt_desc *pkt = &tx->desc[pkt_slot].pkt;
     tx->pending[pkt_slot]    = p;  /* uses the ref from br-enqueue */
+    /* One watchdog stamp per packet (seg slots stay 0, watchdog skips). */
     tx->tx_timestamps[pkt_slot] = now(CLOCK_ID_MONOTONIC);
     tx->head++;
 
@@ -163,7 +165,6 @@ static boolean gve_tx_write_rda(gve_tx_queue tx, struct pbuf *p)
         pbuf_ref(q);  /* each segment slot owns an independent ref */
         u32 seg_slot = tx->head & tx->mask;
         tx->pending[seg_slot]       = q;
-        tx->tx_timestamps[seg_slot] = now(CLOCK_ID_MONOTONIC);
         struct gve_tx_seg_desc *seg = &tx->desc[seg_slot].seg;
         seg->type_flags = GVE_TXD_SEG;
         seg->seg_len    = htobe16(q->len);
@@ -261,9 +262,15 @@ static err_t gve_linkoutput_gqi(struct netif *netif, struct pbuf *p)
     if (tx->stuck)
         return ERR_IF;
     boolean is_empty = queue_empty(tx->br);
-    if (!enqueue(tx->br, p))
-        return ERR_MEM;
+    /* Take the queue's pbuf reference BEFORE publishing it: a concurrent
+     * drain on another CPU may dequeue and (QPL mode) free it right after
+     * the bounce copy.  (ENA enqueues first, but its consumer frees only at
+     * TX completion, so it cannot race the producer's ref.) */
     pbuf_ref(p);
+    if (!enqueue(tx->br, p)) {
+        pbuf_free(p);   /* drop our ref; lwIP still owns p */
+        return ERR_MEM;
+    }
     if (is_empty && spin_try(&tx->ring_mtx)) {
         gve_tx_drain_gqi(tx);
         spin_unlock(&tx->ring_mtx);
@@ -294,8 +301,12 @@ void gve_rx_fill(gve_rx_queue rx)
     int slot_count;
     gve_debug("RX fill: head %d, tail %d, avail %d",
               rx->head, rx->tail, rx->qpl_available);
+    /* head/tail are free-running u32 counters: compare via subtraction so
+     * the predicate stays correct across the u32 wrap (the original
+     * "head < tail + cnt" form deadlocked RX after 2^32 posted buffers,
+     * same overflow class as the TX qpl_head bug fixed in this port). */
     for (slot_count = 0;
-         (rx->head < rx->tail + adapter->rx_desc_cnt) && rx->qpl_available;
+         (rx->head - rx->tail < adapter->rx_desc_cnt) && rx->qpl_available;
          rx->head++, slot_count++, rx->qpl_available--) {
         u64 offset = rx->qpl_head * PAGESIZE;
         if (rx->pbufs[rx->qpl_head].ref > 1) {
@@ -352,8 +363,18 @@ closure_func_basic(thunk, void, gve_rx_service)
              rx->qpl_available++, rx->tail++, budget--) {
             struct gve_rx_desc *desc = &rx->desc[rx->tail & rx->mask];
             u16 length = be16toh(desc->len);
+            /* PKT_CONT marks a non-final buffer of a multi-buffer packet. */
+            boolean cont = !!(desc->flags_seq & GVE_RXF_PKT_CONT);
+            if (rx->drop_pkt) {
+                /* Discarding the remaining fragments of a packet dropped
+                 * mid-chain (official driver: ctx->drop_pkt, gve_rx.c). */
+                if (!cont)
+                    rx->drop_pkt = false;
+                continue;
+            }
             if (desc->flags_seq & GVE_RXF_ERR) {
                 rx->rx_stats.rx_dropped++;
+                rx->drop_pkt = cont;        /* skip the rest of this packet */
                 if (rx->ctx_head) {         /* discard the partial packet */
                     pbuf_free(rx->ctx_head);
                     rx->ctx_head = NULL;
@@ -362,12 +383,12 @@ closure_func_basic(thunk, void, gve_rx_service)
             }
             /* GQI prepends a 2-byte IP-alignment pad on the FIRST buffer of a
              * packet only (Google gve_rx.c: pad = is_first_frag ? GVE_RX_PAD
-             * : 0); PKT_CONT marks a non-final buffer. */
-            boolean cont  = !!(desc->flags_seq & GVE_RXF_PKT_CONT);
+             * : 0). */
             boolean first = (rx->ctx_head == NULL);
             u16 pad = first ? GVE_RX_PADDING : 0;
             if (length <= pad) {
                 rx->rx_stats.rx_dropped++;
+                rx->drop_pkt = cont;
                 if (rx->ctx_head) {
                     pbuf_free(rx->ctx_head);
                     rx->ctx_head = NULL;
@@ -418,6 +439,7 @@ closure_func_basic(thunk, void, gve_rx_service)
                 struct pbuf *p = pbuf_alloc(PBUF_RAW, frag_len, PBUF_RAM);
                 if (!p) {
                     rx->rx_stats.rx_dropped++;
+                    rx->drop_pkt = cont;
                     if (rx->ctx_head) {
                         pbuf_free(rx->ctx_head);
                         rx->ctx_head = NULL;
