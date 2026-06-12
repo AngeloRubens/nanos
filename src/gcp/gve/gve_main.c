@@ -57,9 +57,14 @@ closure_func_basic(thunk, void, gve_mgmt_irq)
     gve_debug("mgmt irq, status 0x%x", status);
     if (status & GVE_DEVICE_STATUS_RESET) {
         /* Device-requested reset (e.g. live migration); mirrors the official
-         * driver's gve_handle_status.  Link state is re-read after reset. */
-        msg_err("GVE: device requested reset");
-        gve_trigger_reset(adapter);
+         * driver's gve_handle_status.  Link state is re-read after reset.
+         * Ignored until the adapter is fully initialized: a reset task
+         * racing gve_init's queue creation would tear down half-created
+         * queues (and after a failed reset the adapter stays down). */
+        if (adapter->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING)) {
+            msg_err("GVE: device requested reset");
+            gve_trigger_reset(adapter);
+        }
         return;
     }
     if (status & GVE_DEVICE_STATUS_LINK_STATUS)
@@ -151,10 +156,16 @@ closure_func_basic(thunk, void, gve_reset)
         else
             async_apply_bh((thunk)&adapter->link_down_task);
     }
-
-  done:
     atomic_clear_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET);
     atomic_clear_bit(&adapter->flags, GVE_FLAG_RESETTING);
+    spin_unlock(&adapter->global_lock);
+    return;
+
+  done:
+    /* Failure: leave RESETTING and ONGOING_RESET set so the watchdog, the
+     * RX service interrupt re-arm and further reset triggers all stay
+     * inhibited — device resources are freed at this point and the adapter
+     * is dead until the image is restarted. */
     spin_unlock(&adapter->global_lock);
 }
 
