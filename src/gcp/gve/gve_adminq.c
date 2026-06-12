@@ -438,10 +438,9 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
     tx->event_counter_idx = be32toh(tx->q_res->counter_index);
     tx->db_idx            = be32toh(tx->q_res->db_index);
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
-    /* The TX notify block is masked at turnup (gve_turnup_irqs), not here:
-     * reading irq_db_indices this early would assume the device populates
-     * it synchronously with CONFIGURE_DEVICE_RESOURCES, which no proven
-     * driver relies on. */
+    /* The TX notify block is masked at turnup (gve_turnup_irqs), with the
+     * rest of the interrupt-state bring-up: no TX events can exist before
+     * the netif is up, so nothing is lost by masking late. */
     gve_tx_init_gqi(tx);
     return true;
 

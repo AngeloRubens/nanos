@@ -71,8 +71,8 @@
  */
 #define GVE_MAX_IO_QUEUES   16
 
-/* Watchdog: if a TX descriptor slot has been outstanding for this many ms
- * with no completion, declare the queue stuck and schedule a reset. */
+/* Watchdog: if a TX packet has been outstanding for this many ms with no
+ * completion, declare the queue stuck and schedule a reset. */
 #define GVE_TX_WATCHDOG_MS          5000
 
 /* Watchdog timer fires at this interval (matches ENA 1-second cadence).
@@ -84,9 +84,9 @@
  * the MSI-X vector may have been lost — schedule a reset. */
 #define GVE_MAX_NO_INTERRUPT_ITERATIONS  3
 
-/* Number of per-slot TX timeouts required to trigger a reset.
+/* Number of timed-out TX packets required to trigger a reset.
  * Matches ENA DEFAULT_TX_CMP_THRESHOLD: avoids spurious resets from
- * transient single-slot stalls; requires sustained queue exhaustion. */
+ * transient single-packet stalls; requires sustained queue exhaustion. */
 #define GVE_TX_STUCK_THRESHOLD          128
 
 /* Cacheline boundary used for QPL copy padding.
@@ -666,10 +666,11 @@ typedef struct gve_tx_queue {
 
     struct gve_stats_tx tx_stats;
 
-    /* Watchdog: per-slot submission timestamp (same model as ENA tx_buf->timestamp).
-     * Set when a descriptor slot is posted; cleared on completion.
-     * Watchdog iterates outstanding slots [tail, head) and flags any slot
-     * whose age exceeds GVE_TX_WATCHDOG_MS. */
+    /* Watchdog: per-packet submission timestamp (same model as ENA
+     * tx_buf->timestamp), stored at the pkt-descriptor slot; seg slots
+     * stay 0 and the watchdog skips them.  Cleared on completion.
+     * Watchdog iterates outstanding slots [tail, head) and flags any
+     * packet whose age exceeds GVE_TX_WATCHDOG_MS. */
     timestamp *tx_timestamps;
     boolean    stuck;
     u32        event_counter_idx;  /* cached from q_res->counter_index at create */
@@ -764,7 +765,8 @@ typedef struct gve_tx_dqo_queue {
     /* Per-tag state, indexed by completion tag (desc_cnt entries each). */
     struct pbuf **pending;     /* in-flight pbuf (RDA); NULL in QPL */
     u16         *seg_counts;   /* total descs (ctx+pkt); 0 = tag not in flight */
-    timestamp   *miss_times;   /* non-zero after miss, cleared on reinject */
+    timestamp   *miss_times;   /* non-zero after miss; cleared when the tag
+                                  retires or on watchdog timeout */
     timestamp   *tx_timestamps; /* per-packet submit time (watchdog) */
     struct gve_queue_resources  *q_res;
 
