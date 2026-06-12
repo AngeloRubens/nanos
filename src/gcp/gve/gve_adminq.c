@@ -179,14 +179,18 @@ boolean gve_cfg_device_resources(gve adapter)
     u32 nq = adapter->num_queues;
     u32 nirq = GVE_IRQ_DB_COUNT(nq);
 
+    /* Zero both arrays: the device populates them, but the driver reads
+     * event counters on the first TX/RX cleanup and irq doorbell indices
+     * when arming DQO interrupts — start from 0 rather than heap garbage
+     * (Linux gets this implicitly from dma_alloc_coherent). */
     u64 evt_cnt_size = MAX(adapter->num_event_counters * sizeof(u32),
                            PAGESIZE);
-    adapter->event_counters = allocate(adapter->contiguous, evt_cnt_size);
+    adapter->event_counters = allocate_zero(adapter->contiguous, evt_cnt_size);
     if (adapter->event_counters == INVALID_ADDRESS)
         return false;
 
     u64 irq_db_size = sizeof(struct gve_irq_db) * nirq;
-    adapter->irq_db_indices = allocate(adapter->contiguous, irq_db_size);
+    adapter->irq_db_indices = allocate_zero(adapter->contiguous, irq_db_size);
     if (adapter->irq_db_indices == INVALID_ADDRESS)
         goto err_evt;
 
@@ -575,8 +579,8 @@ static boolean gve_create_rx_queue(gve adapter, gve_rx_queue rx,
     cmd->create_rx_queue.queue_page_list_id  = htobe32(qpl_id);
     cmd->create_rx_queue.rx_ring_size        = htobe16(adapter->rx_desc_cnt);
     cmd->create_rx_queue.packet_buffer_size  = htobe16(PAGESIZE / 2);
-    cmd->create_rx_queue.rx_buff_ring_size   =
-        htobe16(rda ? 0 : adapter->rx_data_slot_cnt);
+    /* rx_buff_ring_size stays 0 for GQI: both the HW-proven original driver
+     * and the official driver set it only for DQO queues. */
 
     if (!gve_adminq_execute_cmd(adapter, cmd))
         goto err_after_q_res;
