@@ -900,7 +900,10 @@ typedef struct gve {
     u16 mtu;
 } *gve;
 
-/* Schedule a reset exactly once; subsequent callers are no-ops. */
+/* Schedule a reset exactly once; subsequent callers are no-ops.
+ * Uses async_apply_bh (not async_apply, which asserts !in_interrupt())
+ * because this is reachable from the mgmt interrupt handler
+ * (device-requested reset). */
 static inline void gve_trigger_reset(gve adapter)
 {
     if (!atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_RESETTING))

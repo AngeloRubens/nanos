@@ -275,7 +275,9 @@ static err_t gve_linkoutput_gqi(struct netif *netif, struct pbuf *p)
         gve_tx_drain_gqi(tx);
         spin_unlock(&tx->ring_mtx);
     } else {
-        async_apply_bh((thunk)&tx->enqueue_task);
+        /* Not interrupt context: use the runqueue (as ENA does), keeping
+         * the bhqueue for interrupt-deferred work. */
+        async_apply((thunk)&tx->enqueue_task);
     }
     return ERR_OK;
 }

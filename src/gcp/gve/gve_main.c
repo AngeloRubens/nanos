@@ -120,7 +120,9 @@ static void gve_turnup_rx_dqo(gve adapter)
                         ((GVE_DQO_RX_IRQ_THROTTLE_US / 2) <<
                          GVE_DQO_ITR_INTERVAL_SHIFT));
         memory_barrier();
-        async_apply_bh((thunk)&rx->service);
+        /* Called from probe or from the reset BH, never from interrupt
+         * context: runqueue. */
+        async_apply((thunk)&rx->service);
     }
 }
 
@@ -180,9 +182,9 @@ closure_func_basic(thunk, void, gve_reset)
     {
         u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
         if (status & GVE_DEVICE_STATUS_LINK_STATUS)
-            async_apply_bh((thunk)&adapter->link_up_task);
+            async_apply((thunk)&adapter->link_up_task);
         else
-            async_apply_bh((thunk)&adapter->link_down_task);
+            async_apply((thunk)&adapter->link_down_task);
     }
     atomic_clear_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET);
     atomic_clear_bit(&adapter->flags, GVE_FLAG_RESETTING);
@@ -301,14 +303,16 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
         adapter->next_monitored_tx_qid = ri % adapter->num_queues;
 
         /* Wakeup: stopped DQO TX queues with pending packets that have not
-         * been restarted by new incoming traffic. All queues every tick. */
+         * been restarted by new incoming traffic. All queues every tick.
+         * Watchdog runs as a BH, not in interrupt context, so these kicks
+         * go on the runqueue (as in the ENA watchdog). */
         for (u32 i = 0; i < adapter->num_queues; i++) {
             gve_tx_dqo_queue tx = &adapter->tx_dqo[i];
             if (tx->stuck || tx->running)
                 continue;
             u32 free = (tx->mask + 1) - (tx->head - tx->desc_tail);
             if (free >= GVE_TX_RESUME_THRESH)
-                async_apply_bh((thunk)&tx->enqueue_task);
+                async_apply((thunk)&tx->enqueue_task);
         }
         /* Empty-ring detection: if fill posted nothing for several ticks,
          * the device has no buffers and will send no interrupts — deadlock.
@@ -318,7 +322,7 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
             if (rx->empty_rx_queue > 2) {
                 rx->rx_stats.empty_rx_ring++;
                 rx->empty_rx_queue = 0;
-                async_apply_bh((thunk)&rx->service);
+                async_apply((thunk)&rx->service);
             }
         }
     } else {
@@ -378,7 +382,8 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
         }
         adapter->next_monitored_tx_qid = ri % adapter->num_queues;
 
-        /* Wakeup: stopped GQI TX queues with pending packets. All queues every tick. */
+        /* Wakeup: stopped GQI TX queues with pending packets. All queues
+         * every tick.  Runqueue, not bhqueue: see the DQO loop above. */
         for (u32 i = 0; i < adapter->num_queues; i++) {
             gve_tx_queue tx = &adapter->tx[i];
             if (tx->stuck || tx->running)
@@ -387,7 +392,7 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                 adapter->event_counters[tx->event_counter_idx]);
             u32 free = adapter->tx_desc_cnt - (tx->head - hw_tail);
             if (free >= GVE_TX_RESUME_THRESH)
-                async_apply_bh((thunk)&tx->enqueue_task);
+                async_apply((thunk)&tx->enqueue_task);
         }
         /* Empty-ring detection. All queues every tick. */
         for (u32 i = 0; i < adapter->num_queues; i++) {
@@ -395,7 +400,7 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
             if (rx->empty_rx_queue > 2) {
                 rx->rx_stats.empty_rx_ring++;
                 rx->empty_rx_queue = 0;
-                async_apply_bh((thunk)&rx->service);
+                async_apply((thunk)&rx->service);
             }
         }
     }
