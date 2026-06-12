@@ -97,6 +97,33 @@ closure_func_basic(thunk, void, gve_rx_dqo_irq)
     /* interrupt stays disarmed until the ITR re-arm in gve_rx_dqo_service */
 }
 
+/*
+ * gve_turnup_rx_dqo — arm the DQO RX interrupts, with the netif up.
+ *
+ * The analogue of Linux gve_turnup: write the ITR doorbell (enable + 2 us
+ * granularity throttling interval) for every RX queue, then kick the
+ * service once per queue to pick up any completions that arrived before
+ * arming (Linux does the same with a one-off napi_schedule after a memory
+ * barrier).  Called at the end of probe and at the end of a successful
+ * reset — never at queue creation, where an interrupt taken before the
+ * netif is up would be serviced on a secondary CPU and lost.
+ */
+static void gve_turnup_rx_dqo(gve adapter)
+{
+    if (!adapter->dqo)
+        return;
+    for (u32 i = 0; i < adapter->num_queues; i++) {
+        gve_rx_dqo_queue rx = &adapter->rx_dqo[i];
+        pci_bar_write_4(&adapter->db_bar,
+                        be32toh(*rx->irq_db_index) * sizeof(u32),
+                        GVE_DQO_ITR_ENABLE |
+                        ((GVE_DQO_RX_IRQ_THROTTLE_US / 2) <<
+                         GVE_DQO_ITR_INTERVAL_SHIFT));
+        memory_barrier();
+        async_apply_bh((thunk)&rx->service);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* TX completion watchdog and deferred reset                            */
 /* ------------------------------------------------------------------ */
@@ -148,6 +175,7 @@ closure_func_basic(thunk, void, gve_reset)
 
     atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_DEVICE_RUNNING);
     net_if->flags |= NETIF_FLAG_UP;
+    gve_turnup_rx_dqo(adapter);
     rprintf("GVE: adapter reset complete\n");
     {
         u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
@@ -579,6 +607,7 @@ closure_function(3, 1, boolean, gve_probe,
             netif_set_link_up(&adapter->ndev.n);
         else
             netif_set_link_down(&adapter->ndev.n);
+        gve_turnup_rx_dqo(adapter);
         /* Catch a reset the device requested while probe was in progress
          * (the mgmt IRQ ignores it until DEVICE_RUNNING; the official
          * driver re-checks at end of probe for the same reason). */

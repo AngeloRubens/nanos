@@ -457,18 +457,10 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                                             gve_rx_dqo_queue, service);
     gve adapter = rx->adapter;
     struct netif *net_if = &adapter->ndev.n;
-    if (!(net_if->flags & NETIF_FLAG_UP)) {
-        /* Probe window: the queue exists and its one-shot interrupt is
-         * armed before netif_add() brings the interface up, so a packet
-         * arriving in between must not eat the arming.  Re-arm and defer
-         * processing — unless a reset is tearing the queues down. */
-        if (!(adapter->flags & ((1ULL << GVE_FLAG_RESETTING) |
-                                (1ULL << GVE_FLAG_ONGOING_RESET))))
-            pci_bar_write_4(&adapter->db_bar,
-                            be32toh(*rx->irq_db_index) * sizeof(u32),
-                            GVE_DQO_ITR_ENABLE | GVE_DQO_ITR_NO_UPDATE);
+    if (!(net_if->flags & NETIF_FLAG_UP))
+        /* Interrupts are armed only at turnup (with the netif up), so this
+         * can only be a reset tearing the queues down: do not re-arm. */
         return;
-    }
     boolean irq_acked = false;
   begin:
     if (!(net_if->flags & NETIF_FLAG_UP))

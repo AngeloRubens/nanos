@@ -1013,17 +1013,10 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     rx->drop_pkt               = false;
     rx->db_head                = 0;
     gve_rx_dqo_fill(rx);
-
-    /* Arm the RX interrupt: DQO interrupts start disabled and become active
-     * only after the ITR doorbell is written (the analogue of Linux
-     * gve_turnup and of ENA ena_unmask_all_io_irqs).  Initial throttling
-     * interval has 2 us granularity; gve_rx_dqo_service re-arms with
-     * NO_UPDATE after each pass.  Native little-endian, unlike GQI. */
-    pci_bar_write_4(&adapter->db_bar,
-                    be32toh(*rx->irq_db_index) * sizeof(u32),
-                    GVE_DQO_ITR_ENABLE |
-                    ((GVE_DQO_RX_IRQ_THROTTLE_US / 2) <<
-                     GVE_DQO_ITR_INTERVAL_SHIFT));
+    /* The RX interrupt is NOT armed here: arming happens at turnup
+     * (gve_turnup_rx_dqo), once the netif is up — secondary CPUs run their
+     * runloops before PCI probe on nanos, so an interrupt taken before the
+     * netif is up would be serviced (and lost) immediately. */
     return true;
 
   err_cmd:
