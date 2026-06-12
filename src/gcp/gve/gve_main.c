@@ -98,20 +98,33 @@ closure_func_basic(thunk, void, gve_rx_dqo_irq)
 }
 
 /*
- * gve_turnup_rx_dqo — arm the DQO RX interrupts, with the netif up.
+ * gve_turnup_irqs — bring the per-queue interrupt state up, with the netif
+ * up and all queues created.
  *
- * The analogue of Linux gve_turnup: write the ITR doorbell (enable + 2 us
- * granularity throttling interval) for every RX queue, then kick the
+ * The analogue of Linux gve_turnup.  DQO: write the ITR doorbell (enable +
+ * 2 us granularity throttling interval) for every RX queue, then kick the
  * service once per queue to pick up any completions that arrived before
  * arming (Linux does the same with a one-off napi_schedule after a memory
- * barrier).  Called at the end of probe and at the end of a successful
- * reset — never at queue creation, where an interrupt taken before the
- * netif is up would be serviced on a secondary CPU and lost.
+ * barrier).  GQI: mask the TX notify blocks on the device side — TX
+ * completion is event-counter driven and their MSI-X table entries are
+ * never configured (the original driver pointed TX at the configured mgmt
+ * vector; the official driver configures every block).
+ *
+ * Called at the end of probe and at the end of a successful reset — never
+ * at queue creation: a DQO interrupt taken before the netif is up would be
+ * serviced on a secondary CPU and lost, and no proven driver reads the
+ * device-populated irq_db_indices earlier than turnup.
  */
-static void gve_turnup_rx_dqo(gve adapter)
+static void gve_turnup_irqs(gve adapter)
 {
-    if (!adapter->dqo)
+    if (!adapter->dqo) {
+        for (u32 i = 0; i < adapter->num_queues; i++)
+            pci_bar_write_4(&adapter->db_bar,
+                            be32toh(adapter->irq_db_indices[
+                                GVE_IRQ_DB_TX(adapter->num_queues, i)].index) *
+                            sizeof(u32), GVE_IRQ_MASK);
         return;
+    }
     for (u32 i = 0; i < adapter->num_queues; i++) {
         gve_rx_dqo_queue rx = &adapter->rx_dqo[i];
         pci_bar_write_4(&adapter->db_bar,
@@ -177,7 +190,7 @@ closure_func_basic(thunk, void, gve_reset)
 
     atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_DEVICE_RUNNING);
     net_if->flags |= NETIF_FLAG_UP;
-    gve_turnup_rx_dqo(adapter);
+    gve_turnup_irqs(adapter);
     rprintf("GVE: adapter reset complete\n");
     {
         u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
@@ -611,7 +624,7 @@ closure_function(3, 1, boolean, gve_probe,
             netif_set_link_up(&adapter->ndev.n);
         else
             netif_set_link_down(&adapter->ndev.n);
-        gve_turnup_rx_dqo(adapter);
+        gve_turnup_irqs(adapter);
         /* Catch a reset the device requested while probe was in progress
          * (the mgmt IRQ ignores it until DEVICE_RUNNING; the official
          * driver re-checks at end of probe for the same reason). */

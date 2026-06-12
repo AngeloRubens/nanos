@@ -438,17 +438,10 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
     tx->event_counter_idx = be32toh(tx->q_res->counter_index);
     tx->db_idx            = be32toh(tx->q_res->db_index);
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
-    /* Mask the TX notify block on the device side: TX completion is event-
-     * counter driven and this block's MSI-X table entry is never configured.
-     * The original driver pointed TX at the (configured) mgmt vector and the
-     * official driver configures every block, so an unmasked block firing
-     * into an unconfigured MSI-X entry is a configuration no proven driver
-     * ever exercised — mask it explicitly instead of relying on PCI
-     * masked-entry semantics. */
-    pci_bar_write_4(&adapter->db_bar,
-                    be32toh(adapter->irq_db_indices[
-                        GVE_IRQ_DB_TX(adapter->num_queues, index)].index) *
-                    sizeof(u32), GVE_IRQ_MASK);
+    /* The TX notify block is masked at turnup (gve_turnup_irqs), not here:
+     * reading irq_db_indices this early would assume the device populates
+     * it synchronously with CONFIGURE_DEVICE_RESOURCES, which no proven
+     * driver relies on. */
     gve_tx_init_gqi(tx);
     return true;
 
@@ -1022,7 +1015,7 @@ static boolean gve_create_rx_queue_dqo(gve adapter,
     rx->db_head                = 0;
     gve_rx_dqo_fill(rx);
     /* The RX interrupt is NOT armed here: arming happens at turnup
-     * (gve_turnup_rx_dqo), once the netif is up — secondary CPUs run their
+     * (gve_turnup_irqs), once the netif is up — secondary CPUs run their
      * runloops before PCI probe on nanos, so an interrupt taken before the
      * netif is up would be serviced (and lost) immediately. */
     return true;
