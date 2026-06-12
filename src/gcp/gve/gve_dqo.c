@@ -103,12 +103,15 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             } else {
                 u16_t tag = c->completion_tag & tx->mask;
                 if (!tx->seg_counts[tag]) {
+                    /* Stale or duplicate completion: count and move on, as
+                     * the official driver does.  If a real packet's
+                     * completion was lost, its per-tag watchdog timeout
+                     * reclaims the queue via reset. */
                     msg_err("GVE: DQO TX invalid completion tag %u", tag);
                     tx->tx_stats.bad_compl_tag++;
-                    gve_trigger_reset(tx->adapter);
-                    break;
+                } else {
+                    gve_tx_dqo_retire(tx, tag);
                 }
-                gve_tx_dqo_retire(tx, tag);
             }
         } else if (type == GVE_DQO_COMPL_TYPE_MISS) {
             u16_t tag = c->completion_tag & tx->mask;
@@ -119,12 +122,13 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
         } else if (type == GVE_DQO_COMPL_TYPE_REINJECT) {
             u16_t tag = c->completion_tag & tx->mask;
             if (!tx->seg_counts[tag]) {
+                /* As above: count and move on; the watchdog is the
+                 * backstop for a genuinely lost completion. */
                 msg_err("GVE: DQO TX invalid reinject tag %u", tag);
                 tx->tx_stats.bad_compl_tag++;
-                gve_trigger_reset(tx->adapter);
-                break;
+            } else {
+                gve_tx_dqo_retire(tx, tag);  /* also clears pending-miss state */
             }
-            gve_tx_dqo_retire(tx, tag);  /* also clears pending-miss state */
         }
 
         tx->compl_head++;
