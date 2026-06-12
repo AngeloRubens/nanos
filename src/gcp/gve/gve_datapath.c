@@ -350,12 +350,15 @@ closure_func_basic(thunk, void, gve_rx_service)
                                         gve_rx_queue, service);
     gve adapter = rx->adapter;
     struct netif *net_if = &adapter->ndev.n;
+    /* Serialize concurrent runs (IRQ handler + watchdog kicks may enqueue
+     * two instances picked up by different CPUs). */
+    spin_lock(&rx->service_lock);
     if (!(net_if->flags & NETIF_FLAG_UP))
-        return;
+        goto out;
     boolean irq_acked = false;
   begin:
     if (!(net_if->flags & NETIF_FLAG_UP))
-        return;
+        goto out;
     gve_debug("GQI RX service tail %d", rx->tail);
 
     for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
@@ -482,12 +485,15 @@ closure_func_basic(thunk, void, gve_rx_service)
         memory_barrier();
         goto begin;
     }
+  out:
+    spin_unlock(&rx->service_lock);
 }
 
 /* gve_rx_init: called from gve_adminq.c after the queue is allocated. */
 void gve_rx_init(gve_rx_queue rx)
 {
     init_closure_func(&rx->service, thunk, gve_rx_service);
+    spin_lock_init(&rx->service_lock);
 }
 
 /* gve_tx_init_gqi: called from gve_adminq.c after a GQI TX queue is

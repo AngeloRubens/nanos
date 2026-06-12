@@ -716,6 +716,11 @@ typedef struct gve_rx_queue {
     struct pbuf *ctx_head;        /* in-progress multi-buffer packet (NULL = none) */
     boolean drop_pkt;             /* discard fragments until end-of-packet
                                      (official driver: ctx->drop_pkt) */
+    /* Serializes service runs: the closure is scheduled from the IRQ
+     * handler and from watchdog kicks, and the bh/run queues may hand two
+     * enqueued instances to different CPUs (the NAPI_STATE_SCHED guard has
+     * no nanos equivalent). */
+    struct spinlock service_lock;
 } *gve_rx_queue;
 
 /* ------------------------------------------------------------------ */
@@ -838,6 +843,9 @@ typedef struct gve_rx_dqo_queue {
     struct pbuf *ctx_head;        /* in-progress multi-buffer packet (NULL = none) */
     boolean drop_pkt;             /* discard buffers until end_of_packet
                                      (official driver: ctx->drop_pkt) */
+    /* Serializes service runs (IRQ handler, watchdog kicks AND the turnup
+     * one-shot kick, which makes concurrent scheduling systematic). */
+    struct spinlock service_lock;
 
     /* DQO-QPL only: bounce pages.  buf_id i maps to qpl_base + i*GVE_DQO_BUF_SIZE;
      * data is copied out on completion (descriptor carries the physical addr). */

@@ -459,14 +459,18 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                                             gve_rx_dqo_queue, service);
     gve adapter = rx->adapter;
     struct netif *net_if = &adapter->ndev.n;
+    /* Serialize concurrent runs: IRQ handler, watchdog kicks and the
+     * turnup one-shot kick may enqueue instances picked up by different
+     * CPUs. */
+    spin_lock(&rx->service_lock);
     if (!(net_if->flags & NETIF_FLAG_UP))
         /* Interrupts are armed only at turnup (with the netif up), so this
          * can only be a reset tearing the queues down: do not re-arm. */
-        return;
+        goto out;
     boolean irq_acked = false;
   begin:
     if (!(net_if->flags & NETIF_FLAG_UP))
-        return;
+        goto out;
     gve_debug("DQO RX service compl_head %d", rx->compl_head);
 
     for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
@@ -620,11 +624,14 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
         memory_barrier();
         goto begin;
     }
+  out:
+    spin_unlock(&rx->service_lock);
 }
 
 void gve_rx_dqo_init(gve_rx_dqo_queue rx)
 {
     init_closure_func(&rx->service, thunk, gve_rx_dqo_service);
+    spin_lock_init(&rx->service_lock);
 }
 
 /* gve_tx_init_dqo: called from gve_adminq.c after a DQO TX queue is
