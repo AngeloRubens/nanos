@@ -194,10 +194,15 @@ closure_func_basic(thunk, void, gve_reset)
     rprintf("GVE: adapter reset complete\n");
     {
         u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
+        /* Direct calls, as in probe: routing through the link tasks raced
+         * their ONGOING_RESET guard (still set at this point, so a task
+         * running on another CPU before the clear below would skip the
+         * update) and made the tasks dual-source.  They now have a single
+         * scheduler: the mgmt interrupt. */
         if (status & GVE_DEVICE_STATUS_LINK_STATUS)
-            async_apply((thunk)&adapter->link_up_task);
+            netif_set_link_up(net_if);
         else
-            async_apply((thunk)&adapter->link_down_task);
+            netif_set_link_down(net_if);
     }
     atomic_clear_bit(&adapter->flags, GVE_FLAG_ONGOING_RESET);
     atomic_clear_bit(&adapter->flags, GVE_FLAG_RESETTING);
