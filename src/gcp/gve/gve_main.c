@@ -277,7 +277,13 @@ closure_func_basic(timer_handler, void, gve_watchdog_task,
                  * a device stall.  Checked here (watchdog) not in the hot
                  * path (same split as ENA check_missing_comp_in_tx_queue);
                  * the full miss_times scan costs at most mask+1 reads per
-                 * monitored queue per tick. */
+                 * monitored queue per tick.
+                 * The reset is deliberate where the official driver only
+                 * frees the packet: it can do so because its 60s tag-reclaim
+                 * machinery prevents tag reuse afterwards.  Without that
+                 * machinery, not resetting would leak the tag and its
+                 * descriptor-ring slots permanently — the reset IS our
+                 * reclaim path. */
                 for (u32 mi = 0; mi <= tx->mask; mi++) {
                     if (!tx->miss_times[mi])
                         continue;
