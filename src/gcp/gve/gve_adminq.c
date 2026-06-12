@@ -438,6 +438,17 @@ static boolean gve_create_tx_queue(gve adapter, gve_tx_queue tx,
     tx->event_counter_idx = be32toh(tx->q_res->counter_index);
     tx->db_idx            = be32toh(tx->q_res->db_index);
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
+    /* Mask the TX notify block on the device side: TX completion is event-
+     * counter driven and this block's MSI-X table entry is never configured.
+     * The original driver pointed TX at the (configured) mgmt vector and the
+     * official driver configures every block, so an unmasked block firing
+     * into an unconfigured MSI-X entry is a configuration no proven driver
+     * ever exercised — mask it explicitly instead of relying on PCI
+     * masked-entry semantics. */
+    pci_bar_write_4(&adapter->db_bar,
+                    be32toh(adapter->irq_db_indices[
+                        GVE_IRQ_DB_TX(adapter->num_queues, index)].index) *
+                    sizeof(u32), GVE_IRQ_MASK);
     gve_tx_init_gqi(tx);
     return true;
 
