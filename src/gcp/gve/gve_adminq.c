@@ -211,10 +211,8 @@ boolean gve_cfg_device_resources(gve adapter)
         adapter->raw_addressing ? GVE_GQI_RDA_FORMAT : GVE_GQI_QPL_FORMAT;
 
     boolean success = gve_adminq_execute_cmd(adapter, cmd);
-    if (success) {
-        zero(&adapter->hw_stats, sizeof(adapter->hw_stats));
+    if (success)
         return true;
-    }
 
     deallocate(adapter->contiguous, adapter->irq_db_indices, irq_db_size);
     adapter->irq_db_indices = NULL;
@@ -794,7 +792,6 @@ static boolean gve_create_tx_queue_dqo(gve adapter,
     tx->adapter          = adapter;
     tx->stuck            = false;
     tx->running          = true;
-    tx->pending_misses   = 0;
     tx->last_re_idx      = 0;
     tx->db_idx           = be32toh(tx->q_res->db_index);
     for (u16 i = 0; i < desc_cnt; i++)

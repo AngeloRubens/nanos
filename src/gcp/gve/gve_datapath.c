@@ -218,8 +218,6 @@ static void gve_tx_drain_gqi(gve_tx_queue tx)
 
         tx->tx_stats.cnt++;
         tx->tx_stats.bytes += tot_len;
-        adapter->hw_stats.tx_packets++;
-        adapter->hw_stats.tx_bytes += tot_len;
 
         if (++pkts >= GVE_TX_DOORBELL_BATCH) {
             write_barrier();
@@ -435,8 +433,6 @@ closure_func_basic(thunk, void, gve_rx_service)
                     pbuf_free(p);
                 rx->rx_stats.cnt++;
                 rx->rx_stats.bytes += frag_len;
-                adapter->hw_stats.rx_packets++;
-                adapter->hw_stats.rx_bytes += frag_len;
             } else {
                 /* Multi-buffer packet: copy this fragment and chain it (same
                  * pbuf_cat accumulation as ena_rx_mbuf).  Zero-copy is not
@@ -467,8 +463,6 @@ closure_func_basic(thunk, void, gve_rx_service)
                         pbuf_free(pkt);
                     rx->rx_stats.cnt++;
                     rx->rx_stats.bytes += tot;
-                    adapter->hw_stats.rx_packets++;
-                    adapter->hw_stats.rx_bytes += tot;
                 }
             }
         }

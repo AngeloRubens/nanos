@@ -575,7 +575,8 @@ struct gve_rx_desc {
 } __attribute__((packed));
 
 /* ------------------------------------------------------------------ */
-/* Per-queue and adapter statistics                                     */
+/* Per-queue statistics (no adapter-level aggregates: nanos has no      */
+/* stats consumer — these exist for HW bring-up and debugging)          */
 /* ------------------------------------------------------------------ */
 
 struct gve_stats_tx {
@@ -600,13 +601,6 @@ struct gve_stats_rx {
 
 struct gve_stats_dev {
     u64 wd_expired;     /* watchdog-triggered resets */
-};
-
-struct gve_hw_stats {
-    u64 rx_packets;
-    u64 tx_packets;
-    u64 rx_bytes;
-    u64 tx_bytes;
 };
 
 /* TX software queue constants (buf_ring pattern, same as ENA). */
@@ -772,7 +766,6 @@ typedef struct gve_tx_dqo_queue {
     u16         *seg_counts;   /* total descs (ctx+pkt); 0 = tag not in flight */
     timestamp   *miss_times;   /* non-zero after miss, cleared on reinject */
     timestamp   *tx_timestamps; /* per-packet submit time (watchdog) */
-    u16          pending_misses;
     struct gve_queue_resources  *q_res;
 
     struct gve_stats_tx tx_stats;
@@ -903,7 +896,6 @@ typedef struct gve {
     struct timer watchdog_timer;
     closure_struct(timer_handler, watchdog_task);
     u32 next_monitored_tx_qid;   /* rotation cursor for watchdog TX/RX checks */
-    struct gve_hw_stats hw_stats;
     struct gve_stats_dev dev_stats;
     u16 mtu;
 } *gve;

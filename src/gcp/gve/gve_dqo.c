@@ -58,10 +58,7 @@ static void gve_tx_dqo_retire(gve_tx_dqo_queue tx, u16_t tag)
     }
     /* Clear any pending-miss state: a tag that retires (PKT or REINJECT)
      * must not leave a ghost miss behind for the watchdog to time out. */
-    if (tx->miss_times[tag]) {
-        tx->miss_times[tag] = 0;
-        tx->pending_misses--;
-    }
+    tx->miss_times[tag] = 0;
     tx->free_tags[tx->tags_ntc & tx->mask] = tag;
     tx->tags_ntc++;
 }
@@ -99,12 +96,10 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
                 u16_t tag = c->completion_tag & tx->mask;
                 /* Record a miss only for an in-flight tag (the official
                  * driver validates the pending-packet state likewise). */
-                if (!tx->seg_counts[tag]) {
+                if (!tx->seg_counts[tag])
                     tx->tx_stats.bad_compl_tag++;
-                } else if (!tx->miss_times[tag]) {
+                else if (!tx->miss_times[tag])
                     tx->miss_times[tag] = now(CLOCK_ID_MONOTONIC);
-                    tx->pending_misses++;
-                }
             } else {
                 u16_t tag = c->completion_tag & tx->mask;
                 if (!tx->seg_counts[tag]) {
@@ -117,12 +112,10 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             }
         } else if (type == GVE_DQO_COMPL_TYPE_MISS) {
             u16_t tag = c->completion_tag & tx->mask;
-            if (!tx->seg_counts[tag]) {
+            if (!tx->seg_counts[tag])
                 tx->tx_stats.bad_compl_tag++;
-            } else if (!tx->miss_times[tag]) {
+            else if (!tx->miss_times[tag])
                 tx->miss_times[tag] = now(CLOCK_ID_MONOTONIC);
-                tx->pending_misses++;
-            }
         } else if (type == GVE_DQO_COMPL_TYPE_REINJECT) {
             u16_t tag = c->completion_tag & tx->mask;
             if (!tx->seg_counts[tag]) {
@@ -303,8 +296,6 @@ static void gve_tx_drain_dqo(gve_tx_dqo_queue tx)
 
         tx->tx_stats.cnt++;
         tx->tx_stats.bytes += tot_len;
-        adapter->hw_stats.tx_packets++;
-        adapter->hw_stats.tx_bytes += tot_len;
 
         if (++pkts >= GVE_TX_DOORBELL_BATCH) {
             write_barrier();
@@ -594,8 +585,6 @@ closure_func_basic(thunk, void, gve_rx_dqo_service)
                         pbuf_free(pkt);
                     rx->rx_stats.cnt++;
                     rx->rx_stats.bytes += tot;
-                    adapter->hw_stats.rx_packets++;
-                    adapter->hw_stats.rx_bytes += tot;
                 }
             }
 
