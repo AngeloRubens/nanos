@@ -6,6 +6,7 @@
  *   - QPL (Queue Page List) register / unregister
  *   - TX and RX queue create / destroy
  *   - Queue count negotiation (device caps, MSI-X, CPU, manifest)
+ *   - RSS configuration (Toeplitz key + indirection table)
  */
 
 #include "gve_priv.h"
@@ -148,6 +149,8 @@ boolean gve_describe_device(gve adapter)
             else if (id == GVE_DEV_OPT_ID_GQI_RDA ||
                      id == GVE_DEV_OPT_ID_GQI_RAW_ADDRESSING)
                 opt_gqi_rda = true;
+            else if (id == GVE_DEV_OPT_ID_RSS_CONFIG)
+                adapter->rss_supported = true;
             opt = (struct gve_device_option *)((u8 *)(opt + 1) + len);
         }
         if (opt_dqo_rda) {
@@ -252,6 +255,48 @@ boolean gve_get_ptype_map_dqo(gve adapter)
         htobe64(physical_from_virtual(ptype_map));
     boolean success = gve_adminq_execute_cmd(adapter, cmd);
     deallocate(adapter->contiguous, ptype_map, PAGESIZE);
+    return success;
+}
+
+/*
+ * gve_configure_rss — program the RSS Toeplitz key and indirection table.
+ *
+ * The key is random per boot (defends against hash-flooding: with the
+ * device-default key the flow->queue mapping may be predictable); the LUT
+ * spreads flows round-robin over the RX queues.  Static configuration, set
+ * at init and re-applied on reset; there is no runtime consumer that would
+ * rewrite it (no ethtool on nanos).  Best-effort: when the device does not
+ * offer the RSS_CONFIG option this is a no-op and RX steering stays on the
+ * (undocumented) device default, the pre-RSS behavior.
+ */
+boolean gve_configure_rss(gve adapter)
+{
+    if (!adapter->rss_supported)
+        return true;
+
+    /* One page holds the 40-byte key followed by the be32 LUT. */
+    u8 *key = allocate(adapter->contiguous, PAGESIZE);
+    if (key == INVALID_ADDRESS)
+        return false;
+    u32 *lut = (u32 *)(key + GVE_RSS_KEY_SIZE);
+
+    for (int i = 0; i < GVE_RSS_KEY_SIZE; i += sizeof(u64)) {
+        u64 r = random_u64();
+        runtime_memcpy(key + i, &r, sizeof(r));
+    }
+    for (int i = 0; i < GVE_RSS_INDIR_SIZE; i++)
+        lut[i] = htobe32(i % adapter->num_queues);
+
+    struct gve_adminq_command *cmd = gve_adminq_new_cmd(adapter);
+    cmd->opcode = htobe32(GVE_ADMINQ_CONFIGURE_RSS);
+    cmd->configure_rss.hash_types    = htobe16(GVE_RSS_HASH_TYPES);
+    cmd->configure_rss.hash_alg      = GVE_RSS_HASH_ALG_TOEPLITZ;
+    cmd->configure_rss.hash_key_size = htobe16(GVE_RSS_KEY_SIZE);
+    cmd->configure_rss.hash_lut_size = htobe16(GVE_RSS_INDIR_SIZE);
+    cmd->configure_rss.hash_key_addr = htobe64(physical_from_virtual(key));
+    cmd->configure_rss.hash_lut_addr = htobe64(physical_from_virtual(lut));
+    boolean success = gve_adminq_execute_cmd(adapter, cmd);
+    deallocate(adapter->contiguous, key, PAGESIZE);
     return success;
 }
 

@@ -109,6 +109,7 @@
 #define GVE_DEV_OPT_ID_GQI_QPL             0x3
 #define GVE_DEV_OPT_ID_DQO_RDA             0x4
 #define GVE_DEV_OPT_ID_DQO_QPL             0x7
+#define GVE_DEV_OPT_ID_RSS_CONFIG          0xe
 
 /* Admin queue polling: exponential backoff from GVE_ADMINQ_MIN_POLL_US to
  * GVE_ADMINQ_MAX_POLL_US (mirrors ENA ena_delay_exponential_backoff_us).
@@ -130,6 +131,7 @@ enum gve_adminq_opcode {
     GVE_ADMINQ_DESTROY_TX_QUEUE,
     GVE_ADMINQ_DESTROY_RX_QUEUE,
     GVE_ADMINQ_DECONFIGURE_DEVICE_RESOURCES,
+    GVE_ADMINQ_CONFIGURE_RSS = 10,
     GVE_ADMINQ_SET_DRIVER_PARAMETER = 11,
     GVE_ADMINQ_REPORT_STATS,
     GVE_ADMINQ_REPORT_LINK_SPEED,
@@ -289,6 +291,37 @@ struct gve_adminq_get_ptype_map {
     u64 ptype_map_addr;
 } __attribute__((packed));
 
+/*
+ * RSS configuration (CONFIGURE_RSS, device option GVE_DEV_OPT_ID_RSS_CONFIG).
+ * The driver hands the device a Toeplitz hash key and an indirection table
+ * (LUT of RX queue indices, be32 entries); the device then steers each flow
+ * to LUT[toeplitz(4-tuple, key) % lut_size].  Pure init-time configuration:
+ * no per-packet driver work.
+ */
+#define GVE_RSS_KEY_SIZE    40
+#define GVE_RSS_INDIR_SIZE  128
+
+/* Hash type bits (enum gve_rss_hash_type in the Google driver).  We enable
+ * the same set Linux configures: TCP/UDP over IPv4/IPv6. */
+#define GVE_RSS_HASH_TCPV4  (1 << 1)
+#define GVE_RSS_HASH_TCPV6  (1 << 4)
+#define GVE_RSS_HASH_UDPV4  (1 << 6)
+#define GVE_RSS_HASH_UDPV6  (1 << 7)
+#define GVE_RSS_HASH_TYPES  (GVE_RSS_HASH_TCPV4 | GVE_RSS_HASH_UDPV4 | \
+                             GVE_RSS_HASH_TCPV6 | GVE_RSS_HASH_UDPV6)
+
+#define GVE_RSS_HASH_ALG_TOEPLITZ   1   /* ETH_RSS_HASH_TOP */
+
+struct gve_adminq_configure_rss {
+    u16 hash_types;
+    u8  hash_alg;
+    u8  reserved;
+    u16 hash_key_size;
+    u16 hash_lut_size;
+    u64 hash_key_addr;
+    u64 hash_lut_addr;
+} __attribute__((packed));
+
 /* Packet-type map: GVE_NUM_PTYPES (10-bit space) entries of 2 bytes each. */
 #define GVE_NUM_PTYPES      1024
 #define GVE_PTYPE_MAP_SIZE  (GVE_NUM_PTYPES * 2)
@@ -306,6 +339,7 @@ struct gve_adminq_command {
         struct gve_adminq_destroy_tx_queue          destroy_tx_queue;
         struct gve_adminq_destroy_rx_queue          destroy_rx_queue;
         struct gve_adminq_get_ptype_map             get_ptype_map;
+        struct gve_adminq_configure_rss             configure_rss;
         struct gve_adminq_verify_driver_compatibility verify_driver_compat;
         u8 padding[56];     /* struct size = 64 bytes */
     };
@@ -842,6 +876,7 @@ typedef struct gve {
     boolean raw_addressing;  /* GQI-RDA when true; GQI-QPL when false */
     boolean dqo;             /* DQO format (Andromeda 2.x) overrides GQI */
     boolean dqo_qpl;         /* DQO-QPL (bounce pages) when true; DQO-RDA when false */
+    boolean rss_supported;   /* device offered the RSS_CONFIG option */
 
     /* GQI queues (used when !dqo) */
     struct gve_tx_queue tx[GVE_MAX_IO_QUEUES];
@@ -882,6 +917,7 @@ boolean gve_describe_device(gve adapter);
 boolean gve_cfg_device_resources(gve adapter);
 void    gve_free_device_resources(gve adapter);
 boolean gve_get_ptype_map_dqo(gve adapter);
+boolean gve_configure_rss(gve adapter);
 u32     gve_calc_num_queues(gve adapter, tuple config);
 boolean gve_setup_queues(gve adapter);
 void    gve_teardown_queues(gve adapter);

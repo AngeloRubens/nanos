@@ -15,6 +15,8 @@
  *      (direct addressing) and DQO-QPL (registered bounce pages).
  *   8. Multi-buffer RX packet reassembly (pbuf_cat to end-of-packet).
  *   9. Device-requested reset (DEVICE_STATUS bit 1, e.g. live migration).
+ *  10. RSS configuration (random Toeplitz key + round-robin indirection
+ *      table) when the device offers the RSS_CONFIG option.
  *
  * Checksums are computed in software by lwIP (no HW offload), same model
  * as the ENA driver: gVNIC offloads only L4, not the IPv4 header checksum.
@@ -129,6 +131,9 @@ closure_func_basic(thunk, void, gve_reset)
         gve_free_device_resources(adapter);
         goto done;
     }
+    /* Re-apply RSS (fresh random key); best-effort as at init. */
+    if (!gve_configure_rss(adapter))
+        msg_err("GVE: reset: RSS configuration failed, using device default");
     if (!gve_setup_queues(adapter)) {
         msg_err("GVE: reset: failed to recreate queues");
         gve_free_device_resources(adapter);
@@ -471,6 +476,9 @@ static boolean gve_init(gve adapter, tuple config)
         msg_err("GVE: failed to get DQO ptype map");
         goto err2;
     }
+    /* Best-effort: on failure RX steering stays on the device default. */
+    if (!gve_configure_rss(adapter))
+        msg_err("GVE: RSS configuration failed, using device default");
     if (!gve_init_interrupts(adapter)) {
         msg_err("GVE: failed to initialize interrupts");
         goto err2;
@@ -538,8 +546,8 @@ closure_function(3, 1, boolean, gve_probe,
     gve_debug("probing device");
     heap h = bound(general);
     /* allocate_zero: several adapter fields are only conditionally assigned
-     * (format booleans in gve_describe_device, watchdog cursor, dev_stats)
-     * and rely on a zeroed start. */
+     * (format booleans in gve_describe_device, rss_supported, watchdog
+     * cursor, dev_stats) and rely on a zeroed start. */
     gve adapter = allocate_zero(h, sizeof(struct gve));
     if (adapter == INVALID_ADDRESS)
         return false;
