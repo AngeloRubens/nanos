@@ -362,6 +362,12 @@ closure_func_basic(thunk, void, gve_rx_service)
     for (int iter = 0; iter < GVE_CLEAN_BUDGET; iter++) {
         int budget = GVE_RX_BUDGET;
         u32 tail = be32toh(adapter->event_counters[rx->event_counter_idx]);
+        /* Do not read the device-written descriptors until the event
+         * counter announcing them has been read (the official GQI driver
+         * has the equivalent dma_rmb after its seqno check; same class as
+         * the DQO generation-bit barriers).  The TX cleanups need no
+         * barrier: past the counter they only touch driver-written state. */
+        read_barrier();
         for (; rx->tail != tail && budget > 0;
              rx->qpl_available++, rx->tail++, budget--) {
             struct gve_rx_desc *desc = &rx->desc[rx->tail & rx->mask];
