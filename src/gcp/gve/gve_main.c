@@ -131,14 +131,15 @@ closure_func_basic(thunk, void, gve_reset)
         gve_free_device_resources(adapter);
         goto done;
     }
-    /* Re-apply RSS (fresh random key); best-effort as at init. */
-    if (!gve_configure_rss(adapter))
-        msg_err("GVE: reset: RSS configuration failed, using device default");
     if (!gve_setup_queues(adapter)) {
         msg_err("GVE: reset: failed to recreate queues");
         gve_free_device_resources(adapter);
         goto done;
     }
+    /* Re-apply RSS after the queues exist (fresh random key); best-effort
+     * as at init. */
+    if (!gve_configure_rss(adapter))
+        msg_err("GVE: reset: RSS configuration failed, using device default");
 
     atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_DEVICE_RUNNING);
     net_if->flags |= NETIF_FLAG_UP;
@@ -476,9 +477,6 @@ static boolean gve_init(gve adapter, tuple config)
         msg_err("GVE: failed to get DQO ptype map");
         goto err2;
     }
-    /* Best-effort: on failure RX steering stays on the device default. */
-    if (!gve_configure_rss(adapter))
-        msg_err("GVE: RSS configuration failed, using device default");
     if (!gve_init_interrupts(adapter)) {
         msg_err("GVE: failed to initialize interrupts");
         goto err2;
@@ -487,6 +485,12 @@ static boolean gve_init(gve adapter, tuple config)
         msg_err("GVE: failed to set up TX/RX queues");
         goto err3;
     }
+    /* RSS references RX queue ids in the indirection table, so it can only
+     * be configured once the queues exist (the official driver issues
+     * CONFIGURE_RSS via ethtool, always with the interface up).
+     * Best-effort: on failure RX steering stays on the device default. */
+    if (!gve_configure_rss(adapter))
+        msg_err("GVE: RSS configuration failed, using device default");
     atomic_test_and_set_bit(&adapter->flags, GVE_FLAG_DEVICE_RUNNING);
 
     /* Start TX completion watchdog (fires every GVE_WATCHDOG_INTERVAL_MS). */
