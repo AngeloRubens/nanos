@@ -579,6 +579,13 @@ closure_function(3, 1, boolean, gve_probe,
             netif_set_link_up(&adapter->ndev.n);
         else
             netif_set_link_down(&adapter->ndev.n);
+        /* Catch a reset the device requested while probe was in progress
+         * (the mgmt IRQ ignores it until DEVICE_RUNNING; the official
+         * driver re-checks at end of probe for the same reason). */
+        if (status & GVE_DEVICE_STATUS_RESET) {
+            msg_err("GVE: device requested reset during probe");
+            gve_trigger_reset(adapter);
+        }
         return true;
     }
     deallocate(h, adapter, sizeof(struct gve));
