@@ -56,6 +56,12 @@ static void gve_tx_dqo_retire(gve_tx_dqo_queue tx, u16_t tag)
         pbuf_free(tx->pending[tag]);
         tx->pending[tag] = NULL;
     }
+    /* Clear any pending-miss state: a tag that retires (PKT or REINJECT)
+     * must not leave a ghost miss behind for the watchdog to time out. */
+    if (tx->miss_times[tag]) {
+        tx->miss_times[tag] = 0;
+        tx->pending_misses--;
+    }
     tx->free_tags[tx->tags_ntc & tx->mask] = tag;
     tx->tags_ntc++;
 }
@@ -91,7 +97,11 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             /* Alternate-miss encoding: type=PKT but bit 15 of completion_tag set. */
             if (c->completion_tag & GVE_DQO_ALT_MISS_COMPL_BIT) {
                 u16_t tag = c->completion_tag & tx->mask;
-                if (!tx->miss_times[tag]) {
+                /* Record a miss only for an in-flight tag (the official
+                 * driver validates the pending-packet state likewise). */
+                if (!tx->seg_counts[tag]) {
+                    tx->tx_stats.bad_compl_tag++;
+                } else if (!tx->miss_times[tag]) {
                     tx->miss_times[tag] = now(CLOCK_ID_MONOTONIC);
                     tx->pending_misses++;
                 }
@@ -107,7 +117,9 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
             }
         } else if (type == GVE_DQO_COMPL_TYPE_MISS) {
             u16_t tag = c->completion_tag & tx->mask;
-            if (!tx->miss_times[tag]) {
+            if (!tx->seg_counts[tag]) {
+                tx->tx_stats.bad_compl_tag++;
+            } else if (!tx->miss_times[tag]) {
                 tx->miss_times[tag] = now(CLOCK_ID_MONOTONIC);
                 tx->pending_misses++;
             }
@@ -119,11 +131,7 @@ static void gve_tx_dqo_cleanup(gve_tx_dqo_queue tx)
                 gve_trigger_reset(tx->adapter);
                 break;
             }
-            gve_tx_dqo_retire(tx, tag);
-            if (tx->miss_times[tag]) {
-                tx->miss_times[tag] = 0;
-                tx->pending_misses--;
-            }
+            gve_tx_dqo_retire(tx, tag);  /* also clears pending-miss state */
         }
 
         tx->compl_head++;
