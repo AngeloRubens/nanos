@@ -37,12 +37,10 @@ jobs:
   # program's exit status, so the run target self-checks; the same mechanism
   # the upstream runtime-tests use.
   #
-  # x86_64 only: the aarch64 image would need the runner to carry an arm64
-  # glibc sysroot (the hw test is dynamically linked), which an x86_64 runner
-  # does not have.  The aarch64 compile+link is covered by kernel-virt, and
-  # the boot/probe/lifecycle logic exercised here is architecture-independent;
-  # aarch64 runtime behaviour that is arch-specific (the datapath memory
-  # barriers under load) is gated on real GCP hardware regardless.
+  # The aarch64 boot smoke runs on a NATIVE arm64 runner (free for public
+  # repos): there the host carries the arm64 glibc sysroot the dynamically
+  # linked hw test needs, the virt kernel builds with the native gcc (no
+  # cross toolchain, ARCH == HOST_ARCH), and the boot is genuine aarch64.
   boot-smoke-pc:
     name: QEMU boot smoke x86_64
     runs-on: ubuntu-latest
@@ -52,3 +50,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86
       - name: Boot hw (TCG)
         run: timeout 300 make -j$(nproc) run-noaccel TARGET=hw PLATFORM=pc
+
+  boot-smoke-virt:
+    name: QEMU boot smoke aarch64 (native runner)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+      - name: Boot hw (TCG)
+        run: timeout 300 make -j$(nproc) run-noaccel TARGET=hw PLATFORM=virt
