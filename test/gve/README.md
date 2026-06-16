@@ -22,6 +22,21 @@ model), timers, and the async work queues.
 `gve_dqo.c` is `#include`d directly, so the code under test is the shipping
 driver, not a copy.
 
+## Coverage
+
+23 scenarios exercise every queue format in both directions (GQI-QPL/RDA,
+DQO-RDA/QPL TX and RX), multi-segment packets, TX backpressure, the
+MISS/REINJECT tag pool and its edge encodings, RX chaining and drop-to-EOP,
+allocation-failure tolerance, an out-of-order completion fuzzer, and the
+device-option negotiation / format fallback (via an admin-queue model).
+
+Not covered: the watchdog and reset paths in `gve_main.c`.
+`closure_func_basic` emits each closure's `_fill_*` helper as static in its
+own translation unit, so those closures cannot be initialised from the
+harness; exercising them needs the full lifecycle (init → probe → setup),
+which would require modelling every admin-queue command.  See CLAUDE.md
+("HARNESS BOUNDARY") for the exact shape of that follow-up.
+
 ## Build & run
 
     make -C test/gve run
