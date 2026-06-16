@@ -162,9 +162,9 @@ boolean gve_describe_device(gve adapter)
             adapter->raw_addressing = true;
         }   /* else: GQI-QPL fallback (all flags false) */
 
-        const char *fmt =
-            adapter->dqo ? (adapter->dqo_qpl ? "DQO-QPL" : "DQO-RDA") :
-            adapter->raw_addressing ? "GQI-RDA" : "GQI-QPL";
+        sstring fmt =
+            adapter->dqo ? (adapter->dqo_qpl ? ss("DQO-QPL") : ss("DQO-RDA")) :
+            adapter->raw_addressing ? ss("GQI-RDA") : ss("GQI-QPL");
         rprintf("GVE: MAC %02x:%02x:%02x:%02x:%02x:%02x MTU %d "
                 "TX-desc %d RX-desc %d format %s\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
