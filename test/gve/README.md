@@ -24,18 +24,19 @@ driver, not a copy.
 
 ## Coverage
 
-23 scenarios exercise every queue format in both directions (GQI-QPL/RDA,
+25 scenarios exercise every queue format in both directions (GQI-QPL/RDA,
 DQO-RDA/QPL TX and RX), multi-segment packets, TX backpressure, the
 MISS/REINJECT tag pool and its edge encodings, RX chaining and drop-to-EOP,
-allocation-failure tolerance, an out-of-order completion fuzzer, and the
-device-option negotiation / format fallback (via an admin-queue model).
+allocation-failure tolerance, an out-of-order completion fuzzer, the
+device-option negotiation / format fallback (via an admin-queue model), and
+the full lifecycle — init_gve → probe → describe → setup → watchdog →
+reset — for both a DQO-RDA device and the GQI-QPL fallback.  The lifecycle
+links `gve_main.c` and drives the driver's own bring-up so its watchdog and
+reset closures get initialised (closure `_fill_*` helpers are static per
+translation unit, so only the driver can initialise them).
 
-Not covered: the watchdog and reset paths in `gve_main.c`.
-`closure_func_basic` emits each closure's `_fill_*` helper as static in its
-own translation unit, so those closures cannot be initialised from the
-harness; exercising them needs the full lifecycle (init → probe → setup),
-which would require modelling every admin-queue command.  See CLAUDE.md
-("HARNESS BOUNDARY") for the exact shape of that follow-up.
+Minor remaining gaps (datapath only): the GQI RX held-pbuf copy fallback,
+the GQI QPL byte-FIFO wrap, and the io-queues manifest cap.
 
 ## Build & run
 
