@@ -237,17 +237,36 @@ static void make_tx_dqo(gve adapter, gve_tx_dqo_queue tx, u16 desc_cnt)
     make_tx_dqo_mode(adapter, tx, desc_cnt, false);
 }
 
-static gve make_adapter(void)
+static gve make_adapter_common(void)
 {
     gve adapter = allocate_zero(gh, sizeof(struct gve));
     adapter->num_queues = 1;
-    adapter->dqo = true;
-    adapter->dqo_qpl = false;
     adapter->flags = 0;
     adapter->ndev.n.flags = NETIF_FLAG_UP;
     adapter->ndev.n.input = harness_input;
     adapter->ndev.n.num = 0;
     adapter->ndev.n.state = adapter;   /* netif_add does this in the driver */
+    adapter->num_event_counters = 16;
+    adapter->event_counters = allocate_zero(gh, 16 * sizeof(u32));
+    return adapter;
+}
+
+static gve make_adapter(void)                 /* DQO */
+{
+    gve adapter = make_adapter_common();
+    adapter->dqo = true;
+    adapter->dqo_qpl = false;
+    return adapter;
+}
+
+static gve make_adapter_gqi(boolean raw_addressing)
+{
+    gve adapter = make_adapter_common();
+    adapter->dqo = false;
+    adapter->dqo_qpl = false;
+    adapter->raw_addressing = raw_addressing;
+    adapter->tx_desc_cnt = 256;
+    adapter->rx_desc_cnt = 256;
     return adapter;
 }
 
@@ -382,8 +401,15 @@ static u32 rx_buf_cursor;       /* device: next buf_ring entry to consume */
 static u32 rx_compl_cursor;     /* device: next compl_ring entry to write */
 static u8  rx_compl_gen;        /* device generation bit */
 
-static void make_rx_dqo(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs)
+static void make_rx_dqo_mode(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs,
+                             boolean qpl)
 {
+    adapter->dqo_qpl = qpl;
+    if (qpl) {
+        u32 pages = (num_bufs * GVE_DQO_BUF_SIZE + PAGESIZE - 1) >> PAGELOG;
+        rx->qpl_base = allocate(gh, pages * PAGESIZE);
+        rx->qpl_base_phys = physical_from_virtual(rx->qpl_base);
+    }
     rx->pbufs     = allocate_zero(gh, num_bufs * sizeof(*rx->pbufs));
     rx->free_ids  = allocate(gh, num_bufs * sizeof(*rx->free_ids));
     rx->buf_ring  = allocate_zero(gh, num_bufs * sizeof(*rx->buf_ring));
@@ -416,12 +442,23 @@ static void make_rx_dqo(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs)
     rx_compl_gen = 1;
 }
 
+static void make_rx_dqo(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs)
+{
+    make_rx_dqo_mode(adapter, rx, num_bufs, false);
+}
+
 /* Device consumes the next posted buffer and writes a completion for it. */
 static void dqo_dev_rx_complete(gve_rx_dqo_queue rx, u16 len, boolean eop,
                                 boolean err)
 {
     u16 buf_id = rx->buf_ring[rx_buf_cursor & rx->mask].buf_id;
     rx_buf_cursor++;
+    /* DQO-QPL: the device writes the payload into the registered slot the
+     * driver will copy out. */
+    if (rx->adapter->dqo_qpl && !err && len) {
+        u8 *dst = (u8 *)rx->qpl_base + (u64)buf_id * GVE_DQO_BUF_SIZE;
+        for (u16 i = 0; i < len; i++) dst[i] = (u8)(i + 7);
+    }
     u32 slot = rx_compl_cursor & rx->mask;
     struct gve_rx_compl_desc_dqo *c = &rx->compl_ring[slot];
     c->buf_id   = buf_id;
@@ -744,6 +781,247 @@ static void scenario_tx_fuzz(void)
     CHECK(pbufs_live == live_before, "fuzz: no pbuf leak");
 }
 
+/* ------------------------------------------------------------------ */
+/* GQI datapath (gve_datapath.c, separate TU): event-counter completion */
+/* ------------------------------------------------------------------ */
+
+static void make_tx_gqi(gve adapter, gve_tx_queue tx, u16 desc_cnt)
+{
+    boolean rda = adapter->raw_addressing;
+    tx->desc = allocate_zero(gh, desc_cnt * sizeof(*tx->desc));
+    tx->tx_timestamps = allocate_zero(gh, desc_cnt * sizeof(*tx->tx_timestamps));
+    tx->br = allocate_queue(gh, GVE_BUF_RING_SIZE);
+    if (rda) {
+        tx->qpl_base = NULL;
+        tx->pending = allocate_zero(gh, desc_cnt * sizeof(*tx->pending));
+    } else {
+        adapter->tx_pages_per_qpl = 64;
+        u32 qsize = adapter->tx_pages_per_qpl * PAGESIZE;
+        tx->qpl_base = allocate(gh, qsize);
+        tx->qpl_allocated = allocate_zero(gh, desc_cnt * sizeof(*tx->qpl_allocated));
+        tx->qpl_head = 0;
+        tx->qpl_used = 0;
+        tx->qpl_size = qsize;
+    }
+    tx->mask = desc_cnt - 1;
+    tx->head = tx->tail = 0;
+    tx->adapter = adapter;
+    tx->stuck = false;
+    tx->running = true;
+    tx->event_counter_idx = 0;
+    tx->db_idx = 0;
+    zero(&tx->tx_stats, sizeof(tx->tx_stats));
+    gve_tx_init_gqi(tx);
+}
+
+/* GQI device: advance the event counter to N descriptors completed. */
+static void gqi_dev_tx_complete_all(gve adapter, gve_tx_queue tx)
+{
+    adapter->event_counters[tx->event_counter_idx] = htobe32(tx->head);
+}
+
+static void run_tx_gqi_cleanup(gve_tx_queue tx)
+{
+    apply((thunk)&tx->enqueue_task);   /* drains (br empty) -> cleanup */
+}
+
+/* Scenario 13: GQI-RDA TX, single packet, event-counter completion. */
+static void scenario_gqi_tx_rda(void)
+{
+    rprintf("scenario_gqi_tx_rda\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_tx_queue tx = &adapter->tx[0];
+    make_tx_gqi(adapter, tx, 256);
+    gve_setup_linkoutput(adapter, &adapter->ndev.n);
+    int live_before = pbufs_live;
+
+    struct pbuf *p = make_pkt(100);
+    err_t e = adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+    CHECK(e == ERR_OK, "gqi-rda linkoutput ok");
+    CHECK(tx->head == 1, "one descriptor written, got %d", tx->head);
+    CHECK(p->ref == 2, "lwIP + driver ref");
+    CHECK(tx->pending[0] == p, "pbuf pending in RDA slot");
+
+    gqi_dev_tx_complete_all(adapter, tx);
+    run_tx_gqi_cleanup(tx);
+    CHECK(tx->tail == tx->head, "all descriptors retired");
+    CHECK(tx->pending[0] == NULL, "pending slot cleared");
+    CHECK(p->ref == 1, "driver released its ref");
+
+    pbuf_free(p);
+    CHECK(pbufs_live == live_before, "no leak (gqi-rda)");
+}
+
+/* Scenario 14: GQI-QPL TX, single packet, payload copied into the QPL
+ * byte FIFO, qpl_used released on completion. */
+static void scenario_gqi_tx_qpl(void)
+{
+    rprintf("scenario_gqi_tx_qpl\n");
+    gve adapter = make_adapter_gqi(false);
+    gve_tx_queue tx = &adapter->tx[0];
+    make_tx_gqi(adapter, tx, 256);
+    gve_setup_linkoutput(adapter, &adapter->ndev.n);
+    int live_before = pbufs_live;
+
+    struct pbuf *p = make_pkt(128);
+    for (int i = 0; i < 128; i++) ((u8 *)p->payload)[i] = (u8)(i + 3);
+    err_t e = adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+    CHECK(e == ERR_OK, "gqi-qpl linkoutput ok");
+    CHECK(tx->head == 1, "one descriptor written");
+    CHECK(tx->qpl_used > 0, "QPL bytes consumed");
+    CHECK(p->ref == 1, "QPL frees the pbuf inline after the copy");
+    boolean copied = true;
+    for (int i = 0; i < 128; i++)
+        if (((u8 *)tx->qpl_base)[i] != (u8)(i + 3)) copied = false;
+    CHECK(copied, "payload copied into the QPL FIFO");
+
+    gqi_dev_tx_complete_all(adapter, tx);
+    run_tx_gqi_cleanup(tx);
+    CHECK(tx->tail == tx->head, "all descriptors retired");
+    CHECK(tx->qpl_used == 0, "QPL bytes released on completion");
+    CHECK(p->ref == 1, "only the lwIP ref remains");
+    pbuf_free(p);          /* lwIP releases its ref */
+    CHECK(pbufs_live == live_before, "no leak (gqi-qpl)");
+}
+
+/* GQI RX setup (mirrors gve_create_rx_queue; n = rx_desc_cnt ==
+ * rx_data_slot_cnt, the GQI invariant). */
+static u32 gqi_rx_cursor;        /* device: next desc/data slot to fill */
+
+static void make_rx_gqi(gve adapter, gve_rx_queue rx, u16 n)
+{
+    boolean rda = adapter->raw_addressing;
+    adapter->rx_desc_cnt = n;
+    adapter->rx_data_slot_cnt = n;
+    u16 num_pages = n;
+
+    rx->qpl_base = allocate(gh, num_pages * PAGESIZE);
+    rx->rda_base_phys = rda ? physical_from_virtual(rx->qpl_base) : 0;
+    rx->qpl_available = rx->qpl_count = num_pages;
+    rx->pbufs = allocate(gh, rx->qpl_count * sizeof(*rx->pbufs));
+    rx->desc  = allocate_zero(gh, n * sizeof(*rx->desc));
+    rx->data  = allocate_zero(gh, n * sizeof(*rx->data));
+    static u32 irq_db; irq_db = 0;
+    rx->irq_db_index = &irq_db;
+
+    rx->mask = n - 1;
+    rx->head = rx->tail = 0;
+    rx->qpl_head = 0;
+    for (u32 i = 0; i < rx->qpl_count; i++) {
+        struct pbuf *pb = &rx->pbufs[i];
+        pb->next = NULL; pb->type_internal = PBUF_REF; pb->flags = 0;
+        pb->ref = 1; pb->if_idx = NETIF_NO_INDEX;
+    }
+    rx->adapter = adapter;
+    rx->event_counter_idx = 1;
+    rx->db_idx = 0;
+    rx->idx = 0;
+    rx->ctx_head = NULL;
+    rx->drop_pkt = false;
+    rx->first_interrupt = false;
+    rx->no_interrupt_event_cnt = 0;
+    rx->empty_rx_queue = 0;
+    zero(&rx->rx_stats, sizeof(rx->rx_stats));
+    gve_rx_init(rx);
+    gve_rx_fill(rx);
+    gqi_rx_cursor = 0;
+}
+
+/* GQI device: write packet data into the posted QPL slot and a descriptor,
+ * then advance the event counter.  flags carries ERR / PKT_CONT (be16). */
+static void gqi_dev_rx_complete(gve_rx_queue rx, u16 pkt_len, u16 flags)
+{
+    u32 slot = gqi_rx_cursor & rx->mask;
+    u64 offset = be64toh(rx->data[slot]) - rx->rda_base_phys;
+    /* write the payload after the 2-byte alignment pad */
+    u8 *dst = (u8 *)rx->qpl_base + offset + GVE_RX_PADDING;
+    for (u16 i = 0; i < pkt_len; i++) dst[i] = (u8)(i + 1);
+    rx->desc[slot].len = htobe16(pkt_len + GVE_RX_PADDING);
+    rx->desc[slot].flags_seq = flags;
+    gqi_rx_cursor++;
+    rx->adapter->event_counters[rx->event_counter_idx] = htobe32(gqi_rx_cursor);
+}
+
+/* Scenario 15: GQI-RDA RX single-buffer packet (zero-copy fast path). */
+static void scenario_gqi_rx(void)
+{
+    rprintf("scenario_gqi_rx\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+    gve_setup_linkoutput(adapter, &adapter->ndev.n); /* sets net_if->num path */
+    int delivered_before = rx_delivered;
+
+    CHECK(rx->head == 64, "fill posted all buffers, got %d", rx->head);
+    u32 pool0_ref = rx->pbufs[0].ref;
+
+    gqi_dev_rx_complete(rx, 100, 0);    /* normal single-buffer packet */
+    apply((thunk)&rx->service);
+
+    CHECK(rx_delivered == delivered_before + 1, "one packet delivered");
+    CHECK(rx->tail == 1, "tail advanced past the completion");
+    CHECK(rx->pbufs[0].ref == pool0_ref,
+          "zero-copy pool pbuf recycled (ref back to %d)", pool0_ref);
+}
+
+/* Scenario 16: GQI RX multi-buffer chain delivered once at the final
+ * (non-CONT) buffer. */
+static void scenario_gqi_rx_chain(void)
+{
+    rprintf("scenario_gqi_rx_chain\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+    int delivered_before = rx_delivered;
+    int live_before = pbufs_live;
+
+    gqi_dev_rx_complete(rx, 1400, GVE_RXF_PKT_CONT);  /* fragment 1 */
+    gqi_dev_rx_complete(rx, 600,  0);                 /* fragment 2 (final) */
+    apply((thunk)&rx->service);
+
+    CHECK(rx_delivered == delivered_before + 1, "chain delivered exactly once");
+    CHECK(rx->ctx_head == NULL, "no partial chain left");
+    CHECK(rx->tail == 2, "both completions consumed");
+    CHECK(pbufs_live == live_before, "chain copy pbufs freed after delivery");
+}
+
+/* Scenario 17: GQI-QPL RX (same service path as RDA with base 0). */
+static void scenario_gqi_rx_qpl(void)
+{
+    rprintf("scenario_gqi_rx_qpl\n");
+    gve adapter = make_adapter_gqi(false);  /* QPL */
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+    int delivered_before = rx_delivered;
+
+    gqi_dev_rx_complete(rx, 120, 0);
+    apply((thunk)&rx->service);
+    CHECK(rx_delivered == delivered_before + 1, "gqi-qpl rx delivered");
+    CHECK(rx->tail == 1, "completion consumed");
+}
+
+/* Scenario 18: DQO-QPL RX copies the payload out of the registered slot
+ * into a fresh pbuf and recycles the buffer id. */
+static void scenario_dqo_rx_qpl(void)
+{
+    rprintf("scenario_dqo_rx_qpl\n");
+    gve adapter = make_adapter();
+    adapter->dqo_qpl = true;
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo_mode(adapter, rx, 256, true);
+    int delivered_before = rx_delivered;
+    int live_before = pbufs_live;
+
+    gve_rx_dqo_fill(rx);                 /* posts QPL slots, no pbufs */
+    CHECK(pbufs_live == live_before, "QPL fill allocates no pbufs");
+
+    dqo_dev_rx_complete(rx, 128, true, false);
+    run_rx_service(rx);
+    CHECK(rx_delivered == delivered_before + 1, "dqo-qpl rx delivered (copied out)");
+    CHECK(rx->compl_head == 1, "completion consumed");
+    CHECK(pbufs_live == live_before, "copy-out pbuf freed on delivery");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -761,6 +1039,12 @@ int main(int argc, char **argv)
     scenario_tx_alt_miss();
     scenario_tx_stale_tag();
     scenario_tx_fuzz();
+    scenario_gqi_tx_rda();
+    scenario_gqi_tx_qpl();
+    scenario_gqi_rx();
+    scenario_gqi_rx_chain();
+    scenario_gqi_rx_qpl();
+    scenario_dqo_rx_qpl();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
