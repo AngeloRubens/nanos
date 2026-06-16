@@ -635,6 +635,115 @@ static void scenario_tx_qpl(void)
     CHECK(pbufs_live == live_before, "no pbuf leak (QPL)");
 }
 
+/* Scenario 10: alternate-miss encoding (a PKT-type completion whose
+ * completion_tag has bit 15 set is a miss, not a retirement). */
+static void scenario_tx_alt_miss(void)
+{
+    rprintf("scenario_tx_alt_miss\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+
+    struct pbuf *p = make_pkt(80);
+    u16 tag = send_pkt(tx, adapter, p);
+
+    dqo_dev_complete_pkt(&the_dev, tag | GVE_DQO_ALT_MISS_COMPL_BIT,
+                         GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+    CHECK(tx->miss_times[tag] != 0, "alt-miss recorded as a miss");
+    CHECK(tx->seg_counts[tag] == 2, "alt-miss did not retire the packet");
+    CHECK(tx->tx_stats.bad_compl_tag == 0, "alt-miss is not a bad tag");
+
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_REINJECT);
+    run_cleanup(tx);
+    CHECK(tx->seg_counts[tag] == 0, "reinject retired the alt-missed packet");
+    pbuf_free(p);
+}
+
+/* Scenario 11: a stale/duplicate completion for a tag not in flight is
+ * counted and skipped, the ring cursor advances, and NO reset is scheduled
+ * (the trust-line fix; Google rate-limit-logs and continues). */
+static void scenario_tx_stale_tag(void)
+{
+    rprintf("scenario_tx_stale_tag\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+
+    struct pbuf *p = make_pkt(80);
+    u16 tag = send_pkt(tx, adapter, p);
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);                       /* tag retired */
+    pbuf_free(p);
+
+    u32 ch_before = tx->compl_head;
+    u64 reset_before = (adapter->flags >> GVE_FLAG_RESETTING) & 1;
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);  /* stale */
+    run_cleanup(tx);
+    CHECK(tx->tx_stats.bad_compl_tag == 1, "stale tag counted");
+    CHECK(tx->compl_head == ch_before + 1, "ring cursor advanced past stale");
+    CHECK(((adapter->flags >> GVE_FLAG_RESETTING) & 1) == reset_before,
+          "no reset scheduled for a stale completion");
+}
+
+/* deterministic xorshift PRNG for the fuzzer */
+static u64 rng_state = 0x123456789abcdef0ull;
+static u64 rng(void) {
+    u64 x = rng_state;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return rng_state = x;
+}
+
+/* Scenario 12: fuzz out-of-order completions.  Keep a bounded set of
+ * outstanding packets; randomly send new ones or complete an arbitrary
+ * outstanding one (by tag, i.e. out of order) — the exact stress the tag
+ * pool exists for.  Assert no crash, no rejected completion, and that at
+ * quiescence the tag pool and ring are fully restored with no pbuf leak. */
+static void scenario_tx_fuzz(void)
+{
+    rprintf("scenario_tx_fuzz\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+    int live_before = pbufs_live;
+    int free0 = (int)(tx->tags_ntc - tx->tags_ntu);
+
+    enum { CAP = 40 };
+    struct pbuf *out_p[CAP];
+    u16          out_tag[CAP];
+    int n = 0;
+
+    for (int step = 0; step < 20000; step++) {
+        boolean do_send = (n < CAP) && (n == 0 || (rng() & 1));
+        if (do_send) {
+            struct pbuf *p = make_pkt(32 + (rng() & 63));
+            out_tag[n] = send_pkt(tx, adapter, p);
+            out_p[n] = p;
+            n++;
+        } else {
+            int i = (int)(rng() % (u64)n);     /* complete an arbitrary one */
+            dqo_dev_complete_pkt(&the_dev, out_tag[i], GVE_DQO_COMPL_TYPE_PKT);
+            run_cleanup(tx);
+            pbuf_free(out_p[i]);
+            out_p[i] = out_p[n - 1];
+            out_tag[i] = out_tag[n - 1];
+            n--;
+        }
+    }
+    /* drain the remainder */
+    while (n > 0) {
+        dqo_dev_complete_pkt(&the_dev, out_tag[n - 1], GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+        pbuf_free(out_p[n - 1]);
+        n--;
+    }
+
+    CHECK(tx->tx_stats.bad_compl_tag == 0, "fuzz: no completion rejected");
+    CHECK((int)(tx->tags_ntc - tx->tags_ntu) == free0, "fuzz: tag pool restored");
+    CHECK(tx->head == tx->desc_tail, "fuzz: ring fully drained");
+    CHECK(pbufs_live == live_before, "fuzz: no pbuf leak");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -649,6 +758,9 @@ int main(int argc, char **argv)
     scenario_tx_drop_oversize();
     scenario_rx_alloc_fail();
     scenario_tx_qpl();
+    scenario_tx_alt_miss();
+    scenario_tx_stale_tag();
+    scenario_tx_fuzz();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
