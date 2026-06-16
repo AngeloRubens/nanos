@@ -24,16 +24,20 @@ driver, not a copy.
 
 ## Coverage
 
-25 scenarios exercise every queue format in both directions (GQI-QPL/RDA,
+27 scenarios exercise every queue format in both directions (GQI-QPL/RDA,
 DQO-RDA/QPL TX and RX), multi-segment packets, TX backpressure, the
 MISS/REINJECT tag pool and its edge encodings, RX chaining and drop-to-EOP,
 allocation-failure tolerance, an out-of-order completion fuzzer, the
-device-option negotiation / format fallback (via an admin-queue model), and
-the full lifecycle — init_gve → probe → describe → setup → watchdog →
-reset — for both a DQO-RDA device and the GQI-QPL fallback.  The lifecycle
-links `gve_main.c` and drives the driver's own bring-up so its watchdog and
-reset closures get initialised (closure `_fill_*` helpers are static per
-translation unit, so only the driver can initialise them).
+device-option negotiation / format fallback (via an admin-queue model), the
+full lifecycle — init_gve → probe → describe → setup → watchdog → reset —
+for both a DQO-RDA device and the GQI-QPL fallback, and the multi-queue
+driver logic: per-CPU TX queue dispatch with cross-queue isolation, and the
+round-robin RSS indirection table.
+
+What the harness cannot test (hardware behaviour): whether the device
+actually steers RX flows across queues per the RSS table — that is Toeplitz
+hashing in the NIC, and is the open question (#2165) answered only by
+per-queue RX counters on real GCP hardware.
 
 Minor remaining gaps (datapath only): the GQI RX held-pbuf copy fallback,
 the GQI QPL byte-FIFO wrap, and the io-queues manifest cap.
