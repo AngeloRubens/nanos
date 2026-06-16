@@ -169,6 +169,7 @@ static u16  g_desc_opts[8];           /* device options to advertise */
 static int  g_desc_nopts;
 static u32  g_rss_lut[128];           /* captured from CONFIGURE_RSS */
 static u16  g_rss_lut_size;
+static u32  g_dev_status;             /* value returned for DEVICE_STATUS */
 
 /* Process one admin-queue command: build any response the driver reads back,
  * then mark it passed.  Enough commands are handled to drive the full
@@ -277,6 +278,7 @@ u32 pci_bar_read_4(struct pci_bar *b, u64 offset)
         case GVE_REG_ADMINQ_EVT_CNT: return htobe32(g_evt_cnt);
         case GVE_REG_MAX_TX_QUEUES:  return htobe32(g_max_tx);
         case GVE_REG_MAX_RX_QUEUES:  return htobe32(g_max_rx);
+        case GVE_REG_DEVICE_STATUS:  return g_dev_status;
         default:                     return 0;
         }
     }
@@ -1606,6 +1608,101 @@ static void scenario_gqi_tx_backpressure(void)
     CHECK(pbufs_live == live_before, "no leak (gqi backpressure)");
 }
 
+/* Bring an adapter up through the real lifecycle and return it. */
+static gve bring_up(u16 opt, int ncpu)
+{
+    g_desc_nopts = opt ? 1 : 0;
+    g_desc_opts[0] = opt;
+    g_max_tx = g_max_rx = 8;
+    g_msix = 64;
+    total_processors = ncpu;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    init_gve((kernel_heaps)0);
+    apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    gve adapter = g_life_netif->state;
+    apply((netif_dev_setup)&adapter->ndev.setup, (tuple)0);
+    return adapter;
+}
+
+/* Scenario 32: management interrupt (link up/down, device-requested reset)
+ * and the RX interrupt trampoline. */
+static void scenario_main_irqs(void)
+{
+    rprintf("scenario_main_irqs\n");
+    int saved_tp = total_processors;
+    gve adapter = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 2);
+    struct netif *nif = &adapter->ndev.n;
+
+    g_dev_status = GVE_DEVICE_STATUS_LINK_STATUS;       /* link up */
+    apply((thunk)&adapter->mgmt_irq_handler);
+    CHECK(nif->flags & NETIF_FLAG_UP, "mgmt IRQ brought the link up");
+
+    g_dev_status = 0;                                   /* link down */
+    apply((thunk)&adapter->mgmt_irq_handler);
+    CHECK(!(nif->flags & NETIF_FLAG_UP), "mgmt IRQ took the link down");
+
+    /* device-requested reset (live migration): mgmt IRQ schedules a reset */
+    g_dev_status = GVE_DEVICE_STATUS_RESET;
+    apply((thunk)&adapter->mgmt_irq_handler);
+    g_dev_status = 0;
+    CHECK((adapter->flags >> GVE_FLAG_DEVICE_RUNNING) & 1,
+          "running again after a device-requested reset");
+
+    /* RX interrupt trampoline marks first_interrupt and runs the service */
+    adapter->rx_dqo[0].first_interrupt = false;
+    apply((thunk)&adapter->rx_dqo[0].irq_handler);
+    CHECK(adapter->rx_dqo[0].first_interrupt, "RX IRQ set first_interrupt");
+
+    total_processors = saved_tp;
+}
+
+/* Scenario 33: the GQI watchdog branch (a healthy tick on a GQI adapter). */
+static void scenario_gqi_watchdog(void)
+{
+    rprintf("scenario_gqi_watchdog\n");
+    int saved_tp = total_processors;
+    gve adapter = bring_up(0, 1);          /* GQI-QPL fallback, 1 queue */
+    CHECK(!adapter->dqo, "GQI adapter for the GQI watchdog path");
+    u64 wd0 = adapter->dev_stats.wd_expired;
+    apply((timer_handler)&adapter->watchdog_task, (u64)0, (u64)1);
+    CHECK(adapter->dev_stats.wd_expired == wd0, "healthy GQI watchdog: no reset");
+    total_processors = saved_tp;
+}
+
+/* Scenario 34: watchdog stuck-TX and no-RX-interrupt detection. */
+static void scenario_watchdog_detect(void)
+{
+    rprintf("scenario_watchdog_detect\n");
+    int saved_tp = total_processors;
+
+    /* no-interrupt RX: a non-empty completion ring with first_interrupt
+     * never set makes the watchdog count missed interrupts. */
+    gve a = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    gve_rx_dqo_queue rx = &a->rx_dqo[0];
+    u32 slot = rx->compl_head & rx->mask;
+    rx->compl_ring[slot].pkt_len_gen =
+        rx->expected_gen ? GVE_DQO_RX_GEN : 0;     /* CQ appears non-empty */
+    for (int t = 0; t < GVE_MAX_NO_INTERRUPT_ITERATIONS; t++) {
+        rx->first_interrupt = false;
+        a->next_monitored_tx_qid = 0;
+        apply((timer_handler)&a->watchdog_task, (u64)0, (u64)1);
+    }
+    CHECK(rx->no_interrupt_event_cnt >= 2, "watchdog counted missed RX interrupts");
+
+    /* stuck-TX: more than the threshold of packets timed out -> reset. */
+    gve b = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    gve_tx_dqo_queue tx = &b->tx_dqo[0];
+    timestamp old = now(CLOCK_ID_MONOTONIC) - milliseconds(GVE_TX_WATCHDOG_MS + 1000);
+    for (int i = 0; i <= GVE_TX_STUCK_THRESHOLD + 1; i++)
+        tx->tx_timestamps[i] = old;
+    u64 wd0 = b->dev_stats.wd_expired;
+    b->next_monitored_tx_qid = 0;
+    apply((timer_handler)&b->watchdog_task, (u64)0, (u64)1);
+    CHECK(b->dev_stats.wd_expired == wd0 + 1, "stuck-TX threshold -> reset");
+
+    total_processors = saved_tp;
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -1642,6 +1739,9 @@ int main(int argc, char **argv)
     scenario_gqi_rx_errors();
     scenario_gqi_qpl_wrap();
     scenario_gqi_tx_backpressure();
+    scenario_main_irqs();
+    scenario_gqi_watchdog();
+    scenario_watchdog_detect();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

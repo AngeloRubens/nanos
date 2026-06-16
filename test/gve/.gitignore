@@ -1,2 +1,6 @@
 gve_harness
 closure_templates.h
+*.o
+*.gcno
+*.gcda
+*.gcov
