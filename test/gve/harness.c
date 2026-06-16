@@ -1374,6 +1374,11 @@ static void scenario_lifecycle(void)
     CHECK(adapter->num_queues == 2, "queue count capped by cpus (2), got %d",
           adapter->num_queues);
 
+    /* a healthy tick must NOT reset */
+    u64 wd0 = adapter->dev_stats.wd_expired;
+    apply((timer_handler)&adapter->watchdog_task, (u64)0, (u64)1);
+    CHECK(adapter->dev_stats.wd_expired == wd0, "healthy watchdog tick: no reset");
+
     /* a MISS that never reinjects: the watchdog must reset the adapter */
     gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
     tx->miss_times[5] = now(CLOCK_ID_MONOTONIC) -
@@ -1387,6 +1392,38 @@ static void scenario_lifecycle(void)
     CHECK((adapter->flags >> GVE_FLAG_DEVICE_RUNNING) & 1,
           "adapter is RUNNING again after the reset recreated the queues");
     CHECK(!adapter->tx_dqo[0].stuck, "recreated queue is not stuck");
+
+    total_processors = saved_tp;
+}
+
+/* Scenario 25: GQI-QPL lifecycle — the no-option fallback registers page
+ * lists at create; an explicit reset unregisters and recreates them. */
+static void scenario_lifecycle_gqi_qpl(void)
+{
+    rprintf("scenario_lifecycle_gqi_qpl\n");
+    g_desc_nopts = 0;                 /* no options -> GQI-QPL fallback */
+    g_max_tx = g_max_rx = 8;
+    g_msix = 64;
+    int saved_tp = total_processors;
+    total_processors = 1;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+
+    init_gve((kernel_heaps)0);
+    boolean ok = apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    CHECK(ok, "gqi-qpl probe up to netif_add");
+    gve adapter = g_life_netif->state;
+    CHECK(!adapter->dqo && !adapter->raw_addressing, "GQI-QPL fallback selected");
+
+    boolean up = apply((netif_dev_setup)&adapter->ndev.setup, (tuple)0);
+    CHECK(up, "gqi-qpl setup: page lists registered, queues created");
+    CHECK((adapter->flags >> GVE_FLAG_DEVICE_RUNNING) & 1, "running");
+
+    /* explicit reset: teardown unregisters the page lists, recreate
+     * re-registers them — exercise the QPL teardown/recreate path. */
+    gve_trigger_reset(adapter);
+    CHECK((adapter->flags >> GVE_FLAG_DEVICE_RUNNING) & 1,
+          "running again after the QPL reset");
+    CHECK(!((adapter->flags >> GVE_FLAG_RESETTING) & 1), "reset flag cleared");
 
     total_processors = saved_tp;
 }
@@ -1421,6 +1458,7 @@ int main(int argc, char **argv)
     scenario_gqi_tx_multiseg();
     scenario_dqo_tx_backpressure();
     scenario_lifecycle();
+    scenario_lifecycle_gqi_qpl();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
