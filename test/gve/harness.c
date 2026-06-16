@@ -152,11 +152,67 @@ typedef struct dqo_device {
 
 static struct dqo_device the_dev;
 
-/* The doorbell BAR write lands here; we record the TX head. */
-u32 pci_bar_read_4(struct pci_bar *b, u64 offset) { return 0; }
+/* ---- register BAR (adminq) model, for the negotiation scenarios ---- */
+void kernel_delay(timestamp t) { }
+static int g_msix = 64;
+int pci_get_msix_count(pci_dev d) { return g_msix; }
+
+static struct pci_bar *g_reg_bar;     /* the adapter's register BAR */
+static gve g_adapter;                 /* adapter being negotiated */
+static u32  g_evt_cnt;                 /* adminq event counter */
+static u32  g_max_tx = 8, g_max_rx = 8;
+static u16  g_desc_opts[8];           /* device options to advertise */
+static int  g_desc_nopts;
+
+static void adminq_process(struct gve_adminq_command *cmd)
+{
+    if (be32toh(cmd->opcode) == GVE_ADMINQ_DESCRIBE_DEVICE) {
+        struct gve_device_descriptor *d =
+            pointer_from_u64(be64toh(cmd->describe_device.device_descriptor_addr));
+        zero(d, PAGESIZE);
+        d->mtu             = htobe16(1460);
+        d->counters        = htobe16(16);
+        d->tx_queue_entries = htobe16(256);
+        d->rx_queue_entries = htobe16(256);
+        d->tx_pages_per_qpl = htobe16(64);
+        d->rx_pages_per_qpl = htobe16(256);
+        d->num_device_options = htobe16(g_desc_nopts);
+        struct gve_device_option *opt = (struct gve_device_option *)(d + 1);
+        for (int i = 0; i < g_desc_nopts; i++) {
+            opt->option_id = htobe16(g_desc_opts[i]);
+            opt->option_length = 0;
+            opt->required_features_mask = 0;
+            opt++;
+        }
+        d->total_length = htobe16((u16)((u8 *)opt - (u8 *)d));
+    }
+    cmd->status = htobe32(GVE_ADMINQ_COMMAND_PASSED);
+}
+
+u32 pci_bar_read_4(struct pci_bar *b, u64 offset)
+{
+    if (b == g_reg_bar) {
+        switch (offset) {
+        case GVE_REG_ADMINQ_EVT_CNT: return htobe32(g_evt_cnt);
+        case GVE_REG_MAX_TX_QUEUES:  return htobe32(g_max_tx);
+        case GVE_REG_MAX_RX_QUEUES:  return htobe32(g_max_rx);
+        default:                     return 0;
+        }
+    }
+    return 0;   /* doorbell BAR */
+}
+
 void pci_bar_write_4(struct pci_bar *b, u64 offset, u32 val)
 {
-    the_dev.last_tx_doorbell = val;
+    if (b == g_reg_bar) {
+        if (offset == GVE_REG_ADMINQ_DOORBELL) {
+            u32 d = be32toh(val);
+            adminq_process(&g_adapter->adminq[(d - 1) & g_adapter->adminq_mask]);
+            g_evt_cnt = d;
+        }
+        return;
+    }
+    the_dev.last_tx_doorbell = val;   /* doorbell BAR */
 }
 
 /* Device posts one PKT completion for `tag` into the TX completion ring. */
@@ -1022,6 +1078,93 @@ static void scenario_dqo_rx_qpl(void)
     CHECK(pbufs_live == live_before, "copy-out pbuf freed on delivery");
 }
 
+/* ------------------------------------------------------------------ */
+/* Device negotiation / fallback (gve_adminq.c, third TU)               */
+/* ------------------------------------------------------------------ */
+
+static gve negotiate(const u16 *opts, int nopts)
+{
+    gve adapter = make_adapter_common();
+    adapter->contiguous = gh;
+    adapter->adminq = allocate(gh, PAGESIZE);
+    adapter->adminq_mask = PAGESIZE / sizeof(struct gve_adminq_command) - 1;
+    adapter->adminq_head = 0;
+    adapter->adminq_running = true;
+    adapter->reg_bar.vaddr = pointer_from_u64(0x1000);
+    adapter->db_bar.vaddr  = pointer_from_u64(0x2000);
+    g_reg_bar = &adapter->reg_bar;
+    g_adapter = adapter;
+    g_evt_cnt = 0;
+    g_desc_nopts = nopts;
+    for (int i = 0; i < nopts; i++) g_desc_opts[i] = opts[i];
+
+    boolean ok = gve_describe_device(adapter);
+    CHECK(ok, "describe_device succeeded");
+    return adapter;
+}
+
+/* Scenario 19: format negotiation and the GQI-QPL fallback. */
+static void scenario_negotiate_formats(void)
+{
+    rprintf("scenario_negotiate_formats\n");
+
+    /* No options at all -> GQI-QPL fallback (the common case on older
+     * devices; the allocate_zero fix makes this deterministic). */
+    gve a = negotiate(NULL, 0);
+    CHECK(!a->dqo && !a->dqo_qpl && !a->raw_addressing,
+          "no options -> GQI-QPL fallback (all format flags false)");
+    CHECK(!a->rss_supported, "no RSS option -> rss_supported false");
+
+    u16 o_dqo_rda[] = { GVE_DEV_OPT_ID_DQO_RDA };
+    a = negotiate(o_dqo_rda, 1);
+    CHECK(a->dqo && !a->dqo_qpl, "DQO_RDA option -> DQO-RDA");
+
+    u16 o_dqo_qpl[] = { GVE_DEV_OPT_ID_DQO_QPL };
+    a = negotiate(o_dqo_qpl, 1);
+    CHECK(a->dqo && a->dqo_qpl, "DQO_QPL option -> DQO-QPL");
+
+    u16 o_gqi_rda[] = { GVE_DEV_OPT_ID_GQI_RDA };
+    a = negotiate(o_gqi_rda, 1);
+    CHECK(!a->dqo && a->raw_addressing, "GQI_RDA option -> GQI-RDA");
+
+    /* Priority: DQO-RDA beats GQI-RDA when both are offered. */
+    u16 o_both[] = { GVE_DEV_OPT_ID_GQI_RDA, GVE_DEV_OPT_ID_DQO_RDA };
+    a = negotiate(o_both, 2);
+    CHECK(a->dqo, "DQO-RDA wins over GQI-RDA (priority)");
+
+    u16 o_rss[] = { GVE_DEV_OPT_ID_RSS_CONFIG };
+    a = negotiate(o_rss, 1);
+    CHECK(a->rss_supported, "RSS_CONFIG option -> rss_supported");
+    CHECK(!a->dqo && !a->raw_addressing, "RSS option alone keeps GQI-QPL");
+}
+
+/* Scenario 20: queue-count negotiation and the dev_max==0 fallback. */
+static void scenario_negotiate_queue_count(void)
+{
+    rprintf("scenario_negotiate_queue_count\n");
+    gve a = make_adapter_common();
+    a->reg_bar.vaddr = pointer_from_u64(0x1000);
+    g_reg_bar = &a->reg_bar;
+    int saved_tp = total_processors;
+
+    /* device reports 0 max queues -> fall back to 1 */
+    g_max_tx = g_max_rx = 0; g_msix = 64; total_processors = 8;
+    CHECK(gve_calc_num_queues(a, 0) == 1, "dev_max 0 -> 1 queue");
+
+    /* min over device max / msix / cpu */
+    g_max_tx = g_max_rx = 8; g_msix = 64; total_processors = 4;
+    CHECK(gve_calc_num_queues(a, 0) == 4, "capped by cpu count (4)");
+
+    g_max_tx = g_max_rx = 8; g_msix = 64; total_processors = 16;
+    CHECK(gve_calc_num_queues(a, 0) == 8, "capped by device max (8)");
+
+    g_max_tx = g_max_rx = 32; g_msix = 9; total_processors = 16;
+    CHECK(gve_calc_num_queues(a, 0) == 4, "capped by MSI-X ((9-1)/2 = 4)");
+
+    total_processors = saved_tp;
+    g_max_tx = g_max_rx = 8; g_msix = 64;
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -1045,6 +1188,8 @@ int main(int argc, char **argv)
     scenario_gqi_rx_chain();
     scenario_gqi_rx_qpl();
     scenario_dqo_rx_qpl();
+    scenario_negotiate_formats();
+    scenario_negotiate_queue_count();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

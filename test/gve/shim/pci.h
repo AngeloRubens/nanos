@@ -14,5 +14,6 @@ struct pci_bar {
 
 u32  pci_bar_read_4(struct pci_bar *b, u64 offset);
 void pci_bar_write_4(struct pci_bar *b, u64 offset, u32 val);
+int  pci_get_msix_count(pci_dev d);
 
 #endif

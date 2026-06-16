@@ -24,4 +24,7 @@ typedef struct harness_cpu { u32 id; } *cpuinfo;
 cpuinfo current_cpu(void);
 extern int total_processors;
 
+/* busy-wait: a no-op in the harness (the device model responds at once) */
+void kernel_delay(timestamp t);
+
 #endif
