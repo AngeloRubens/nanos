@@ -130,10 +130,12 @@ void netif_set_link_down(struct netif *n) { n->flags &= ~NETIF_FLAG_UP; }
 u16  net_get_napi_id(u8 netif_num, u16 queue_idx) { return queue_idx + 1; }
 
 static int rx_delivered;        /* packets handed to net_if->input */
+static int g_input_hold;        /* 1 = lwIP keeps the pbuf (models a held ref) */
 static err_t harness_input(struct pbuf *p, struct netif *inp)
 {
     rx_delivered++;
-    pbuf_free(p);               /* the stack consumes it */
+    if (!g_input_hold)
+        pbuf_free(p);           /* the stack consumes it */
     return ERR_OK;
 }
 err_t ethernet_input(struct pbuf *p, struct netif *netif) { return harness_input(p, netif); }
@@ -923,6 +925,7 @@ static void scenario_tx_fuzz(void)
 static void make_tx_gqi(gve adapter, gve_tx_queue tx, u16 desc_cnt)
 {
     boolean rda = adapter->raw_addressing;
+    adapter->tx_desc_cnt = desc_cnt;   /* the GQI space check uses this */
     tx->desc = allocate_zero(gh, desc_cnt * sizeof(*tx->desc));
     tx->tx_timestamps = allocate_zero(gh, desc_cnt * sizeof(*tx->tx_timestamps));
     tx->br = allocate_queue(gh, GVE_BUF_RING_SIZE);
@@ -1522,6 +1525,87 @@ static void scenario_multiqueue_rss(void)
     CHECK(roundrobin, "LUT spreads round-robin over the 6 RX queues");
 }
 
+/* Scenario 28: GQI RX error and drop-to-EOP paths. */
+static void scenario_gqi_rx_errors(void)
+{
+    rprintf("scenario_gqi_rx_errors\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+    int delivered_before = rx_delivered;
+
+    /* single-buffer error packet -> dropped */
+    gqi_dev_rx_complete(rx, 100, GVE_RXF_ERR);
+    /* errored fragment mid-chain -> drop the rest to EOP */
+    gqi_dev_rx_complete(rx, 1400, GVE_RXF_ERR | GVE_RXF_PKT_CONT);
+    gqi_dev_rx_complete(rx, 600, 0);                /* EOP of dropped chain */
+    /* a clean packet still delivered afterwards */
+    gqi_dev_rx_complete(rx, 120, 0);
+    apply((thunk)&rx->service);
+
+    CHECK(rx_delivered == delivered_before + 1, "only the clean packet delivered");
+    CHECK(rx->rx_stats.rx_dropped >= 2, "errored packets counted dropped");
+    CHECK(!rx->drop_pkt, "drop state cleared at EOP");
+}
+
+/* Scenario 30: GQI-QPL TX byte-FIFO wrap (qpl_head wraps around qpl_size). */
+static void scenario_gqi_qpl_wrap(void)
+{
+    rprintf("scenario_gqi_qpl_wrap\n");
+    gve adapter = make_adapter_gqi(false);     /* QPL */
+    gve_tx_queue tx = &adapter->tx[0];
+    make_tx_gqi(adapter, tx, 256);
+    gve_setup_linkoutput(adapter, &adapter->ndev.n);
+    int live_before = pbufs_live;
+
+    /* send enough bytes (large packets) to wrap the QPL byte FIFO twice */
+    u32 sent = 0;
+    for (int i = 0; i < 4 * (int)(tx->qpl_size / 2048); i++) {
+        struct pbuf *p = make_pkt(2000);
+        adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+        gqi_dev_tx_complete_all(adapter, tx);
+        run_tx_gqi_cleanup(tx);
+        pbuf_free(p);            /* lwIP's ref (QPL freed the driver's inline) */
+        sent++;
+    }
+    CHECK(sent > 0 && tx->qpl_head < tx->qpl_size, "qpl_head wrapped and stayed in range");
+    CHECK(tx->qpl_used == 0, "all QPL bytes released after completions");
+    CHECK(pbufs_live == live_before, "no leak across the QPL wrap");
+}
+
+/* Scenario 31: GQI TX backpressure (ring fills, queue stops, then resumes). */
+static void scenario_gqi_tx_backpressure(void)
+{
+    rprintf("scenario_gqi_tx_backpressure\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_tx_queue tx = &adapter->tx[0];
+    make_tx_gqi(adapter, tx, 16);
+    gve_setup_linkoutput(adapter, &adapter->ndev.n);
+    int live_before = pbufs_live;
+
+    struct pbuf *kept[64]; int n = 0;
+    while (tx->running && n < 64) {
+        struct pbuf *p = make_pkt(64);
+        kept[n++] = p;
+        adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+    }
+    CHECK(!tx->running, "GQI queue stopped under backpressure");
+    CHECK(tx->tx_stats.queue_stop >= 1, "queue_stop counted");
+
+    gqi_dev_tx_complete_all(adapter, tx);       /* complete what's posted */
+    apply((thunk)&tx->enqueue_task);            /* wakeup + drain held pkt */
+    CHECK(tx->running, "GQI queue resumed");
+    CHECK(tx->tx_stats.queue_wakeup >= 1, "queue_wakeup counted");
+
+    /* drain fully */
+    while (tx->tail != tx->head) {
+        gqi_dev_tx_complete_all(adapter, tx);
+        apply((thunk)&tx->enqueue_task);
+    }
+    for (int i = 0; i < n; i++) pbuf_free(kept[i]);
+    CHECK(pbufs_live == live_before, "no leak (gqi backpressure)");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -1555,6 +1639,9 @@ int main(int argc, char **argv)
     scenario_lifecycle_gqi_qpl();
     scenario_multiqueue_dispatch();
     scenario_multiqueue_rss();
+    scenario_gqi_rx_errors();
+    scenario_gqi_qpl_wrap();
+    scenario_gqi_tx_backpressure();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
