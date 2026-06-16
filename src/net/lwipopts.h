@@ -96,12 +96,6 @@ typedef unsigned long size_t;
 
 #define LWIP_STATS  0
 
-/* Enable per-netif control of HW checksum offload.
- * Drivers that offload TCP/UDP/IP checksum generation disable the
- * corresponding NETIF_CHECKSUM_GEN_* flags via netif_set_checksum_ctrl().
- * Other netifs inherit all-enabled defaults.  RX checking is always on. */
-#define LWIP_CHECKSUM_CTRL_PER_NETIF 1
-
 #define LWIP_HOOK_IP4_INPUT net_ip_input_hook
 #define LWIP_HOOK_IP6_INPUT net_ip_input_hook
 
