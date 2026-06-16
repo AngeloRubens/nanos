@@ -1165,6 +1165,109 @@ static void scenario_negotiate_queue_count(void)
     g_max_tx = g_max_rx = 8; g_msix = 64;
 }
 
+/* Scenario 21: DQO TX multi-segment packet (chain -> ctx + N pkt descs,
+ * one tag, retired as a unit). */
+static void scenario_dqo_tx_multiseg(void)
+{
+    rprintf("scenario_dqo_tx_multiseg\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+    int live_before = pbufs_live;
+    int free0 = (int)(tx->tags_ntc - tx->tags_ntu);
+
+    struct pbuf *p = make_chain(3, 200);     /* 3 segments */
+    u16 tag = send_pkt(tx, adapter, p);
+    CHECK(tx->head == 4, "ctx + 3 pkt descs written, got %d", tx->head);
+    CHECK(tx->seg_counts[tag] == 4, "4 descriptors recorded for the tag");
+    CHECK(tx->pending[tag] == p, "chain held pending in RDA");
+
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+    CHECK(tx->desc_tail == 4, "all 4 descriptors retired");
+    CHECK((int)(tx->tags_ntc - tx->tags_ntu) == free0, "tag returned");
+
+    pbuf_free(p);
+    CHECK(pbufs_live == live_before, "multi-seg chain fully freed");
+}
+
+/* Scenario 22: GQI-RDA TX multi-segment packet (pkt + seg descriptors,
+ * each segment slot holds its own pbuf reference). */
+static void scenario_gqi_tx_multiseg(void)
+{
+    rprintf("scenario_gqi_tx_multiseg\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_tx_queue tx = &adapter->tx[0];
+    make_tx_gqi(adapter, tx, 256);
+    gve_setup_linkoutput(adapter, &adapter->ndev.n);
+    int live_before = pbufs_live;
+
+    struct pbuf *p = make_chain(3, 200);
+    err_t e = adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+    CHECK(e == ERR_OK, "gqi multi-seg linkoutput ok");
+    CHECK(tx->head == 3, "pkt + 2 seg descriptors written, got %d", tx->head);
+    CHECK(tx->pending[0] == p && tx->pending[1] == p->next, "chain segments pending");
+
+    gqi_dev_tx_complete_all(adapter, tx);
+    run_tx_gqi_cleanup(tx);
+    CHECK(tx->tail == tx->head, "all segments retired");
+
+    pbuf_free(p);
+    CHECK(pbufs_live == live_before, "no leak across segment refs");
+}
+
+/* Scenario 23: TX backpressure — fill the ring until the queue stops, then
+ * a completion lets a queued packet through (queue_wakeup). */
+static void scenario_dqo_tx_backpressure(void)
+{
+    rprintf("scenario_dqo_tx_backpressure\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 16);            /* small ring */
+    int live_before = pbufs_live;
+
+    /* send (without completing) until the queue stops accepting */
+    int sent = 0;
+    struct pbuf *kept[32];
+    while (tx->running && sent < 32) {
+        struct pbuf *p = make_pkt(64);
+        kept[sent++] = p;
+        adapter->ndev.n.state = adapter;
+        gve_linkoutput_dqo(&adapter->ndev.n, p);
+    }
+    CHECK(!tx->running, "queue stopped under backpressure");
+    CHECK(tx->tx_stats.queue_stop >= 1, "queue_stop counted");
+    CHECK(!queue_empty(tx->br), "a packet is held in the software queue");
+
+    /* complete the outstanding packets, then kick the drain */
+    for (u32 t = tx->tags_ntu; t != tx->tags_ntc; t++) { }   /* (no-op) */
+    /* complete in submission order via the descriptor EOP tags */
+    u32 done = 0;
+    while (tx->desc_tail != tx->head && done < 64) {
+        u16 tag = tx->desc[(tx->desc_tail + 1) & tx->mask].compl_tag;
+        if (tx->seg_counts[tag]) {
+            dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+            run_cleanup(tx);
+        } else {
+            run_cleanup(tx);
+        }
+        done++;
+    }
+    apply((thunk)&tx->enqueue_task);         /* wakeup + drain the held pkt */
+    CHECK(tx->running, "queue resumed after completions");
+    CHECK(tx->tx_stats.queue_wakeup >= 1, "queue_wakeup counted");
+    CHECK(queue_empty(tx->br), "software queue drained");
+
+    /* drain everything to balance pbufs */
+    while (tx->desc_tail != tx->head) {
+        u16 tag = tx->desc[(tx->desc_tail + 1) & tx->mask].compl_tag;
+        dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+    }
+    for (int i = 0; i < sent; i++) pbuf_free(kept[i]);
+    CHECK(pbufs_live == live_before, "no leak under backpressure");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -1190,6 +1293,9 @@ int main(int argc, char **argv)
     scenario_dqo_rx_qpl();
     scenario_negotiate_formats();
     scenario_negotiate_queue_count();
+    scenario_dqo_tx_multiseg();
+    scenario_gqi_tx_multiseg();
+    scenario_dqo_tx_backpressure();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
