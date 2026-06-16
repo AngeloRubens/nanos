@@ -280,12 +280,79 @@ static void scenario_tx_inorder(void)
     CHECK(pbufs_live == live_before, "pbuf fully freed after lwIP releases");
 }
 
+/* Send one packet on tx; returns its completion tag. */
+static u16 send_pkt(gve_tx_dqo_queue tx, gve adapter, struct pbuf *p)
+{
+    u32 head_before = tx->head;
+    gve_linkoutput_dqo(&adapter->ndev.n, p);
+    /* EOP desc is the last one written; its compl_tag is the pool tag. */
+    return tx->desc[(tx->head - 1) & tx->mask].compl_tag;
+}
+
+static void run_cleanup(gve_tx_dqo_queue tx)
+{
+    spin_lock(&tx->ring_mtx);
+    gve_tx_dqo_cleanup(tx);
+    spin_unlock(&tx->ring_mtx);
+}
+
+/* Scenario 2: a MISSed packet keeps its tag/pbuf until REINJECT, and a
+ * packet sent in between gets a DIFFERENT tag (the collision the tag pool
+ * exists to prevent).  Then REINJECT retires the missed packet. */
+static void scenario_tx_miss_reinject(void)
+{
+    rprintf("scenario_tx_miss_reinject\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+    int live_before = pbufs_live;
+    int free0 = (int)(tx->tags_ntc - tx->tags_ntu);
+
+    struct pbuf *A = make_pkt(100);
+    u16 tA = send_pkt(tx, adapter, A);
+
+    /* Device MISSes A: record only, do not retire, do not return the tag. */
+    dqo_dev_complete_pkt(&the_dev, tA, GVE_DQO_COMPL_TYPE_MISS);
+    run_cleanup(tx);
+    CHECK(tx->seg_counts[tA] == 2, "missed A not retired (seg_counts stays)");
+    CHECK(tx->miss_times[tA] != 0, "miss recorded for A");
+    CHECK(tx->pending[tA] == A, "A still pending");
+    CHECK(A->ref == 2, "A still held by the driver");
+    CHECK(tx->desc_tail == 0, "no descriptors retired on miss");
+    CHECK((int)(tx->tags_ntc - tx->tags_ntu) == free0 - 1, "A's tag still out");
+
+    /* A packet sent while A is missed must get a different tag. */
+    struct pbuf *B = make_pkt(200);
+    u16 tB = send_pkt(tx, adapter, B);
+    CHECK(tB != tA, "B must not reuse the missed tag tA (%d)", tA);
+
+    dqo_dev_complete_pkt(&the_dev, tB, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+    CHECK(tx->seg_counts[tB] == 0, "B retired");
+    CHECK(tx->seg_counts[tA] == 2, "A still pending after B retires");
+    CHECK(tx->miss_times[tA] != 0, "A's miss still pending");
+
+    /* REINJECT retires A. */
+    dqo_dev_complete_pkt(&the_dev, tA, GVE_DQO_COMPL_TYPE_REINJECT);
+    run_cleanup(tx);
+    CHECK(tx->seg_counts[tA] == 0, "A retired on reinject");
+    CHECK(tx->miss_times[tA] == 0, "A's miss state cleared");
+    CHECK(tx->pending[tA] == NULL, "A no longer pending");
+    CHECK(A->ref == 1, "driver released A's ref");
+    CHECK((int)(tx->tags_ntc - tx->tags_ntu) == free0, "both tags returned");
+
+    pbuf_free(A);
+    pbuf_free(B);
+    CHECK(pbufs_live == live_before, "all pbufs freed");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
     failures = checks = 0;
 
     scenario_tx_inorder();
+    scenario_tx_miss_reinject();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
