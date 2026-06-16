@@ -60,3 +60,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
       - name: Boot hw (TCG)
         run: timeout 300 make -j$(nproc) run-noaccel TARGET=hw PLATFORM=virt
+
+  # Host harness that compiles and executes the real DQO datapath
+  # (src/gcp/gve/gve_dqo.c) against a software device model — the only
+  # pre-hardware test that runs the datapath/lifecycle logic.
+  dqo-harness:
+    name: DQO datapath harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: make -C test/gve run
