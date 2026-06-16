@@ -158,20 +158,27 @@ static int g_msix = 64;
 int pci_get_msix_count(pci_dev d) { return g_msix; }
 
 static struct pci_bar *g_reg_bar;     /* the adapter's register BAR */
-static gve g_adapter;                 /* adapter being negotiated */
+static struct gve_adminq_command *g_adminq;  /* the device's view of the ring */
+static u32  g_adminq_mask;
 static u32  g_evt_cnt;                 /* adminq event counter */
 static u32  g_max_tx = 8, g_max_rx = 8;
 static u16  g_desc_opts[8];           /* device options to advertise */
 static int  g_desc_nopts;
 
+/* Process one admin-queue command: build any response the driver reads back,
+ * then mark it passed.  Enough commands are handled to drive the full
+ * lifecycle (describe / configure-resources / create-queues / rss / page
+ * lists / teardown). */
 static void adminq_process(struct gve_adminq_command *cmd)
 {
-    if (be32toh(cmd->opcode) == GVE_ADMINQ_DESCRIBE_DEVICE) {
+    u32 op = be32toh(cmd->opcode);
+    switch (op) {
+    case GVE_ADMINQ_DESCRIBE_DEVICE: {
         struct gve_device_descriptor *d =
             pointer_from_u64(be64toh(cmd->describe_device.device_descriptor_addr));
         zero(d, PAGESIZE);
-        d->mtu             = htobe16(1460);
-        d->counters        = htobe16(16);
+        d->mtu              = htobe16(1460);
+        d->counters         = htobe16(16);
         d->tx_queue_entries = htobe16(256);
         d->rx_queue_entries = htobe16(256);
         d->tx_pages_per_qpl = htobe16(64);
@@ -185,8 +192,69 @@ static void adminq_process(struct gve_adminq_command *cmd)
             opt++;
         }
         d->total_length = htobe16((u16)((u8 *)opt - (u8 *)d));
+        break;
+    }
+    case GVE_ADMINQ_CREATE_TX_QUEUE: {
+        struct gve_queue_resources *q =
+            pointer_from_u64(be64toh(cmd->create_tx_queue.queue_resources_addr));
+        u32 qid = be32toh(cmd->create_tx_queue.queue_id);
+        q->db_index      = htobe32(qid);
+        q->counter_index = htobe32(qid);
+        break;
+    }
+    case GVE_ADMINQ_CREATE_RX_QUEUE: {
+        struct gve_queue_resources *q =
+            pointer_from_u64(be64toh(cmd->create_rx_queue.queue_resources_addr));
+        u32 qid = be32toh(cmd->create_rx_queue.queue_id);
+        q->db_index      = htobe32(8 + qid);
+        q->counter_index = htobe32(8 + qid);
+        break;
+    }
+    default:
+        break;   /* verify / cfg-resources / ptype / rss / page-list / destroy */
     }
     cmd->status = htobe32(GVE_ADMINQ_COMMAND_PASSED);
+}
+
+/* ---- lifecycle link/stub glue (only the full-lifecycle scenario uses it) ---- */
+timerqueue kernel_timers;
+static pci_probe g_probe;            /* recorded by register_pci_driver */
+static struct netif *g_life_netif;   /* captured by netif_add */
+
+void register_pci_driver(pci_probe p, pci_remove remove) { g_probe = p; }
+int  pci_enable_msix(pci_dev dev) { return 64; }
+u64  pci_setup_msix_aff(pci_dev dev, int s, thunk h, sstring n, range a) { return 0; }
+void pci_teardown_msix(pci_dev dev, int msi_slot) { }
+void pci_disable_msix(pci_dev dev) { }
+void pci_bar_deinit(struct pci_bar *b) { }
+void pci_enable_io_and_memory(pci_dev dev) { }
+u16  pci_get_vendor(pci_dev dev) { return PCI_VENDOR_ID_GOOGLE; }
+u16  pci_get_device(pci_dev dev) { return PCI_DEV_ID_GVNIC; }
+
+void pci_bar_init(pci_dev dev, struct pci_bar *b, int bar, bytes o, bytes l)
+{
+    b->vaddr = pointer_from_u64(0x10000 + bar);
+    if (bar == GVE_REGISTER_BAR) {
+        g_reg_bar = b;             /* route adminq register access here */
+        /* capture the ring: the PFN write is lossy on a 64-bit host (the
+         * physical address does not fit u32 >> PAGELOG), so recover the
+         * adapter from its embedded reg_bar instead.  adapter->adminq is
+         * already allocated by this point in gve_init. */
+        gve adapter = (gve)((u8 *)b - offsetof(gve, reg_bar));
+        g_adminq = adapter->adminq;
+        g_adminq_mask = PAGESIZE / sizeof(struct gve_adminq_command) - 1;
+    }
+}
+
+struct netif *netif_add(struct netif *netif, const void *ip, const void *nm,
+                        const void *gw, void *state, netif_init_fn init,
+                        netif_input_fn input)
+{
+    netif->state = state;
+    netif->input = input;
+    g_life_netif = netif;
+    if (init) init(netif);
+    return netif;
 }
 
 u32 pci_bar_read_4(struct pci_bar *b, u64 offset)
@@ -207,7 +275,7 @@ void pci_bar_write_4(struct pci_bar *b, u64 offset, u32 val)
     if (b == g_reg_bar) {
         if (offset == GVE_REG_ADMINQ_DOORBELL) {
             u32 d = be32toh(val);
-            adminq_process(&g_adapter->adminq[(d - 1) & g_adapter->adminq_mask]);
+            adminq_process(&g_adminq[(d - 1) & g_adminq_mask]);
             g_evt_cnt = d;
         }
         return;
@@ -1093,7 +1161,8 @@ static gve negotiate(const u16 *opts, int nopts)
     adapter->reg_bar.vaddr = pointer_from_u64(0x1000);
     adapter->db_bar.vaddr  = pointer_from_u64(0x2000);
     g_reg_bar = &adapter->reg_bar;
-    g_adapter = adapter;
+    g_adminq = adapter->adminq;
+    g_adminq_mask = adapter->adminq_mask;
     g_evt_cnt = 0;
     g_desc_nopts = nopts;
     for (int i = 0; i < nopts; i++) g_desc_opts[i] = opts[i];
@@ -1268,9 +1337,64 @@ static void scenario_dqo_tx_backpressure(void)
     CHECK(pbufs_live == live_before, "no leak under backpressure");
 }
 
+/* ------------------------------------------------------------------ */
+/* Full lifecycle: init_gve -> probe -> setup -> watchdog -> reset      */
+/* ------------------------------------------------------------------ */
+
+/* Scenario 24: drive the real bring-up end to end, then fire the watchdog
+ * and let it reset.  This is the only scenario that runs gve_main.c's
+ * probe/setup/watchdog/reset (their closures can only be initialised by the
+ * driver's own lifecycle, not from the harness). */
+static void scenario_lifecycle(void)
+{
+    rprintf("scenario_lifecycle\n");
+
+    /* device presents a DQO-RDA option, 8 max queues, plenty of MSI-X */
+    g_desc_nopts = 1;
+    g_desc_opts[0] = GVE_DEV_OPT_ID_DQO_RDA;
+    g_max_tx = g_max_rx = 8;
+    g_msix = 64;
+    int saved_tp = total_processors;
+    total_processors = 2;
+    g_adminq = NULL;
+
+    /* init_gve registers the probe; apply it with a fake gVNIC device */
+    init_gve((kernel_heaps)0);
+    CHECK(g_probe != 0, "init_gve registered a probe");
+    boolean ok = apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    CHECK(ok, "probe matched and brought the device up to netif_add");
+
+    gve adapter = g_life_netif->state;
+    CHECK(adapter->dqo && !adapter->dqo_qpl, "negotiated DQO-RDA");
+
+    /* net.c applies the setup closure once the config tuple is available */
+    boolean up = apply((netif_dev_setup)&adapter->ndev.setup, (tuple)0);
+    CHECK(up, "setup completed (queues, interrupts, RSS, watchdog)");
+    CHECK((adapter->flags >> GVE_FLAG_DEVICE_RUNNING) & 1, "DEVICE_RUNNING set");
+    CHECK(adapter->num_queues == 2, "queue count capped by cpus (2), got %d",
+          adapter->num_queues);
+
+    /* a MISS that never reinjects: the watchdog must reset the adapter */
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    tx->miss_times[5] = now(CLOCK_ID_MONOTONIC) -
+                        milliseconds(GVE_TX_WATCHDOG_MS + 1000);
+    u64 wd_before = adapter->dev_stats.wd_expired;
+
+    apply((timer_handler)&adapter->watchdog_task, (u64)0, (u64)1);
+
+    CHECK(adapter->dev_stats.wd_expired == wd_before + 1,
+          "watchdog detected the stuck queue and counted a reset");
+    CHECK((adapter->flags >> GVE_FLAG_DEVICE_RUNNING) & 1,
+          "adapter is RUNNING again after the reset recreated the queues");
+    CHECK(!adapter->tx_dqo[0].stuck, "recreated queue is not stuck");
+
+    total_processors = saved_tp;
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
+    kernel_timers = allocate_timerqueue(gh, 0, ss("harness"));
     failures = checks = 0;
 
     scenario_tx_inorder();
@@ -1296,6 +1420,7 @@ int main(int argc, char **argv)
     scenario_dqo_tx_multiseg();
     scenario_gqi_tx_multiseg();
     scenario_dqo_tx_backpressure();
+    scenario_lifecycle();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

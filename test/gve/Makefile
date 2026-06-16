@@ -26,7 +26,8 @@ RUNTIME_SRCS := $(addprefix $(ROOT)/src/runtime/,$(addsuffix .c,$(RUNTIME))) \
 # harness.c the way gve_dqo.c is.  harness.c calls its non-static entry
 # points (gve_setup_linkoutput, gve_rx_fill/init, gve_tx_init_gqi).
 SRCS := harness.c $(ROOT)/src/gcp/gve/gve_datapath.c \
-	$(ROOT)/src/gcp/gve/gve_adminq.c $(RUNTIME_SRCS)
+	$(ROOT)/src/gcp/gve/gve_adminq.c $(ROOT)/src/gcp/gve/gve_main.c \
+	$(RUNTIME_SRCS)
 
 gve_harness: closure_templates.h $(SRCS)
 	gcc $(CFLAGS) $(SRCS) -lpthread -o $@

@@ -27,4 +27,8 @@ extern int total_processors;
 /* busy-wait: a no-op in the harness (the device model responds at once) */
 void kernel_delay(timestamp t);
 
+/* the watchdog timer queue: gve registers a timer into it, but the harness
+ * invokes the watchdog closure directly, so this is never serviced */
+extern timerqueue kernel_timers;
+
 #endif

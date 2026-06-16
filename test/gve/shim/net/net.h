@@ -16,4 +16,10 @@ static inline void netif_dev_init(netif_dev dev) { }
 
 u16 net_get_napi_id(u8 netif_num, u16 queue_idx);
 
+typedef err_t (*netif_init_fn)(struct netif *netif);
+typedef err_t (*netif_input_fn)(struct pbuf *p, struct netif *inp);
+struct netif *netif_add(struct netif *netif, const void *ipaddr,
+                        const void *netmask, const void *gw, void *state,
+                        netif_init_fn init, netif_input_fn input);
+
 #endif
