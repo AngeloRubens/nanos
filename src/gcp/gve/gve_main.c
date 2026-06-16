@@ -497,7 +497,15 @@ static void gve_deinit_interrupts(gve adapter)
 /* Adapter init                                                         */
 /* ------------------------------------------------------------------ */
 
-static boolean gve_init(gve adapter, tuple config)
+/*
+ * gve_init — probe-time device bring-up that needs no manifest config:
+ * admin queue + DESCRIBE_DEVICE (which yields the MAC, MTU, queue format
+ * and device queue maximums).  Queue-count selection and everything that
+ * depends on it are deferred to gve_setup, because the io-queues manifest
+ * option is only readable once the filesystem (and the root tuple) is up —
+ * which is after probe.
+ */
+static boolean gve_init(gve adapter)
 {
     adapter->adminq = allocate(adapter->contiguous, PAGESIZE);
     if (adapter->adminq == INVALID_ADDRESS)
@@ -531,26 +539,47 @@ static boolean gve_init(gve adapter, tuple config)
         msg_err("GVE: failed to describe device");
         goto err1;
     }
+    return true;
+
+  err1:
+    pci_bar_deinit(&adapter->db_bar);
+    pci_bar_deinit(&adapter->reg_bar);
+    deallocate(adapter->contiguous, adapter->adminq, PAGESIZE);
+    return false;
+}
+
+/*
+ * gve_setup — netif_dev setup callback, applied by net.c once the
+ * per-interface config tuple is available (after the filesystem is
+ * mounted).  This is where the io-queues manifest option can finally be
+ * read, so queue-count selection and the rest of device bring-up live here
+ * rather than at probe time.  Mirrors virtio_net_setup.
+ */
+closure_func_basic(netif_dev_setup, boolean, gve_setup,
+                   tuple config)
+{
+    gve adapter = struct_from_closure(gve, ndev.setup);
+    struct netif *net_if = &adapter->ndev.n;
 
     adapter->num_queues = gve_calc_num_queues(adapter, config);
     rprintf("GVE: using %d TX/RX queue pair(s)\n", adapter->num_queues);
 
     if (!gve_cfg_device_resources(adapter)) {
         msg_err("GVE: failed to configure device resources");
-        goto err1;
+        return false;
     }
     /* DQO requires the driver to fetch the packet-type map before queues. */
     if (adapter->dqo && !gve_get_ptype_map_dqo(adapter)) {
         msg_err("GVE: failed to get DQO ptype map");
-        goto err2;
+        goto err_res;
     }
     if (!gve_init_interrupts(adapter)) {
         msg_err("GVE: failed to initialize interrupts");
-        goto err2;
+        goto err_res;
     }
     if (!gve_setup_queues(adapter)) {
         msg_err("GVE: failed to set up TX/RX queues");
-        goto err3;
+        goto err_intr;
     }
     /* RSS references RX queue ids in the indirection table, so it can only
      * be configured once the queues exist (the official driver issues
@@ -568,16 +597,26 @@ static boolean gve_init(gve adapter, tuple config)
                    watchdog_interval,
                    init_closure_func(&adapter->watchdog_task,
                                      timer_handler, gve_watchdog_task));
+
+    /* Queues and interrupts are up: bring the link up and arm RX IRQs.
+     * Any reset the device requested during bring-up is caught here too
+     * (the mgmt IRQ ignores it until DEVICE_RUNNING). */
+    u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
+    if (status & GVE_DEVICE_STATUS_LINK_STATUS)
+        netif_set_link_up(net_if);
+    else
+        netif_set_link_down(net_if);
+    gve_turnup_irqs(adapter);
+    if (status & GVE_DEVICE_STATUS_RESET) {
+        msg_err("GVE: device requested reset during setup");
+        gve_trigger_reset(adapter);
+    }
     return true;
 
-  err3:
+  err_intr:
     gve_deinit_interrupts(adapter);
-  err2:
+  err_res:
     gve_free_device_resources(adapter);
-  err1:
-    pci_bar_deinit(&adapter->db_bar);
-    pci_bar_deinit(&adapter->reg_bar);
-    deallocate(adapter->contiguous, adapter->adminq, PAGESIZE);
     return false;
 }
 
@@ -607,8 +646,8 @@ static err_t gve_if_init(struct netif *netif)
 /* PCI probe                                                            */
 /* ------------------------------------------------------------------ */
 
-closure_function(3, 1, boolean, gve_probe,
-        heap, general, heap, contiguous, tuple, config,
+closure_function(2, 1, boolean, gve_probe,
+        heap, general, heap, contiguous,
         pci_dev d)
 {
     if ((pci_get_vendor(d) != PCI_VENDOR_ID_GOOGLE) ||
@@ -625,24 +664,15 @@ closure_function(3, 1, boolean, gve_probe,
     adapter->general   = h;
     adapter->contiguous = bound(contiguous);
     adapter->pdev      = d;
-    if (gve_init(adapter, bound(config))) {
+    if (gve_init(adapter)) {
         gve_debug("registering network interface");
         netif_dev_init(&adapter->ndev);
+        /* The rest of bring-up (queue count from the io-queues manifest,
+         * queues, interrupts, RSS, link) runs in gve_setup, applied by
+         * net.c once the per-interface config tuple is available. */
+        init_closure_func(&adapter->ndev.setup, netif_dev_setup, gve_setup);
         netif_add(&adapter->ndev.n, 0, 0, 0, adapter,
                   gve_if_init, ethernet_input);
-        u32 status = pci_bar_read_4(&adapter->reg_bar, GVE_REG_DEVICE_STATUS);
-        if (status & GVE_DEVICE_STATUS_LINK_STATUS)
-            netif_set_link_up(&adapter->ndev.n);
-        else
-            netif_set_link_down(&adapter->ndev.n);
-        gve_turnup_irqs(adapter);
-        /* Catch a reset the device requested while probe was in progress
-         * (the mgmt IRQ ignores it until DEVICE_RUNNING; the official
-         * driver re-checks at end of probe for the same reason). */
-        if (status & GVE_DEVICE_STATUS_RESET) {
-            msg_err("GVE: device requested reset during probe");
-            gve_trigger_reset(adapter);
-        }
         return true;
     }
     deallocate(h, adapter, sizeof(struct gve));
@@ -652,9 +682,8 @@ closure_function(3, 1, boolean, gve_probe,
 void init_gve(kernel_heaps kh)
 {
     heap h = heap_locked(kh);
-    tuple config = get(get_root_tuple(), sym(gve));
     pci_probe probe = closure(h, gve_probe, h,
-                              (heap)heap_linear_backed(kh), config);
+                              (heap)heap_linear_backed(kh));
     assert(probe != INVALID_ADDRESS);
     register_pci_driver(probe, 0);
 }
