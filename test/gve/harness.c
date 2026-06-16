@@ -49,9 +49,14 @@ void async_apply_bh(thunk t) { apply(t); }
 /* ------------------------------------------------------------------ */
 
 static int pbufs_live;          /* outstanding pbufs (alloc - free-to-zero) */
+static int pbuf_alloc_fail_after = -1;  /* >=0: fail once the counter hits 0 */
 
 struct pbuf *pbuf_alloc(int layer, u16 length, int type)
 {
+    if (pbuf_alloc_fail_after == 0)
+        return 0;
+    if (pbuf_alloc_fail_after > 0)
+        pbuf_alloc_fail_after--;
     struct pbuf *p = allocate(gh, sizeof(*p));
     if (p == INVALID_ADDRESS)
         return 0;
@@ -174,7 +179,8 @@ static void dqo_dev_complete_pkt(dqo_device dev, u16 tag, u8 type)
 /* Build a DQO TX queue (mirrors gve_create_tx_queue_dqo init, RDA mode) */
 /* ------------------------------------------------------------------ */
 
-static void make_tx_dqo(gve adapter, gve_tx_dqo_queue tx, u16 desc_cnt)
+static void make_tx_dqo_mode(gve adapter, gve_tx_dqo_queue tx, u16 desc_cnt,
+                             boolean qpl)
 {
     tx->desc       = allocate_zero(gh, desc_cnt * sizeof(*tx->desc));
     tx->compl      = allocate_zero(gh, desc_cnt * sizeof(*tx->compl));
@@ -199,6 +205,23 @@ static void make_tx_dqo(gve adapter, gve_tx_dqo_queue tx, u16 desc_cnt)
         tx->free_tags[i] = i;
     tx->tags_ntu = 0;
     tx->tags_ntc = desc_cnt;
+
+    adapter->dqo_qpl = qpl;
+    if (qpl) {
+        adapter->tx_pages_per_qpl = 64;
+        u32 qsize = adapter->tx_pages_per_qpl * PAGESIZE;
+        tx->qpl_base = allocate(gh, qsize);
+        tx->qpl_base_phys = physical_from_virtual(tx->qpl_base);
+        tx->qpl_num_slots = adapter->tx_pages_per_qpl * (PAGESIZE / GVE_DQO_BUF_SIZE);
+        tx->qpl_slot_list = allocate(gh, tx->qpl_num_slots * sizeof(*tx->qpl_slot_list));
+        for (u32 i = 0; i < tx->qpl_num_slots; i++)
+            tx->qpl_slot_list[i] = (u16)i;
+        tx->qpl_slot_head = tx->qpl_slot_tail = 0;
+        tx->qpl_free_slots = tx->qpl_num_slots;
+        tx->tag_qpl_slots = allocate(gh, desc_cnt * sizeof(*tx->tag_qpl_slots));
+        tx->tag_qpl_n = allocate_zero(gh, desc_cnt * sizeof(*tx->tag_qpl_n));
+    }
+
     zero(&tx->tx_stats, sizeof(tx->tx_stats));
     gve_tx_init_dqo(tx);
 
@@ -207,6 +230,11 @@ static void make_tx_dqo(gve adapter, gve_tx_dqo_queue tx, u16 desc_cnt)
     the_dev.tx_compl_mask = desc_cnt - 1;
     the_dev.tx_compl_tail = 0;
     the_dev.tx_compl_gen = 1;
+}
+
+static void make_tx_dqo(gve adapter, gve_tx_dqo_queue tx, u16 desc_cnt)
+{
+    make_tx_dqo_mode(adapter, tx, desc_cnt, false);
 }
 
 static gve make_adapter(void)
@@ -346,6 +374,267 @@ static void scenario_tx_miss_reinject(void)
     CHECK(pbufs_live == live_before, "all pbufs freed");
 }
 
+/* ------------------------------------------------------------------ */
+/* RX device model + queue setup                                        */
+/* ------------------------------------------------------------------ */
+
+static u32 rx_buf_cursor;       /* device: next buf_ring entry to consume */
+static u32 rx_compl_cursor;     /* device: next compl_ring entry to write */
+static u8  rx_compl_gen;        /* device generation bit */
+
+static void make_rx_dqo(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs)
+{
+    rx->pbufs     = allocate_zero(gh, num_bufs * sizeof(*rx->pbufs));
+    rx->free_ids  = allocate(gh, num_bufs * sizeof(*rx->free_ids));
+    rx->buf_ring  = allocate_zero(gh, num_bufs * sizeof(*rx->buf_ring));
+    rx->compl_ring = allocate_zero(gh, num_bufs * sizeof(*rx->compl_ring));
+    static u32 irq_db; irq_db = 0;
+    rx->irq_db_index = &irq_db;
+
+    rx->mask = num_bufs - 1;
+    rx->num_bufs = num_bufs;
+    rx->buf_head = 0;
+    rx->compl_head = 0;
+    rx->expected_gen = 1;
+    for (u16 i = 0; i < num_bufs; i++)
+        rx->free_ids[i] = i;
+    rx->next_to_use = 0;
+    rx->next_to_clean = num_bufs;
+    rx->adapter = adapter;
+    rx->db_idx = 0;
+    rx->idx = 0;
+    rx->ctx_head = NULL;
+    rx->drop_pkt = false;
+    rx->db_head = 0;
+    rx->first_interrupt = false;
+    rx->no_interrupt_event_cnt = 0;
+    rx->empty_rx_queue = 0;
+    zero(&rx->rx_stats, sizeof(rx->rx_stats));
+    gve_rx_dqo_init(rx);
+
+    rx_buf_cursor = rx_compl_cursor = 0;
+    rx_compl_gen = 1;
+}
+
+/* Device consumes the next posted buffer and writes a completion for it. */
+static void dqo_dev_rx_complete(gve_rx_dqo_queue rx, u16 len, boolean eop,
+                                boolean err)
+{
+    u16 buf_id = rx->buf_ring[rx_buf_cursor & rx->mask].buf_id;
+    rx_buf_cursor++;
+    u32 slot = rx_compl_cursor & rx->mask;
+    struct gve_rx_compl_desc_dqo *c = &rx->compl_ring[slot];
+    c->buf_id   = buf_id;
+    c->err_flags = err ? GVE_DQO_RX_ERR : 0;
+    c->status0  = eop ? GVE_DQO_RX_EOP : 0;
+    write_barrier();
+    c->pkt_len_gen = (u16)(len & GVE_DQO_RX_PKT_LEN_MASK) |
+                     (rx_compl_gen ? GVE_DQO_RX_GEN : 0);
+    rx_compl_cursor++;
+    if ((rx_compl_cursor & rx->mask) == 0)
+        rx_compl_gen ^= 1;
+}
+
+/* Free every pbuf the queue still holds (posted buffers + partial chain). */
+static void free_rx_dqo(gve_rx_dqo_queue rx)
+{
+    if (rx->ctx_head) { pbuf_free(rx->ctx_head); rx->ctx_head = NULL; }
+    for (u32 i = 0; i < rx->num_bufs; i++)
+        if (rx->pbufs[i]) { pbuf_free(rx->pbufs[i]); rx->pbufs[i] = NULL; }
+}
+
+static void run_rx_service(gve_rx_dqo_queue rx)
+{
+    apply((thunk)&rx->service);
+}
+
+/* Scenario 3: RX single-buffer packet delivered in order. */
+static void scenario_rx_inorder(void)
+{
+    rprintf("scenario_rx_inorder\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo(adapter, rx, 256);
+    int delivered_before = rx_delivered;
+
+    gve_rx_dqo_fill(rx);
+    CHECK(rx->buf_head > 0, "fill posted buffers, got %d", rx->buf_head);
+    u16 first_buf = rx->buf_ring[0].buf_id;
+    CHECK(rx->pbufs[first_buf] != NULL, "posted buffer has a pbuf");
+
+    dqo_dev_rx_complete(rx, 100, true, false);
+    run_rx_service(rx);
+
+    CHECK(rx_delivered == delivered_before + 1, "one packet delivered");
+    CHECK(rx->compl_head == 1, "compl_head advanced past the completion");
+    CHECK(rx->ctx_head == NULL, "no partial chain left");
+
+    free_rx_dqo(rx);
+}
+
+/* Scenario 4: RX multi-buffer packet (chain) delivered once at EOP. */
+static void scenario_rx_chain(void)
+{
+    rprintf("scenario_rx_chain\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo(adapter, rx, 256);
+    int delivered_before = rx_delivered;
+
+    gve_rx_dqo_fill(rx);
+    dqo_dev_rx_complete(rx, 1400, false, false);  /* fragment 1, !EOP */
+    dqo_dev_rx_complete(rx, 600,  true,  false);  /* fragment 2, EOP  */
+    run_rx_service(rx);
+
+    CHECK(rx_delivered == delivered_before + 1,
+          "a 2-buffer packet is delivered exactly once");
+    CHECK(rx->ctx_head == NULL, "chain fully delivered, no partial left");
+    free_rx_dqo(rx);
+}
+
+/* Scenario 5: an error mid-chain drops to end-of-packet, and the next
+ * packet is delivered cleanly (no corrupt frame from the chain tail). */
+static void scenario_rx_drop_eop(void)
+{
+    rprintf("scenario_rx_drop_eop\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo(adapter, rx, 256);
+    int delivered_before = rx_delivered;
+
+    gve_rx_dqo_fill(rx);
+    dqo_dev_rx_complete(rx, 1400, false, true);   /* frag 1: error, !EOP */
+    dqo_dev_rx_complete(rx, 600,  true,  false);  /* frag 2: EOP (tail)  */
+    dqo_dev_rx_complete(rx, 100,  true,  false);  /* a fresh clean packet */
+    run_rx_service(rx);
+
+    CHECK(rx_delivered == delivered_before + 1,
+          "only the clean packet is delivered, the dropped chain tail is not");
+    CHECK(rx->drop_pkt == false, "drop state cleared at the chain's EOP");
+    CHECK(rx->rx_stats.rx_dropped >= 1, "the errored packet was counted dropped");
+    free_rx_dqo(rx);
+}
+
+/* Scenario 6: tag-pool / ring-cursor wrap.  Send many packets, completing
+ * each before the next, so head/compl_head/tags_ntu all wrap repeatedly;
+ * assert every packet retires cleanly and no completion is ever rejected. */
+static void scenario_tx_wrap(void)
+{
+    rprintf("scenario_tx_wrap\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+    int live_before = pbufs_live;
+    int free0 = (int)(tx->tags_ntc - tx->tags_ntu);
+
+    const int N = 4000;          /* >> ring size: forces many wraps */
+    for (int i = 0; i < N; i++) {
+        struct pbuf *p = make_pkt(64);
+        u16 tag = send_pkt(tx, adapter, p);
+        dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+        pbuf_free(p);            /* lwIP releases its ref */
+    }
+    CHECK(tx->tx_stats.bad_compl_tag == 0, "no completion ever rejected");
+    CHECK(tx->tx_stats.cnt == (u64)N, "all %d packets accounted", N);
+    CHECK((int)(tx->tags_ntc - tx->tags_ntu) == free0, "tag pool fully returned");
+    CHECK(tx->head == tx->desc_tail, "ring fully drained (head == desc_tail)");
+    CHECK(pbufs_live == live_before, "no pbuf leak across the wrap");
+}
+
+/* Build a pbuf chain of nsegs segments. */
+static struct pbuf *make_chain(int nsegs, u16 seglen)
+{
+    struct pbuf *head = NULL, *tail = NULL;
+    for (int i = 0; i < nsegs; i++) {
+        struct pbuf *p = pbuf_alloc(PBUF_RAW, seglen, PBUF_RAM);
+        p->tot_len = (u16)(seglen * nsegs);
+        if (!head) head = p; else tail->next = p;
+        tail = p;
+    }
+    return head;
+}
+
+/* Scenario 7: a packet with more than GVE_TX_MAX_DATA_DESCS segments is
+ * dropped (consumed) rather than wedging the queue. */
+static void scenario_tx_drop_oversize(void)
+{
+    rprintf("scenario_tx_drop_oversize\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+    int live_before = pbufs_live;
+    int free0 = (int)(tx->tags_ntc - tx->tags_ntu);
+
+    struct pbuf *p = make_chain(GVE_TX_MAX_DATA_DESCS + 1, 64);
+    err_t e = gve_linkoutput_dqo(&adapter->ndev.n, p);
+
+    CHECK(e == ERR_OK, "linkoutput accepts then drops, returns OK");
+    CHECK(tx->head == 0, "no descriptors written for the dropped packet");
+    CHECK((int)(tx->tags_ntc - tx->tags_ntu) == free0, "no tag consumed");
+    CHECK(tx->running == true, "queue not wedged");
+    CHECK(p->ref == 1, "driver released its ref on the dropped packet");
+
+    pbuf_free(p);
+    CHECK(pbufs_live == live_before, "dropped packet fully freed");
+}
+
+/* Scenario 8: RX fill tolerates a pbuf allocation failure (partial fill,
+ * no crash, the failure is counted) and recovers on the next fill. */
+static void scenario_rx_alloc_fail(void)
+{
+    rprintf("scenario_rx_alloc_fail\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo(adapter, rx, 256);
+
+    pbuf_alloc_fail_after = 5;        /* 5 succeed, then alloc fails */
+    gve_rx_dqo_fill(rx);
+    pbuf_alloc_fail_after = -1;       /* recover */
+
+    CHECK(rx->buf_head == 5, "fill stopped at the alloc failure (5), got %d",
+          rx->buf_head);
+    CHECK(rx->rx_stats.refil_partial >= 1, "partial refill counted");
+
+    gve_rx_dqo_fill(rx);             /* recovers, posts more */
+    CHECK(rx->buf_head > 5, "fill resumes after allocations recover");
+    free_rx_dqo(rx);
+}
+
+/* Scenario 9: DQO-QPL TX bounces the payload into a registered slot, frees
+ * the pbuf inline, and returns the slot on completion. */
+static void scenario_tx_qpl(void)
+{
+    rprintf("scenario_tx_qpl\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo_mode(adapter, tx, 256, true);
+    int live_before = pbufs_live;
+    u32 slots_before = tx->qpl_free_slots;
+
+    struct pbuf *p = make_pkt(128);
+    /* fill the payload with a known pattern to verify the bounce copy */
+    for (int i = 0; i < 128; i++) ((u8 *)p->payload)[i] = (u8)(i + 1);
+
+    u16 tag = send_pkt(tx, adapter, p);
+    CHECK(p->ref == 1, "QPL frees the driver's ref inline (1 left), got %d", p->ref);
+    CHECK(tx->qpl_free_slots == slots_before - 1, "one bounce slot taken");
+    CHECK(tx->tag_qpl_n[tag] == 1, "one slot recorded for the tag");
+    u16 sid = tx->tag_qpl_slots[tag][0];
+    u8 *bounce = (u8 *)tx->qpl_base + (u64)sid * GVE_DQO_BUF_SIZE;
+    boolean copied = true;
+    for (int i = 0; i < 128; i++) if (bounce[i] != (u8)(i + 1)) copied = false;
+    CHECK(copied, "payload bounce-copied into the QPL slot");
+
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+    CHECK(tx->qpl_free_slots == slots_before, "bounce slot returned on completion");
+    CHECK(tx->tag_qpl_n[tag] == 0, "slot record cleared");
+
+    pbuf_free(p);
+    CHECK(pbufs_live == live_before, "no pbuf leak (QPL)");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -353,6 +642,13 @@ int main(int argc, char **argv)
 
     scenario_tx_inorder();
     scenario_tx_miss_reinject();
+    scenario_rx_inorder();
+    scenario_rx_chain();
+    scenario_rx_drop_eop();
+    scenario_tx_wrap();
+    scenario_tx_drop_oversize();
+    scenario_rx_alloc_fail();
+    scenario_tx_qpl();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
