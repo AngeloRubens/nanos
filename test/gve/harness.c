@@ -39,6 +39,7 @@ heap heap_linear_backed(kernel_heaps kh) { return gh; }
 int total_processors = 1;
 static struct harness_cpu the_cpu = { .id = 0 };
 cpuinfo current_cpu(void) { return &the_cpu; }
+static void set_cpu(u32 id) { the_cpu.id = id; }
 
 /* Deferred work: run synchronously (single-threaded harness). */
 void async_apply(thunk t)    { apply(t); }
@@ -164,6 +165,8 @@ static u32  g_evt_cnt;                 /* adminq event counter */
 static u32  g_max_tx = 8, g_max_rx = 8;
 static u16  g_desc_opts[8];           /* device options to advertise */
 static int  g_desc_nopts;
+static u32  g_rss_lut[128];           /* captured from CONFIGURE_RSS */
+static u16  g_rss_lut_size;
 
 /* Process one admin-queue command: build any response the driver reads back,
  * then mark it passed.  Enough commands are handled to drive the full
@@ -210,8 +213,16 @@ static void adminq_process(struct gve_adminq_command *cmd)
         q->counter_index = htobe32(8 + qid);
         break;
     }
+    case GVE_ADMINQ_CONFIGURE_RSS: {
+        u32 *lut = pointer_from_u64(be64toh(cmd->configure_rss.hash_lut_addr));
+        u16 n = be16toh(cmd->configure_rss.hash_lut_size);
+        g_rss_lut_size = n;
+        for (u16 i = 0; i < n && i < 128; i++)
+            g_rss_lut[i] = be32toh(lut[i]);
+        break;
+    }
     default:
-        break;   /* verify / cfg-resources / ptype / rss / page-list / destroy */
+        break;   /* verify / cfg-resources / ptype / page-list / destroy */
     }
     cmd->status = htobe32(GVE_ADMINQ_COMMAND_PASSED);
 }
@@ -1428,6 +1439,89 @@ static void scenario_lifecycle_gqi_qpl(void)
     total_processors = saved_tp;
 }
 
+/* complete and retire every outstanding single-segment packet on a DQO TX
+ * queue (re-points the device completion ring at this queue first). */
+static void drain_tx_dqo_all(gve_tx_dqo_queue tx)
+{
+    the_dev.tx_compl = tx->compl;
+    the_dev.tx_compl_mask = tx->mask;
+    the_dev.tx_compl_tail = tx->compl_head;
+    the_dev.tx_compl_gen = tx->expected_gen;
+    while (tx->desc_tail != tx->head) {
+        u16 tag = tx->desc[(tx->desc_tail + 1) & tx->mask].compl_tag;
+        dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+    }
+}
+
+/* Scenario 26: per-CPU TX queue dispatch — a packet from CPU n goes to
+ * queue n % num_queues, and the queues stay independent (own tags). */
+static void scenario_multiqueue_dispatch(void)
+{
+    rprintf("scenario_multiqueue_dispatch\n");
+    gve adapter = make_adapter();
+    adapter->num_queues = 4;
+    for (int q = 0; q < 4; q++)
+        make_tx_dqo(adapter, &adapter->tx_dqo[q], 256);
+    int live_before = pbufs_live;
+
+    struct pbuf *kept[8];
+    for (int cpu = 0; cpu < 8; cpu++) {
+        set_cpu(cpu);
+        struct pbuf *p = make_pkt(64);
+        kept[cpu] = p;
+        u32 q = cpu % 4;
+        u32 head_before = adapter->tx_dqo[q].head;
+        gve_linkoutput_dqo(&adapter->ndev.n, p);
+        CHECK(adapter->tx_dqo[q].head == head_before + 2,
+              "cpu %d -> queue %d (head advanced)", cpu, q);
+    }
+    set_cpu(0);
+    for (int q = 0; q < 4; q++)
+        CHECK(adapter->tx_dqo[q].head == 4,
+              "queue %d received exactly 2 packets, got %d",
+              q, adapter->tx_dqo[q].head);
+    /* isolation: each queue used its own tag pool (tags 0 and 1) */
+    for (int q = 0; q < 4; q++)
+        CHECK(adapter->tx_dqo[q].tags_ntu == 2, "queue %d took 2 tags", q);
+
+    for (int q = 0; q < 4; q++)
+        drain_tx_dqo_all(&adapter->tx_dqo[q]);
+    for (int cpu = 0; cpu < 8; cpu++)
+        pbuf_free(kept[cpu]);
+    CHECK(pbufs_live == live_before, "no leak across queues");
+}
+
+/* Scenario 27: the RSS indirection table is built round-robin over the RX
+ * queues (the driver's contribution to multi-queue RX; the device's actual
+ * Toeplitz steering is a hardware behaviour, measured on real GCP HW). */
+static void scenario_multiqueue_rss(void)
+{
+    rprintf("scenario_multiqueue_rss\n");
+    gve adapter = make_adapter_common();
+    adapter->contiguous = gh;
+    adapter->num_queues = 6;
+    adapter->rss_supported = true;
+    adapter->adminq = allocate(gh, PAGESIZE);
+    adapter->adminq_mask = PAGESIZE / sizeof(struct gve_adminq_command) - 1;
+    adapter->adminq_head = 0;
+    adapter->adminq_running = true;
+    adapter->reg_bar.vaddr = pointer_from_u64(0x1000);
+    g_reg_bar = &adapter->reg_bar;
+    g_adminq = adapter->adminq;
+    g_adminq_mask = adapter->adminq_mask;
+    g_evt_cnt = 0;
+    g_rss_lut_size = 0;
+
+    boolean ok = gve_configure_rss(adapter);
+    CHECK(ok, "configure_rss succeeded");
+    CHECK(g_rss_lut_size == GVE_RSS_INDIR_SIZE, "LUT size %d", GVE_RSS_INDIR_SIZE);
+    boolean roundrobin = true;
+    for (int i = 0; i < g_rss_lut_size; i++)
+        if (g_rss_lut[i] != (u32)(i % 6)) roundrobin = false;
+    CHECK(roundrobin, "LUT spreads round-robin over the 6 RX queues");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -1459,6 +1553,8 @@ int main(int argc, char **argv)
     scenario_dqo_tx_backpressure();
     scenario_lifecycle();
     scenario_lifecycle_gqi_qpl();
+    scenario_multiqueue_dispatch();
+    scenario_multiqueue_rss();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
