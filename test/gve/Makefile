@@ -29,7 +29,12 @@ SRCS := harness.c $(ROOT)/src/gcp/gve/gve_datapath.c \
 	$(ROOT)/src/gcp/gve/gve_adminq.c $(ROOT)/src/gcp/gve/gve_main.c \
 	$(RUNTIME_SRCS)
 
-gve_harness: closure_templates.h $(SRCS)
+# Header dependencies: the shim headers (incl. shim/lock.h) and the driver's
+# gve_priv.h/gve.h are #included, not in SRCS, so list them so edits trigger
+# a rebuild.
+DEPS := $(wildcard shim/*.h) $(wildcard $(ROOT)/src/gcp/gve/*.h)
+
+gve_harness: closure_templates.h $(SRCS) $(DEPS)
 	gcc $(CFLAGS) $(SRCS) -lpthread -o $@
 
 # Sanitizer build: AddressSanitizer + UBSan, an independent check of the
@@ -40,7 +45,7 @@ gve_harness: closure_templates.h $(SRCS)
 # allocated from the page-backed contiguous heap (page-aligned); the host
 # harness backs every heap with the general mcache, which is not 64-byte
 # aligned, so UBSan's alignment check is a harness artifact, not a driver bug.
-gve_harness_san: closure_templates.h $(SRCS)
+gve_harness_san: closure_templates.h $(SRCS) $(DEPS)
 	gcc -O1 -g -std=gnu11 -fsanitize=address,undefined -fno-sanitize=alignment \
 		-fno-omit-frame-pointer $(INC) $(SRCS) -lpthread -o $@
 
@@ -48,7 +53,7 @@ gve_harness_san: closure_templates.h $(SRCS)
 # + ThreadSanitizer, driving the driver's locked state from multiple threads.
 # Confirms ring_mtx / service_lock actually serialise it; the lock-free
 # runtime queue's internals are suppressed (see tsan.supp).
-gve_harness_tsan: closure_templates.h $(SRCS)
+gve_harness_tsan: closure_templates.h $(SRCS) $(DEPS)
 	gcc -O1 -g -std=gnu11 -DGVE_HARNESS_SMP -fsanitize=thread \
 		-fno-omit-frame-pointer $(INC) $(SRCS) -lpthread -o $@
 
