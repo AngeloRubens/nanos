@@ -32,15 +32,30 @@ SRCS := harness.c $(ROOT)/src/gcp/gve/gve_datapath.c \
 gve_harness: closure_templates.h $(SRCS)
 	gcc $(CFLAGS) $(SRCS) -lpthread -o $@
 
+# Sanitizer build: AddressSanitizer + UBSan, an independent check of the
+# memory/UB behaviour the functional assertions do not cover (use-after-free,
+# overflow, bad frees across the ref-ownership and fuzzer paths).
+# -fno-sanitize=alignment: the only over-aligned type is struct gve_irq_db
+# (aligned(64), "device expects 64-byte alignment").  On hardware it is
+# allocated from the page-backed contiguous heap (page-aligned); the host
+# harness backs every heap with the general mcache, which is not 64-byte
+# aligned, so UBSan's alignment check is a harness artifact, not a driver bug.
+gve_harness_san: closure_templates.h $(SRCS)
+	gcc -O1 -g -std=gnu11 -fsanitize=address,undefined -fno-sanitize=alignment \
+		-fno-omit-frame-pointer $(INC) $(SRCS) -lpthread -o $@
+
 closure_templates.h: $(CONTGEN)
 	$(CONTGEN) 10 10 > $@
 
 $(CONTGEN):
 	$(MAKE) -C $(ROOT)/tools contgen
 
-.PHONY: run clean
+.PHONY: run sanitize clean
 run: gve_harness
 	./gve_harness
 
+sanitize: gve_harness_san
+	ASAN_OPTIONS=detect_leaks=0 ./gve_harness_san
+
 clean:
-	rm -f gve_harness closure_templates.h
+	rm -f gve_harness gve_harness_san closure_templates.h

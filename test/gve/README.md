@@ -87,6 +87,17 @@ gve_adminq.c 96%, gve_main.c 99%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 
+`make -C test/gve sanitize` builds and runs the suite under
+AddressSanitizer + UBSan — an independent check of the memory and
+undefined-behaviour properties the functional assertions do not cover
+(use-after-free, buffer overflow, bad frees) across the ref-ownership,
+wrap-stress and out-of-order fuzzer paths.  It runs clean.  The build passes
+`-fno-sanitize=alignment`: the only over-aligned type is struct gve_irq_db
+(aligned(64) — "device expects 64-byte alignment"), which on hardware comes
+from the page-backed contiguous heap; the host harness backs every heap with
+the general mcache (not 64-byte aligned), so that one UBSan check is a harness
+artifact, not a driver bug.
+
 What the harness cannot test (hardware behaviour): whether the device
 actually steers RX flows across queues per the RSS table — that is Toeplitz
 hashing in the NIC, and is the open question (#2165) answered only by
