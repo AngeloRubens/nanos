@@ -24,7 +24,7 @@ driver, not a copy.
 
 ## Coverage
 
-36 scenarios (214 checks) exercise every queue format in both directions
+42 scenarios (244 checks) exercise every queue format in both directions
 (GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
 backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
 and drop-to-EOP, an out-of-order completion fuzzer, the device-option
@@ -41,9 +41,16 @@ vectors, mgmt/RX MSI-X setup failure with interrupt teardown, queue-create
 failure through the deinit-interrupts path, and a device-requested reset
 caught during bring-up), and every watchdog branch (per-tick TX wakeup and
 RX empty-ring kicks, the GQI stuck-TX and no-interrupt resets, the DQO
-miss-reinject timeout and no-interrupt resets, all with recovery).
+miss-reinject timeout and no-interrupt resets, all with recovery), the TX
+hot-path edges (stale alt-miss/miss/reinject completion tags, the mid-batch
+doorbell write when more than GVE_TX_DOORBELL_BATCH packets drain in one
+pass, and linkoutput returning ERR_MEM on a full software queue), and the RX
+error/drop branches (DQO-RDA bad_req_id, errored continuation freeing a
+partial chain, zero-length and stack-rejected packets; GQI runt buffers and
+continuation-alloc failures; DQO-QPL drop-to-EOP recycle and copy-out alloc
+failure).
 
-Measured line coverage (gcov): gve_dqo.c 87%, gve_datapath.c 82%,
+Measured line coverage (gcov): gve_dqo.c 97%, gve_datapath.c 89%,
 gve_adminq.c 80%, gve_main.c 93%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.

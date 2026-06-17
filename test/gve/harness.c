@@ -156,9 +156,12 @@ u16  net_get_napi_id(u8 netif_num, u16 queue_idx) { return queue_idx + 1; }
 
 static int rx_delivered;        /* packets handed to net_if->input */
 static int g_input_hold;        /* 1 = lwIP keeps the pbuf (models a held ref) */
+static int g_input_err;         /* 1 = input returns !=ERR_OK (driver frees) */
 static err_t harness_input(struct pbuf *p, struct netif *inp)
 {
     rx_delivered++;
+    if (g_input_err)
+        return ERR_MEM;         /* the stack rejects it; the driver frees p */
     if (!g_input_hold)
         pbuf_free(p);           /* the stack consumes it */
     return ERR_OK;
@@ -1978,6 +1981,248 @@ static void scenario_watchdog_branches(void)
     total_processors = saved_tp;
 }
 
+/* Scenario 37: DQO TX completions whose tag is not in flight — the
+ * alternate-miss, MISS and REINJECT encodings each count a bad tag and are
+ * skipped without a reset (the trust-line fix; the PKT-stale encoding is
+ * covered by scenario_tx_stale_tag). */
+static void scenario_tx_stale_types(void)
+{
+    rprintf("scenario_tx_stale_types\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+    u64 reset_before = (adapter->flags >> GVE_FLAG_RESETTING) & 1;
+    u16 free_tag = 200;                /* nothing was ever sent on this tag */
+
+    dqo_dev_complete_pkt(&the_dev, free_tag | GVE_DQO_ALT_MISS_COMPL_BIT,
+                         GVE_DQO_COMPL_TYPE_PKT);     /* alt-miss, stale */
+    dqo_dev_complete_pkt(&the_dev, free_tag, GVE_DQO_COMPL_TYPE_MISS);
+    dqo_dev_complete_pkt(&the_dev, free_tag, GVE_DQO_COMPL_TYPE_REINJECT);
+    run_cleanup(tx);
+
+    CHECK(tx->tx_stats.bad_compl_tag == 3, "three stale-type tags counted");
+    CHECK(tx->compl_head == 3, "ring cursor advanced past all three");
+    CHECK(((adapter->flags >> GVE_FLAG_RESETTING) & 1) == reset_before,
+          "no reset for stale alt-miss/miss/reinject completions");
+}
+
+/* Scenario 38: more than GVE_TX_DOORBELL_BATCH packets drained in one pass
+ * cross the mid-batch doorbell write (then the tail doorbell), for both DQO
+ * and GQI. */
+static void scenario_tx_doorbell_batch(void)
+{
+    rprintf("scenario_tx_doorbell_batch\n");
+    const int N = GVE_TX_DOORBELL_BATCH + 1;   /* 65: forces a mid-batch ring */
+
+    /* DQO-RDA. */
+    {
+        gve adapter = make_adapter();
+        gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+        make_tx_dqo(adapter, tx, 256);
+        int live_before = pbufs_live;
+        struct pbuf *pkts[N];
+        for (int i = 0; i < N; i++) {
+            pkts[i] = make_pkt(64);
+            pbuf_ref(pkts[i]);              /* the ref linkoutput would take */
+            enqueue(tx->br, pkts[i]);
+        }
+        apply((thunk)&tx->enqueue_task);   /* one drain of all N packets */
+        CHECK(tx->tx_stats.doorbells >= 2, "DQO drain rang a mid-batch + tail doorbell");
+        CHECK(tx->tx_stats.cnt == (u64)N, "DQO drained all %d packets", N);
+        for (u16 t = 0; t <= tx->mask; t++)
+            if (tx->seg_counts[t])
+                dqo_dev_complete_pkt(&the_dev, t, GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+        for (int i = 0; i < N; i++)
+            pbuf_free(pkts[i]);
+        CHECK(pbufs_live == live_before, "DQO batch: no pbuf leak");
+    }
+
+    /* GQI-RDA. */
+    {
+        gve adapter = make_adapter_gqi(true);
+        gve_tx_queue tx = &adapter->tx[0];
+        make_tx_gqi(adapter, tx, 256);
+        gve_setup_linkoutput(adapter, &adapter->ndev.n);
+        int live_before = pbufs_live;
+        struct pbuf *pkts[N];
+        for (int i = 0; i < N; i++) {
+            pkts[i] = make_pkt(64);
+            pbuf_ref(pkts[i]);
+            enqueue(tx->br, pkts[i]);
+        }
+        apply((thunk)&tx->enqueue_task);
+        CHECK(tx->tx_stats.doorbells >= 2, "GQI drain rang a mid-batch + tail doorbell");
+        CHECK(tx->tx_stats.cnt == (u64)N, "GQI drained all %d packets", N);
+        gqi_dev_tx_complete_all(adapter, tx);
+        run_tx_gqi_cleanup(tx);
+        for (int i = 0; i < N; i++)
+            pbuf_free(pkts[i]);
+        CHECK(pbufs_live == live_before, "GQI batch: no pbuf leak");
+    }
+}
+
+/* Scenario 39: linkoutput on a full software TX queue returns ERR_MEM and
+ * drops the reference it took (lwIP keeps owning the pbuf), for both DQO
+ * and GQI. */
+static void scenario_tx_enqueue_full(void)
+{
+    rprintf("scenario_tx_enqueue_full\n");
+
+    /* DQO. */
+    {
+        gve adapter = make_adapter();
+        gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+        make_tx_dqo(adapter, tx, 256);
+        int live_before = pbufs_live;
+        while (enqueue(tx->br, (void *)tx)) ;   /* fill to capacity */
+        struct pbuf *p = make_pkt(100);
+        err_t r = gve_linkoutput_dqo(&adapter->ndev.n, p);
+        CHECK(r == ERR_MEM, "DQO linkoutput on a full queue returns ERR_MEM");
+        CHECK(p->ref == 1, "DQO linkoutput dropped its own ref on failure");
+        pbuf_free(p);
+        CHECK(pbufs_live == live_before, "DQO enqueue-full: no pbuf leak");
+    }
+
+    /* GQI. */
+    {
+        gve adapter = make_adapter_gqi(true);
+        gve_tx_queue tx = &adapter->tx[0];
+        make_tx_gqi(adapter, tx, 256);
+        gve_setup_linkoutput(adapter, &adapter->ndev.n);
+        int live_before = pbufs_live;
+        while (enqueue(tx->br, (void *)tx)) ;
+        struct pbuf *p = make_pkt(100);
+        err_t r = adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+        CHECK(r == ERR_MEM, "GQI linkoutput on a full queue returns ERR_MEM");
+        CHECK(p->ref == 1, "GQI linkoutput dropped its own ref on failure");
+        pbuf_free(p);
+        CHECK(pbufs_live == live_before, "GQI enqueue-full: no pbuf leak");
+    }
+}
+
+/* Scenario 40: DQO-RDA RX edge cases — a completion for an unposted buffer
+ * (bad_req_id), an error on the second fragment of a started chain (frees
+ * the partial chain), a zero-length packet (freed at EOP), and a packet the
+ * stack rejects (driver frees it). */
+static void scenario_rx_dqo_edge(void)
+{
+    rprintf("scenario_rx_dqo_edge\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo(adapter, rx, 256);
+    int delivered_before = rx_delivered;
+    gve_rx_dqo_fill(rx);
+
+    /* spurious completion: drop the posted pbuf so the slot looks unposted. */
+    u16 bid = rx->buf_ring[rx_buf_cursor & rx->mask].buf_id;
+    struct pbuf *lost = rx->pbufs[bid];
+    rx->pbufs[bid] = NULL;
+    pbuf_free(lost);
+    dqo_dev_rx_complete(rx, 100, true, false);
+    run_rx_service(rx);
+    CHECK(rx->rx_stats.bad_req_id == 1, "unposted buffer counted bad_req_id");
+
+    /* good fragment then an error fragment: the partial chain is freed. */
+    dqo_dev_rx_complete(rx, 1400, false, false);   /* frag 1: ctx_head set */
+    dqo_dev_rx_complete(rx, 600,  true,  true);    /* frag 2: error at EOP */
+    run_rx_service(rx);
+    CHECK(rx->ctx_head == NULL, "errored chain tail freed the partial packet");
+    CHECK(rx->rx_stats.rx_dropped >= 1, "errored chain counted dropped");
+
+    /* zero-length packet: delivered path frees it (tot_len == 0). */
+    int dropped_at = rx_delivered;
+    dqo_dev_rx_complete(rx, 0, true, false);
+    run_rx_service(rx);
+    CHECK(rx_delivered == dropped_at, "zero-length packet not handed to input");
+
+    /* a packet the stack rejects: the driver frees it. */
+    int live_before = pbufs_live;
+    g_input_err = 1;
+    dqo_dev_rx_complete(rx, 120, true, false);
+    run_rx_service(rx);
+    g_input_err = 0;
+    CHECK(rx_delivered == dropped_at + 1, "rejected packet still reached input once");
+    CHECK(pbufs_live <= live_before, "driver freed the rejected packet");
+
+    free_rx_dqo(rx);
+}
+
+/* Scenario 41: GQI RX edge cases — an error on a started chain (frees the
+ * partial), a runt buffer (length <= pad) dropped, a multi-buffer packet
+ * whose continuation allocation fails, and a packet the stack rejects. */
+static void scenario_rx_gqi_edge(void)
+{
+    rprintf("scenario_rx_gqi_edge\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+
+    /* good first fragment then an error continuation: partial chain freed. */
+    gqi_dev_rx_complete(rx, 1400, GVE_RXF_PKT_CONT);     /* frag 1 -> ctx_head */
+    gqi_dev_rx_complete(rx, 600,  GVE_RXF_ERR);          /* frag 2: error EOP */
+    apply((thunk)&rx->service);
+    CHECK(rx->ctx_head == NULL, "GQI errored continuation freed the partial");
+
+    /* runt buffer: length <= pad is dropped. */
+    u64 dropped0 = rx->rx_stats.rx_dropped;
+    gqi_dev_rx_complete(rx, 0, 0);                       /* len = pad only */
+    apply((thunk)&rx->service);
+    CHECK(rx->rx_stats.rx_dropped > dropped0, "runt buffer (<= pad) dropped");
+
+    /* multi-buffer packet whose continuation pbuf_alloc fails. */
+    u64 dropped1 = rx->rx_stats.rx_dropped;
+    gqi_dev_rx_complete(rx, 1400, GVE_RXF_PKT_CONT);     /* frag 1 */
+    gqi_dev_rx_complete(rx, 600,  0);                    /* frag 2 (final) */
+    pbuf_alloc_fail_after = 1;          /* frag 1 copy ok, frag 2 fails */
+    apply((thunk)&rx->service);
+    pbuf_alloc_fail_after = -1;
+    CHECK(rx->rx_stats.rx_dropped > dropped1, "chain dropped on continuation alloc fail");
+    CHECK(rx->ctx_head == NULL, "no partial chain left after alloc fail");
+
+    /* a packet the stack rejects: the driver frees it. */
+    int delivered_at = rx_delivered;
+    g_input_err = 1;
+    gqi_dev_rx_complete(rx, 120, 0);
+    apply((thunk)&rx->service);
+    g_input_err = 0;
+    CHECK(rx_delivered == delivered_at + 1, "rejected GQI packet reached input once");
+}
+
+/* Scenario 42: DQO-QPL RX drop paths — an error fragment recycles its slot
+ * and arms drop-to-EOP (whose subsequent buffers take the QPL recycle
+ * branch), and a continuation whose copy-out allocation fails frees the
+ * partial chain. */
+static void scenario_rx_dqo_qpl_edge(void)
+{
+    rprintf("scenario_rx_dqo_qpl_edge\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo_mode(adapter, rx, 256, true);    /* DQO-QPL */
+    int delivered_before = rx_delivered;
+    gve_rx_dqo_fill(rx);
+
+    /* error fragment (!EOP) drops and arms drop_pkt; the following buffer
+     * takes the QPL drop-recycle branch; EOP clears the drop. */
+    dqo_dev_rx_complete(rx, 1400, false, true);    /* frag 1: error, !EOP */
+    dqo_dev_rx_complete(rx, 600,  true,  false);   /* frag 2: recycled, EOP */
+    run_rx_service(rx);
+    CHECK(rx->drop_pkt == false, "QPL drop-to-EOP cleared at end of packet");
+    CHECK(rx->rx_stats.rx_dropped >= 1, "QPL error fragment counted dropped");
+
+    /* good fragment then a continuation whose copy-out alloc fails. */
+    u64 dropped1 = rx->rx_stats.rx_dropped;
+    dqo_dev_rx_complete(rx, 1400, false, false);   /* frag 1: copied, ctx_head */
+    dqo_dev_rx_complete(rx, 600,  true,  false);   /* frag 2: copy will fail */
+    pbuf_alloc_fail_after = 1;          /* frag 1 copy ok, frag 2 fails */
+    run_rx_service(rx);
+    pbuf_alloc_fail_after = -1;
+    CHECK(rx->rx_stats.rx_dropped > dropped1, "QPL continuation alloc fail dropped");
+    CHECK(rx->ctx_head == NULL, "QPL partial chain freed on alloc fail");
+
+    free_rx_dqo(rx);
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -2020,6 +2265,12 @@ int main(int argc, char **argv)
     scenario_setup_alloc_fail();
     scenario_setup_failpaths();
     scenario_watchdog_branches();
+    scenario_tx_stale_types();
+    scenario_tx_doorbell_batch();
+    scenario_tx_enqueue_full();
+    scenario_rx_dqo_edge();
+    scenario_rx_gqi_edge();
+    scenario_rx_dqo_qpl_edge();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
