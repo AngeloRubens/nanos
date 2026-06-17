@@ -192,6 +192,7 @@ static u32  g_evt_cnt;                 /* adminq event counter */
 static u32  g_max_tx = 8, g_max_rx = 8;
 static u16  g_desc_opts[8];           /* device options to advertise */
 static int  g_desc_nopts;
+static u32  g_adminq_fail_op;          /* opcode to fail (0 = none) */
 static u32  g_rss_lut[128];           /* captured from CONFIGURE_RSS */
 static u16  g_rss_lut_size;
 static u32  g_dev_status;             /* value returned for DEVICE_STATUS */
@@ -252,7 +253,10 @@ static void adminq_process(struct gve_adminq_command *cmd)
     default:
         break;   /* verify / cfg-resources / ptype / page-list / destroy */
     }
-    cmd->status = htobe32(GVE_ADMINQ_COMMAND_PASSED);
+    if (op == g_adminq_fail_op)
+        cmd->status = htobe32(GVE_ADMINQ_COMMAND_ERROR_ABORTED);
+    else
+        cmd->status = htobe32(GVE_ADMINQ_COMMAND_PASSED);
 }
 
 /* ---- lifecycle link/stub glue (only the full-lifecycle scenario uses it) ---- */
@@ -261,8 +265,17 @@ static pci_probe g_probe;            /* recorded by register_pci_driver */
 static struct netif *g_life_netif;   /* captured by netif_add */
 
 void register_pci_driver(pci_probe p, pci_remove remove) { g_probe = p; }
-int  pci_enable_msix(pci_dev dev) { return 64; }
-u64  pci_setup_msix_aff(pci_dev dev, int s, thunk h, sstring n, range a) { return 0; }
+static int g_msix_avail = 64;             /* vectors pci_enable_msix reports */
+int  pci_enable_msix(pci_dev dev) { return g_msix_avail; }
+static int g_msix_setup_fail_after = -1;  /* >=0: fail that many calls in */
+u64  pci_setup_msix_aff(pci_dev dev, int s, thunk h, sstring n, range a)
+{
+    if (g_msix_setup_fail_after == 0)
+        return INVALID_PHYSICAL;
+    if (g_msix_setup_fail_after > 0)
+        g_msix_setup_fail_after--;
+    return 0;
+}
 void pci_teardown_msix(pci_dev dev, int msi_slot) { }
 void pci_disable_msix(pci_dev dev) { }
 void pci_bar_deinit(struct pci_bar *b) { }
@@ -1691,6 +1704,12 @@ static void scenario_gqi_watchdog(void)
     u64 wd0 = adapter->dev_stats.wd_expired;
     apply((timer_handler)&adapter->watchdog_task, (u64)0, (u64)1);
     CHECK(adapter->dev_stats.wd_expired == wd0, "healthy GQI watchdog: no reset");
+
+    /* GQI RX interrupt trampoline: marks first_interrupt, runs the service. */
+    adapter->rx[0].first_interrupt = false;
+    apply((thunk)&adapter->rx[0].irq_handler);
+    CHECK(adapter->rx[0].first_interrupt, "GQI RX IRQ set first_interrupt");
+
     total_processors = saved_tp;
 }
 
@@ -1791,6 +1810,174 @@ static void scenario_setup_alloc_fail(void)
     total_processors = saved_tp;
 }
 
+/* Bring an adapter through probe (gve_init: describe) only, so the netif
+ * setup closure can be applied by hand with failures injected. */
+static gve bring_up_probe_only(u16 opt, int ncpu)
+{
+    g_desc_nopts = opt ? 1 : 0;
+    g_desc_opts[0] = opt;
+    g_max_tx = g_max_rx = 8;
+    g_msix = 64; g_msix_avail = 64; g_msix_setup_fail_after = -1;
+    total_processors = ncpu;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    init_gve((kernel_heaps)0);
+    apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    return g_life_netif->state;
+}
+
+/* Scenario 35b: gve_setup failure paths — cfg failure, interrupt-init
+ * failure (too few vectors, mgmt/RX MSI-X setup failure), queue setup
+ * failure (the err_intr deinit path), plus the success tail with the link
+ * up and a device-requested reset caught during bring-up. */
+static void scenario_setup_failpaths(void)
+{
+    rprintf("scenario_setup_failpaths\n");
+    int saved_tp = total_processors;
+    u32 saved_status = g_dev_status;
+
+    /* cfg fails: the device rejects CONFIGURE_DEVICE_RESOURCES (covers the
+     * cfg cleanup path that deallocates both arrays). */
+    gve a = bring_up_probe_only(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_adminq_fail_op = GVE_ADMINQ_CONFIGURE_DEVICE_RESOURCES;
+    CHECK(!apply((netif_dev_setup)&a->ndev.setup, (tuple)0),
+          "setup fails when the device rejects cfg-resources");
+    g_adminq_fail_op = 0;
+
+    /* too few MSI-X vectors. */
+    gve b = bring_up_probe_only(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_msix_avail = 2;                  /* need 2*nq+1 = 3 */
+    CHECK(!apply((netif_dev_setup)&b->ndev.setup, (tuple)0),
+          "setup fails with too few MSI-X vectors");
+    g_msix_avail = 64;
+
+    /* mgmt MSI-X setup fails (first pci_setup_msix call). */
+    gve c = bring_up_probe_only(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_msix_setup_fail_after = 0;
+    CHECK(!apply((netif_dev_setup)&c->ndev.setup, (tuple)0),
+          "setup fails when mgmt MSI-X setup fails");
+    g_msix_setup_fail_after = -1;
+
+    /* RX MSI-X setup fails (mgmt ok, first RX slot fails -> teardown). */
+    gve d = bring_up_probe_only(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_msix_setup_fail_after = 1;
+    CHECK(!apply((netif_dev_setup)&d->ndev.setup, (tuple)0),
+          "setup fails when RX MSI-X setup fails");
+    g_msix_setup_fail_after = -1;
+
+    /* queue setup fails after interrupts are up -> err_intr deinit path. */
+    gve e = bring_up_probe_only(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    e->contiguous = fail_heap(); e->general = fail_heap();
+    g_alloc_fail_after = 12;           /* cfg+ptype pass, queues fail */
+    CHECK(!apply((netif_dev_setup)&e->ndev.setup, (tuple)0),
+          "setup fails at queue creation (deinit interrupts path)");
+    g_alloc_fail_after = -1; e->contiguous = gh; e->general = gh;
+
+    /* success tail: link up and a device-requested reset during setup. */
+    gve f = bring_up_probe_only(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_dev_status = GVE_DEVICE_STATUS_LINK_STATUS | GVE_DEVICE_STATUS_RESET;
+    boolean ok = apply((netif_dev_setup)&f->ndev.setup, (tuple)0);
+    g_dev_status = saved_status;
+    CHECK(ok, "setup succeeds with link up + device-requested reset");
+    CHECK(f->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING),
+          "device-requested-reset-during-setup recovered");
+
+    total_processors = saved_tp;
+}
+
+/* Scenario 36: watchdog branches not reached by the healthy/stuck DQO
+ * cases — the per-tick TX wakeup and RX empty-ring kicks, the
+ * first_interrupt-seen reset, the GQI stuck-TX and no-interrupt resets, and
+ * the DQO miss-reinject timeout that frees the pbuf and resets. */
+static void scenario_watchdog_branches(void)
+{
+    rprintf("scenario_watchdog_branches\n");
+    int saved_tp = total_processors;
+    timestamp old = now(CLOCK_ID_MONOTONIC) -
+                    milliseconds(GVE_TX_WATCHDOG_MS + 1000);
+
+    /* DQO healthy tick: TX wakeup (full ring free, not running), RX
+     * empty-ring kick, and the first_interrupt-seen branch — no reset. */
+    gve a = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    gve_tx_dqo_queue atx = &a->tx_dqo[0];
+    gve_rx_dqo_queue arx = &a->rx_dqo[0];
+    atx->running = false; atx->stuck = false;
+    atx->head = atx->desc_tail = 0;
+    arx->first_interrupt = true;
+    arx->empty_rx_queue = 3;
+    u64 er0 = arx->rx_stats.empty_rx_ring, wd0 = a->dev_stats.wd_expired;
+    a->next_monitored_tx_qid = 0;
+    apply((timer_handler)&a->watchdog_task, (u64)0, (u64)1);
+    CHECK(a->dev_stats.wd_expired == wd0, "DQO healthy watchdog: no reset");
+    CHECK(arx->rx_stats.empty_rx_ring == er0 + 1, "DQO watchdog empty-ring kick");
+    CHECK(arx->empty_rx_queue == 0 && !arx->first_interrupt,
+          "DQO watchdog cleared empty/first-interrupt state");
+
+    /* GQI healthy tick: same wakeup + empty-ring branches. */
+    gve b = bring_up(0, 1);
+    gve_tx_queue btx = &b->tx[0];
+    gve_rx_queue brx = &b->rx[0];
+    btx->running = false; btx->stuck = false; btx->head = 0;
+    b->event_counters[btx->event_counter_idx] = htobe32(0);
+    brx->first_interrupt = true;
+    brx->empty_rx_queue = 3;
+    u64 ber0 = brx->rx_stats.empty_rx_ring, bwd0 = b->dev_stats.wd_expired;
+    b->next_monitored_tx_qid = 0;
+    apply((timer_handler)&b->watchdog_task, (u64)0, (u64)1);
+    CHECK(b->dev_stats.wd_expired == bwd0, "GQI healthy watchdog: no reset");
+    CHECK(brx->rx_stats.empty_rx_ring == ber0 + 1, "GQI watchdog empty-ring kick");
+
+    /* GQI stuck-TX over threshold -> reset. */
+    gve c = bring_up(0, 1);
+    gve_tx_queue ctx = &c->tx[0];
+    ctx->tail = 0; ctx->head = GVE_TX_STUCK_THRESHOLD + 2;
+    for (u32 i = 0; i < ctx->head; i++)
+        ctx->tx_timestamps[i & ctx->mask] = old;
+    u64 cwd0 = c->dev_stats.wd_expired;
+    c->next_monitored_tx_qid = 0;
+    apply((timer_handler)&c->watchdog_task, (u64)0, (u64)1);
+    CHECK(c->dev_stats.wd_expired == cwd0 + 1, "GQI stuck-TX threshold -> reset");
+
+    /* DQO miss-reinject timeout: a MISS that never got a REINJECT within
+     * the deadline frees the held pbuf and resets. */
+    gve d = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    gve_tx_dqo_queue dtx = &d->tx_dqo[0];
+    dtx->pending[3] = make_pkt(100);
+    dtx->miss_times[3] = old;
+    u64 dwd0 = d->dev_stats.wd_expired;
+    d->next_monitored_tx_qid = 0;
+    apply((timer_handler)&d->watchdog_task, (u64)0, (u64)1);
+    CHECK(d->dev_stats.wd_expired == dwd0 + 1, "DQO miss timeout -> reset");
+    CHECK(dtx->miss_times[3] == 0, "DQO watchdog cleared the timed-out miss");
+
+    /* DQO no-interrupt: ticking past GVE_MAX_NO_INTERRUPT_ITERATIONS with a
+     * non-empty CQ and no first_interrupt triggers a reset (and recovers). */
+    gve e = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    gve_rx_dqo_queue erx = &e->rx_dqo[0];
+    for (int t = 0; t <= GVE_MAX_NO_INTERRUPT_ITERATIONS; t++) {
+        erx->first_interrupt = false;
+        u32 slot = erx->compl_head & erx->mask;
+        erx->compl_ring[slot].pkt_len_gen = erx->expected_gen ? GVE_DQO_RX_GEN : 0;
+        e->next_monitored_tx_qid = 0;
+        apply((timer_handler)&e->watchdog_task, (u64)0, (u64)1);
+    }
+    CHECK(e->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING),
+          "DQO no-interrupt watchdog reset and recovered");
+
+    /* GQI no-interrupt: event counter past tail, no first_interrupt. */
+    gve f = bring_up(0, 1);
+    gve_rx_queue frx = &f->rx[0];
+    for (int t = 0; t <= GVE_MAX_NO_INTERRUPT_ITERATIONS; t++) {
+        frx->first_interrupt = false;
+        f->event_counters[frx->event_counter_idx] = htobe32(frx->tail + 1);
+        f->next_monitored_tx_qid = 0;
+        apply((timer_handler)&f->watchdog_task, (u64)0, (u64)1);
+    }
+    CHECK(f->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING),
+          "GQI no-interrupt watchdog reset and recovered");
+
+    total_processors = saved_tp;
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -1831,6 +2018,8 @@ int main(int argc, char **argv)
     scenario_gqi_watchdog();
     scenario_watchdog_detect();
     scenario_setup_alloc_fail();
+    scenario_setup_failpaths();
+    scenario_watchdog_branches();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

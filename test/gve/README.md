@@ -24,7 +24,7 @@ driver, not a copy.
 
 ## Coverage
 
-34 scenarios (196 checks) exercise every queue format in both directions
+36 scenarios (214 checks) exercise every queue format in both directions
 (GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
 backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
 and drop-to-EOP, an out-of-order completion fuzzer, the device-option
@@ -36,10 +36,15 @@ RSS indirection table), and — via a failing-heap wrapper that returns
 INVALID after a set number of allocations — the queue-create error cascades,
 the ring-size backoff (halve and retry down to GVE_MIN_RING_SIZE), and the
 failed-reset epilogue (DEVICE_RUNNING cleared, RESETTING/ONGOING_RESET left
-set).
+set), the gve_setup failure paths (cfg-resources rejected, too few MSI-X
+vectors, mgmt/RX MSI-X setup failure with interrupt teardown, queue-create
+failure through the deinit-interrupts path, and a device-requested reset
+caught during bring-up), and every watchdog branch (per-tick TX wakeup and
+RX empty-ring kicks, the GQI stuck-TX and no-interrupt resets, the DQO
+miss-reinject timeout and no-interrupt resets, all with recovery).
 
 Measured line coverage (gcov): gve_dqo.c 87%, gve_datapath.c 82%,
-gve_adminq.c 79%, gve_main.c 69%.  To measure: compile the four driver
+gve_adminq.c 80%, gve_main.c 93%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 
