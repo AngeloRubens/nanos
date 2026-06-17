@@ -24,23 +24,33 @@ driver, not a copy.
 
 ## Coverage
 
-27 scenarios exercise every queue format in both directions (GQI-QPL/RDA,
-DQO-RDA/QPL TX and RX), multi-segment packets, TX backpressure, the
-MISS/REINJECT tag pool and its edge encodings, RX chaining and drop-to-EOP,
-allocation-failure tolerance, an out-of-order completion fuzzer, the
-device-option negotiation / format fallback (via an admin-queue model), the
-full lifecycle — init_gve → probe → describe → setup → watchdog → reset —
-for both a DQO-RDA device and the GQI-QPL fallback, and the multi-queue
-driver logic: per-CPU TX queue dispatch with cross-queue isolation, and the
-round-robin RSS indirection table.
+34 scenarios (196 checks) exercise every queue format in both directions
+(GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
+backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
+and drop-to-EOP, an out-of-order completion fuzzer, the device-option
+negotiation / format fallback (via an admin-queue model), the full
+lifecycle — init_gve → probe → describe → setup → watchdog → reset — for
+both a DQO-RDA device and the GQI-QPL fallback, the multi-queue driver logic
+(per-CPU TX queue dispatch with cross-queue isolation, and the round-robin
+RSS indirection table), and — via a failing-heap wrapper that returns
+INVALID after a set number of allocations — the queue-create error cascades,
+the ring-size backoff (halve and retry down to GVE_MIN_RING_SIZE), and the
+failed-reset epilogue (DEVICE_RUNNING cleared, RESETTING/ONGOING_RESET left
+set).
+
+Measured line coverage (gcov): gve_dqo.c 87%, gve_datapath.c 82%,
+gve_adminq.c 79%, gve_main.c 69%.  To measure: compile the four driver
+files (gve_dqo.c is carried by harness.c via #include) and harness.c with
+`--coverage`, link, run, then `gcov -n` the objects.
 
 What the harness cannot test (hardware behaviour): whether the device
 actually steers RX flows across queues per the RSS table — that is Toeplitz
 hashing in the NIC, and is the open question (#2165) answered only by
 per-queue RX counters on real GCP hardware.
 
-Minor remaining gaps (datapath only): the GQI RX held-pbuf copy fallback,
-the GQI QPL byte-FIFO wrap, and the io-queues manifest cap.
+The remaining uncovered lines are mostly the deeper allocation-failure
+cleanup cascades that need failure injected at specific later allocation
+points, and msg_err diagnostics on those paths.
 
 ## Build & run
 

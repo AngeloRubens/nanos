@@ -36,6 +36,31 @@ static int  checks;
 heap heap_locked(kernel_heaps kh)        { return gh; }
 heap heap_linear_backed(kernel_heaps kh) { return gh; }
 
+/* Failing-heap wrapper: delegates to gh but returns INVALID after a set
+ * number of allocations, so the driver's alloc-failure cascades and the
+ * ring-size backoff can be exercised. */
+static int g_alloc_fail_after = -1;       /* -1 = never fail */
+static u64 failheap_alloc(struct heap *h, bytes b)
+{
+    if (g_alloc_fail_after == 0)
+        return INVALID_PHYSICAL;
+    if (g_alloc_fail_after > 0)
+        g_alloc_fail_after--;
+    return gh->alloc(gh, b);
+}
+static void failheap_dealloc(struct heap *h, u64 a, bytes b)
+{
+    gh->dealloc(gh, a, b);
+}
+static struct heap g_failheap;
+static heap fail_heap(void)
+{
+    g_failheap.alloc = failheap_alloc;
+    g_failheap.dealloc = failheap_dealloc;
+    g_failheap.pagesize = gh->pagesize;
+    return &g_failheap;
+}
+
 int total_processors = 1;
 static struct harness_cpu the_cpu = { .id = 0 };
 cpuinfo current_cpu(void) { return &the_cpu; }
@@ -1703,6 +1728,69 @@ static void scenario_watchdog_detect(void)
     total_processors = saved_tp;
 }
 
+/* Bring an adapter through probe (describe) + queue-count + cfg-resources,
+ * stopping BEFORE setup_queues so a failing heap can be injected there. */
+static gve bring_up_to_cfg(u16 opt, int ncpu)
+{
+    g_desc_nopts = opt ? 1 : 0;
+    g_desc_opts[0] = opt;
+    g_max_tx = g_max_rx = 8;
+    g_msix = 64;
+    total_processors = ncpu;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    init_gve((kernel_heaps)0);
+    apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    gve adapter = g_life_netif->state;
+    adapter->num_queues = gve_calc_num_queues(adapter, (tuple)0);
+    gve_cfg_device_resources(adapter);
+    return adapter;
+}
+
+/* Scenario 35: queue setup under allocation failure — the create-queue
+ * error cascades and the ring-size backoff (the driver halves and retries
+ * down to GVE_MIN_RING_SIZE, then gives up). */
+static void scenario_setup_alloc_fail(void)
+{
+    rprintf("scenario_setup_alloc_fail\n");
+    int saved_tp = total_processors;
+
+    gve a = bring_up_to_cfg(GVE_DEV_OPT_ID_DQO_RDA, 2);
+    a->contiguous = fail_heap();
+    a->general = fail_heap();
+    g_alloc_fail_after = 6;            /* fail mid first-queue create */
+    CHECK(!gve_setup_queues(a), "DQO setup fails (early alloc failure)");
+    g_alloc_fail_after = 20;           /* create one queue, fail the next */
+    CHECK(!gve_setup_queues(a), "DQO setup fails (inter-queue failure)");
+    g_alloc_fail_after = -1;
+    a->contiguous = gh; a->general = gh;
+
+    gve b = bring_up_to_cfg(0, 1);     /* GQI-QPL fallback */
+    b->contiguous = fail_heap();
+    b->general = fail_heap();
+    g_alloc_fail_after = 4;
+    CHECK(!gve_setup_queues(b), "GQI-QPL setup fails under alloc failure");
+    g_alloc_fail_after = -1;
+    b->contiguous = gh; b->general = gh;
+
+    /* Failed reset: a full adapter is reset, but the re-create allocation
+     * fails (cfg succeeds, setup_queues does not), so the reset takes its
+     * failure epilogue — DEVICE_RUNNING cleared, RESETTING/ONGOING_RESET
+     * left set (the adapter is dead until restart). */
+    gve c = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    c->contiguous = fail_heap();
+    c->general = fail_heap();
+    g_alloc_fail_after = 8;            /* cfg+ptype pass, setup_queues fails */
+    gve_trigger_reset(c);              /* async_apply_bh runs synchronously */
+    g_alloc_fail_after = -1;
+    c->contiguous = gh; c->general = gh;
+    CHECK(!(c->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING)),
+          "failed reset clears DEVICE_RUNNING");
+    CHECK(c->flags & (1ULL << GVE_FLAG_ONGOING_RESET),
+          "failed reset leaves ONGOING_RESET set (adapter dead)");
+
+    total_processors = saved_tp;
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -1742,6 +1830,7 @@ int main(int argc, char **argv)
     scenario_main_irqs();
     scenario_gqi_watchdog();
     scenario_watchdog_detect();
+    scenario_setup_alloc_fail();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
