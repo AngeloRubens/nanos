@@ -24,7 +24,7 @@ driver, not a copy.
 
 ## Coverage
 
-51 scenarios (344 checks) exercise every queue format in both directions
+52 scenarios (348 checks) exercise every queue format in both directions
 (GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
 backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
 and drop-to-EOP, an out-of-order completion fuzzer, the device-option
@@ -54,7 +54,10 @@ err_after_* cleanup labels from progressively deeper points until the rings
 come up (the QPL page-list and slot-list allocations included).  Finally the
 admin-queue command-failure paths (describe failing at probe, ptype/RSS/cfg
 failing during setup and reset, and a command the device never answers
-timing out and marking the queue dead), the GQI-QPL multi-segment TX seg
+running the exponential-backoff poll to its retry limit, timing out and
+marking the queue dead — plus the watchdog deadline-scan edges that are not a
+timeout: a DQO miss still within GVE_TX_WATCHDOG_MS and zero seg-descriptor
+timestamp slots, both skipped without a reset), the GQI-QPL multi-segment TX seg
 descriptors with a byte-FIFO wrap, more GQI/DQO RX chain-error branches, and
 queue teardown freeing held resources (an undrained software queue, in-flight
 pending pbufs, a partial RX chain and a still-held RX pbuf) for GQI-RDA,
@@ -67,7 +70,7 @@ the DQO-QPL TX rejection of a single segment larger than one fixed bounce
 slot.
 
 Measured line coverage (gcov): gve_dqo.c 98%, gve_datapath.c 94%,
-gve_adminq.c 95%, gve_main.c 99%.  To measure: compile the four driver
+gve_adminq.c 96%, gve_main.c 99%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 

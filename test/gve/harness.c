@@ -336,9 +336,13 @@ void pci_bar_write_4(struct pci_bar *b, u64 offset, u32 val)
     if (b == g_reg_bar) {
         if (offset == GVE_REG_ADMINQ_DOORBELL) {
             u32 d = be32toh(val);
-            if (!g_adminq_no_answer)   /* model a device that never replies */
+            /* A device that never replies neither processes the command nor
+             * advances the event counter, so gve_adminq_wait polls the
+             * unchanged counter to its retry limit and times out. */
+            if (!g_adminq_no_answer) {
                 adminq_process(&g_adminq[(d - 1) & g_adminq_mask]);
-            g_evt_cnt = d;
+                g_evt_cnt = d;
+            }
         }
         return;
     }
@@ -2373,11 +2377,53 @@ static void scenario_adminq_timeout(void)
     g_max_tx = g_max_rx = 8; g_msix = 64; g_msix_avail = 64;
     g_msix_setup_fail_after = -1; total_processors = 1;
     g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    g_evt_cnt = 0;                     /* fresh device: counter starts at 0 so
+                                        * the unanswered command stays behind */
     g_adminq_no_answer = 1;            /* device stops replying */
     init_gve((kernel_heaps)0);
     boolean pr = apply(g_probe, (pci_dev)pointer_from_u64(0x42));
     g_adminq_no_answer = 0;
     CHECK(!pr, "probe fails when the device never answers the admin queue");
+
+    total_processors = saved_tp;
+}
+
+/* Scenario 45b: watchdog deadline-scan edges that are NOT a timeout — a DQO
+ * miss recorded recently (still within GVE_TX_WATCHDOG_MS) is skipped, not
+ * reset; and the GQI stuck scan skips zero (seg-descriptor / already-retired)
+ * timestamp slots while a recent packet stamp is below the deadline. */
+static void scenario_watchdog_deadline_edges(void)
+{
+    rprintf("scenario_watchdog_deadline_edges\n");
+    int saved_tp = total_processors;
+    timestamp recent = now(CLOCK_ID_MONOTONIC);
+
+    /* DQO: a fresh miss within the deadline must not trip a reset. */
+    gve a = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    gve_tx_dqo_queue atx = &a->tx_dqo[0];
+    atx->seg_counts[3] = 2;            /* tag 3 in flight */
+    atx->miss_times[3] = recent;       /* missed just now (not expired) */
+    a->rx_dqo[0].first_interrupt = true;
+    a->next_monitored_tx_qid = 0;
+    u64 wd0 = a->dev_stats.wd_expired;
+    apply((timer_handler)&a->watchdog_task, (u64)0, (u64)1);
+    CHECK(a->dev_stats.wd_expired == wd0, "DQO recent miss: no reset");
+    CHECK(atx->miss_times[3] == recent, "DQO recent miss still pending");
+
+    /* GQI: in-flight packet with a recent pkt stamp and zero seg-slot stamps;
+     * the scan skips the zero slots and finds nothing stuck. */
+    gve b = bring_up(0, 1);
+    gve_tx_queue btx = &b->tx[0];
+    btx->tail = 0; btx->head = 3;
+    btx->tx_timestamps[0] = recent;    /* packet slot, recent */
+    btx->tx_timestamps[1] = 0;         /* seg slot -> skipped */
+    btx->tx_timestamps[2] = 0;         /* seg slot -> skipped */
+    b->rx[0].first_interrupt = true;
+    b->next_monitored_tx_qid = 0;
+    u64 bwd0 = b->dev_stats.wd_expired;
+    apply((timer_handler)&b->watchdog_task, (u64)0, (u64)1);
+    CHECK(b->dev_stats.wd_expired == bwd0, "GQI recent stamp + seg slots: no reset");
+    CHECK(!btx->stuck, "GQI queue not marked stuck");
 
     total_processors = saved_tp;
 }
@@ -2711,6 +2757,7 @@ int main(int argc, char **argv)
     scenario_setup_fail_sweep();
     scenario_cmd_failures();
     scenario_adminq_timeout();
+    scenario_watchdog_deadline_edges();
     scenario_gqi_qpl_multiseg();
     scenario_gqi_rx_midchain();
     scenario_dqo_rx_more();
