@@ -106,6 +106,18 @@ from the page-backed contiguous heap; the host harness backs every heap with
 the general mcache (not 64-byte aligned), so that one UBSan check is a harness
 artifact, not a driver bug.
 
+`make -C test/gve tsan` builds with real atomic spinlocks (shim/lock.h under
+GVE_HARNESS_SMP — the normal build compiles the runtime's locks to no-ops)
+and runs two extra concurrency scenarios under ThreadSanitizer: four producer
+threads transmitting on one DQO-RDA queue (ring_mtx must serialise the
+head/desc_tail/tag-pool/descriptor-ring writes), and two threads running the
+RX service at once (service_lock must serialise it so each completion is
+delivered exactly once — the dual-source double-run the design guards
+against).  TSan reports no data races; the functional invariants hold.  The
+lock-free runtime queue's internals are suppressed (tsan.supp) since its
+inline-asm CAS is opaque to TSan and it is a vetted primitive, not driver
+code.  TSan needs ASLR off, so the target wraps the run in `setarch -R`.
+
 What the harness cannot test (hardware behaviour): whether the device
 actually steers RX flows across queues per the RSS table — that is Toeplitz
 hashing in the NIC, and is the open question (#2165) answered only by

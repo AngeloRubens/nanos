@@ -1,5 +1,6 @@
 gve_harness
 gve_harness_san
+gve_harness_tsan
 closure_templates.h
 *.o
 *.gcno

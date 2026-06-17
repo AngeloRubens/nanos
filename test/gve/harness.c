@@ -72,6 +72,21 @@ static heap gh;                 /* global process heap */
 static int  failures;
 static int  checks;
 
+/* Concurrency harness (GVE_HARNESS_SMP): a mutex serialises pbuf alloc/free
+ * and the refcount, modelling lwIP's SYS_ARCH_PROTECT and the kernel's locked
+ * general heap.  Without it, concurrent service/linkoutput threads would race
+ * in the (host) allocator itself and TSan would flag the heap rather than the
+ * driver logic under test.  In the normal build these are no-ops. */
+#ifdef GVE_HARNESS_SMP
+#include <pthread.h>
+static pthread_mutex_t g_heap_mtx = PTHREAD_MUTEX_INITIALIZER;
+#define HEAP_LOCK()   pthread_mutex_lock(&g_heap_mtx)
+#define HEAP_UNLOCK() pthread_mutex_unlock(&g_heap_mtx)
+#else
+#define HEAP_LOCK()   ((void)0)
+#define HEAP_UNLOCK() ((void)0)
+#endif
+
 #define CHECK(cond, ...) do {                                           \
     checks++;                                                           \
     if (!(cond)) {                                                      \
@@ -132,16 +147,22 @@ static int pbuf_alloc_fail_after = -1;  /* >=0: fail once the counter hits 0 */
 
 struct pbuf *pbuf_alloc(int layer, u16 length, int type)
 {
-    if (pbuf_alloc_fail_after == 0)
+    HEAP_LOCK();
+    if (pbuf_alloc_fail_after == 0) {
+        HEAP_UNLOCK();
         return 0;
+    }
     if (pbuf_alloc_fail_after > 0)
         pbuf_alloc_fail_after--;
     struct pbuf *p = allocate(gh, sizeof(*p));
-    if (p == INVALID_ADDRESS)
+    if (p == INVALID_ADDRESS) {
+        HEAP_UNLOCK();
         return 0;
+    }
     p->payload = (length ? allocate(gh, length) : 0);
     if (length && p->payload == INVALID_ADDRESS) {
         deallocate(gh, p, sizeof(*p));
+        HEAP_UNLOCK();
         return 0;
     }
     p->next = 0;
@@ -152,14 +173,16 @@ struct pbuf *pbuf_alloc(int layer, u16 length, int type)
     p->if_idx = NETIF_NO_INDEX;
     p->napi_id = 0;
     pbufs_live++;
+    HEAP_UNLOCK();
     return p;
 }
 
-void pbuf_ref(struct pbuf *p) { p->ref++; }
+void pbuf_ref(struct pbuf *p) { HEAP_LOCK(); p->ref++; HEAP_UNLOCK(); }
 
 u8 pbuf_free(struct pbuf *p)
 {
     u8 freed = 0;
+    HEAP_LOCK();
     while (p) {
         struct pbuf *next = p->next;
         if (--p->ref == 0) {
@@ -173,6 +196,7 @@ u8 pbuf_free(struct pbuf *p)
             break;             /* still referenced: stop */
         }
     }
+    HEAP_UNLOCK();
     return freed;
 }
 
@@ -409,7 +433,10 @@ void pci_bar_write_4(struct pci_bar *b, u64 offset, u32 val)
         }
         return;
     }
-    the_dev.last_tx_doorbell = val;   /* doorbell BAR */
+    /* Doorbell BAR — telemetry only.  Atomic so concurrent service/drain
+     * threads in the TSan harness don't race on this harness-side field
+     * (it is not driver state). */
+    __atomic_store_n(&the_dev.last_tx_doorbell, val, __ATOMIC_RELAXED);
 }
 
 /* Device posts one PKT completion for `tag` into the TX completion ring. */
@@ -3033,6 +3060,120 @@ static void scenario_rx_fill_wrap(void)
           "head-tail predicate stays correct across the wrap");
 }
 
+/* ------------------------------------------------------------------ */
+/* Concurrency scenarios (GVE_HARNESS_SMP, run under ThreadSanitizer).   */
+/* With the real atomic spinlocks from shim/lock.h, these drive the      */
+/* driver's lock-protected state from multiple threads so TSan can       */
+/* confirm ring_mtx / service_lock actually serialise it.                */
+/* ------------------------------------------------------------------ */
+#ifdef GVE_HARNESS_SMP
+#define CONC_NPROD    4
+#define CONC_PERPROD  300
+
+static gve          g_conc_adapter;
+static struct pbuf *g_conc_tx_pkts[CONC_NPROD][CONC_PERPROD];
+
+static void *conc_tx_producer(void *arg)
+{
+    long id = (long)arg;
+    for (int i = 0; i < CONC_PERPROD; i++)
+        gve_linkoutput_dqo(&g_conc_adapter->ndev.n, g_conc_tx_pkts[id][i]);
+    return NULL;
+}
+
+/* Scenario C1: many producer threads transmit on one DQO-RDA queue at
+ * once.  Each linkoutput enqueues on the lock-free br, then drains under
+ * ring_mtx; the drain's accesses to head / desc_tail / the tag pool / the
+ * descriptor ring must be serialised by ring_mtx.  TSan reports a race if
+ * any of that escapes the lock. */
+static void scenario_conc_tx(void)
+{
+    rprintf("scenario_conc_tx\n");
+    gve adapter = make_adapter();              /* DQO-RDA */
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 4096);            /* holds all descs, no backpressure */
+    adapter->num_queues = 1;
+    g_conc_adapter = adapter;
+
+    int total = CONC_NPROD * CONC_PERPROD;
+    int live_before = pbufs_live;
+    for (int t = 0; t < CONC_NPROD; t++)
+        for (int i = 0; i < CONC_PERPROD; i++)
+            g_conc_tx_pkts[t][i] = make_pkt(64);
+
+    pthread_t th[CONC_NPROD];
+    for (long t = 0; t < CONC_NPROD; t++)
+        pthread_create(&th[t], NULL, conc_tx_producer, (void *)t);
+    for (int t = 0; t < CONC_NPROD; t++)
+        pthread_join(th[t], NULL);
+
+    /* All packets were accepted and turned into ctx+pkt descriptor pairs;
+     * the tag pool advanced by exactly one tag per packet (no double-take,
+     * no lost slot — the invariant ring_mtx protects). */
+    CHECK(tx->head == (u32)(total * 2), "all %d packets written (head=%u)",
+          total, tx->head);
+    CHECK((u32)(tx->tags_ntu - 0) == (u32)total, "one tag taken per packet (%u)",
+          tx->tags_ntu);
+
+    /* Drain the completions and free everything.  Cleanup is budgeted
+     * (GVE_TX_CLEAN_BUDGET per call), so retire in a loop until the ring
+     * is empty. */
+    for (u16 t = 0; t <= tx->mask; t++)
+        if (tx->seg_counts[t])
+            dqo_dev_complete_pkt(&the_dev, t, GVE_DQO_COMPL_TYPE_PKT);
+    for (int guard = 0; tx->compl_head < (u32)total && guard < total + 16; guard++)
+        run_cleanup(tx);
+    for (int t = 0; t < CONC_NPROD; t++)
+        for (int i = 0; i < CONC_PERPROD; i++)
+            pbuf_free(g_conc_tx_pkts[t][i]);
+    CHECK(pbufs_live == live_before, "no pbuf leak across concurrent TX");
+}
+
+static gve_rx_dqo_queue g_conc_rx;
+static void *conc_rx_service(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 50; i++)
+        apply((thunk)&g_conc_rx->service);
+    return NULL;
+}
+
+/* Scenario C2: two threads run the RX service concurrently while a batch of
+ * completions is pending.  service_lock must serialise the body so the two
+ * runs do not both consume the same completion or corrupt compl_head /
+ * ctx_head / the free-id pool — the dual-source double-run the design
+ * guards against.  Each packet must be delivered exactly once. */
+static void scenario_conc_rx(void)
+{
+    rprintf("scenario_conc_rx\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo(adapter, rx, 256);
+    adapter->num_queues = 1;
+    g_conc_rx = rx;
+
+    int delivered_before = rx_delivered;
+    const int N = 200;
+    gve_rx_dqo_fill(rx);
+    for (int i = 0; i < N; i++)
+        dqo_dev_rx_complete(rx, 100, true, false);
+
+    pthread_t a, b;
+    pthread_create(&a, NULL, conc_rx_service, NULL);
+    pthread_create(&b, NULL, conc_rx_service, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+
+    CHECK(rx_delivered == delivered_before + N,
+          "every completion delivered exactly once (%d of %d)",
+          rx_delivered - delivered_before, N);
+    CHECK(rx->compl_head == (u32)N, "compl_head consumed all completions (%u)",
+          rx->compl_head);
+    CHECK(rx->ctx_head == NULL, "no partial chain left after concurrent service");
+    free_rx_dqo(rx);
+}
+#endif /* GVE_HARNESS_SMP */
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -3098,6 +3239,10 @@ int main(int argc, char **argv)
     scenario_dqo_desc_layout();
     scenario_doorbell_format();
     scenario_rx_fill_wrap();
+#ifdef GVE_HARNESS_SMP
+    scenario_conc_tx();
+    scenario_conc_rx();
+#endif
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

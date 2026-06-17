@@ -44,18 +44,29 @@ gve_harness_san: closure_templates.h $(SRCS)
 	gcc -O1 -g -std=gnu11 -fsanitize=address,undefined -fno-sanitize=alignment \
 		-fno-omit-frame-pointer $(INC) $(SRCS) -lpthread -o $@
 
+# Concurrency build: real atomic spinlocks (shim/lock.h under GVE_HARNESS_SMP)
+# + ThreadSanitizer, driving the driver's locked state from multiple threads.
+# Confirms ring_mtx / service_lock actually serialise it; the lock-free
+# runtime queue's internals are suppressed (see tsan.supp).
+gve_harness_tsan: closure_templates.h $(SRCS)
+	gcc -O1 -g -std=gnu11 -DGVE_HARNESS_SMP -fsanitize=thread \
+		-fno-omit-frame-pointer $(INC) $(SRCS) -lpthread -o $@
+
 closure_templates.h: $(CONTGEN)
 	$(CONTGEN) 10 10 > $@
 
 $(CONTGEN):
 	$(MAKE) -C $(ROOT)/tools contgen
 
-.PHONY: run sanitize clean
+.PHONY: run sanitize tsan clean
 run: gve_harness
 	./gve_harness
 
 sanitize: gve_harness_san
 	ASAN_OPTIONS=detect_leaks=0 ./gve_harness_san
 
+tsan: gve_harness_tsan
+	setarch $$(uname -m) -R env TSAN_OPTIONS=suppressions=tsan.supp ./gve_harness_tsan
+
 clean:
-	rm -f gve_harness gve_harness_san closure_templates.h
+	rm -f gve_harness gve_harness_san gve_harness_tsan closure_templates.h

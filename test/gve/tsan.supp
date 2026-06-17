@@ -1,0 +1,12 @@
+# ThreadSanitizer suppressions for the gve concurrency harness.
+#
+# The nanos runtime queue is a lock-free MPMC ring built on
+# compare_and_swap_32 (inline-asm in x86_64/machine.h), which TSan cannot see
+# through, so it reports the queue's internal head/slot synchronisation as
+# races.  The queue is a separately-vetted runtime primitive, not the driver
+# code under test, so its internals are suppressed; the driver's own
+# lock-protected state (head, desc_tail, tags, compl_head, ctx_head) uses the
+# __atomic spinlock from shim/lock.h and is analysed normally.
+race:enqueue
+race:dequeue
+race:queue_data
