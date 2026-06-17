@@ -24,7 +24,7 @@ driver, not a copy.
 
 ## Coverage
 
-43 scenarios (306 checks) exercise every queue format in both directions
+49 scenarios (330 checks) exercise every queue format in both directions
 (GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
 backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
 and drop-to-EOP, an out-of-order completion fuzzer, the device-option
@@ -51,10 +51,17 @@ continuation-alloc failures; DQO-QPL drop-to-EOP recycle and copy-out alloc
 failure).  Finally a sweep walks the allocation-failure point across every
 queue-create cascade for all four formats, unwinding the create functions'
 err_after_* cleanup labels from progressively deeper points until the rings
-come up (the QPL page-list and slot-list allocations included).
+come up (the QPL page-list and slot-list allocations included).  Finally the
+admin-queue command-failure paths (describe failing at probe, ptype/RSS/cfg
+failing during setup and reset, and a command the device never answers
+timing out and marking the queue dead), the GQI-QPL multi-segment TX seg
+descriptors with a byte-FIFO wrap, more GQI/DQO RX chain-error branches, and
+queue teardown freeing held resources (an undrained software queue, in-flight
+pending pbufs, a partial RX chain and a still-held RX pbuf) for GQI-RDA,
+GQI-QPL and DQO-RDA.
 
-Measured line coverage (gcov): gve_dqo.c 97%, gve_datapath.c 89%,
-gve_adminq.c 94%, gve_main.c 93%.  To measure: compile the four driver
+Measured line coverage (gcov): gve_dqo.c 98%, gve_datapath.c 93%,
+gve_adminq.c 95%, gve_main.c 99%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 
@@ -63,11 +70,11 @@ actually steers RX flows across queues per the RSS table — that is Toeplitz
 hashing in the NIC, and is the open question (#2165) answered only by
 per-queue RX counters on real GCP hardware.
 
-The remaining uncovered lines are mostly the admin-queue command timeout
-path (the device never answering, which the synchronous device model cannot
-reproduce), the GQI RX non-zero-copy fallback (the half-page buffer lands at
-a ring slot the in-order device model never reaches), and a few QPL slot
-wrap and msg_err diagnostic lines.
+The remaining uncovered lines are the GQI RX non-zero-copy fallback (the
+half-page buffer lands at a ring slot the in-order device model never
+reaches), the slow-path async_apply enqueue (a no-op to reach with the
+single-threaded UP spinlock model), and a few QPL slot-wrap and msg_err
+diagnostic lines.
 
 ## Build & run
 

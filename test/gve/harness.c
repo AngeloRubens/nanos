@@ -196,6 +196,7 @@ static u32  g_max_tx = 8, g_max_rx = 8;
 static u16  g_desc_opts[8];           /* device options to advertise */
 static int  g_desc_nopts;
 static u32  g_adminq_fail_op;          /* opcode to fail (0 = none) */
+static int  g_adminq_no_answer;        /* 1 = device never writes a status */
 static u32  g_rss_lut[128];           /* captured from CONFIGURE_RSS */
 static u16  g_rss_lut_size;
 static u32  g_dev_status;             /* value returned for DEVICE_STATUS */
@@ -331,7 +332,8 @@ void pci_bar_write_4(struct pci_bar *b, u64 offset, u32 val)
     if (b == g_reg_bar) {
         if (offset == GVE_REG_ADMINQ_DOORBELL) {
             u32 d = be32toh(val);
-            adminq_process(&g_adminq[(d - 1) & g_adminq_mask]);
+            if (!g_adminq_no_answer)   /* model a device that never replies */
+                adminq_process(&g_adminq[(d - 1) & g_adminq_mask]);
             g_evt_cnt = d;
         }
         return;
@@ -2260,6 +2262,266 @@ static void scenario_setup_fail_sweep(void)
     sweep_setup_fail(0);                       /* GQI-QPL */
 }
 
+/* Full bring-up (probe + setup) advertising an explicit set of device
+ * options (so RSS-capable adapters can be built). */
+static gve bring_up_opts(const u16 *opts, int n, int ncpu)
+{
+    g_desc_nopts = n;
+    for (int i = 0; i < n; i++)
+        g_desc_opts[i] = opts[i];
+    g_max_tx = g_max_rx = 8;
+    g_msix = 64; g_msix_avail = 64; g_msix_setup_fail_after = -1;
+    total_processors = ncpu;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    init_gve((kernel_heaps)0);
+    apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    gve adapter = g_life_netif->state;
+    apply((netif_dev_setup)&adapter->ndev.setup, (tuple)0);
+    return adapter;
+}
+
+/* Scenario 44: admin-queue command-failure paths — describe failing at
+ * probe (the adapter is torn down and no netif added), the ptype-map and
+ * RSS commands failing during setup, and cfg/ptype/RSS failing during a
+ * reset. */
+static void scenario_cmd_failures(void)
+{
+    rprintf("scenario_cmd_failures\n");
+    int saved_tp = total_processors;
+    const u16 dqo_rss[] = { GVE_DEV_OPT_ID_DQO_RDA, GVE_DEV_OPT_ID_RSS_CONFIG };
+
+    /* describe fails -> gve_init returns false -> probe deallocates. */
+    g_desc_nopts = 1; g_desc_opts[0] = GVE_DEV_OPT_ID_DQO_RDA;
+    g_max_tx = g_max_rx = 8; g_msix = 64; g_msix_avail = 64;
+    g_msix_setup_fail_after = -1; total_processors = 1;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    g_adminq_fail_op = GVE_ADMINQ_DESCRIBE_DEVICE;
+    init_gve((kernel_heaps)0);
+    boolean pr = apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    g_adminq_fail_op = 0;
+    CHECK(!pr, "probe fails when DESCRIBE_DEVICE is rejected");
+    CHECK(g_life_netif == 0, "no netif added on describe failure");
+
+    /* setup: ptype-map fails (DQO requires it before queues). */
+    gve a = bring_up_probe_only(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_adminq_fail_op = GVE_ADMINQ_GET_PTYPE_MAP;
+    CHECK(!apply((netif_dev_setup)&a->ndev.setup, (tuple)0),
+          "setup fails when GET_PTYPE_MAP is rejected");
+    g_adminq_fail_op = 0;
+
+    /* setup: RSS fails — best-effort, setup still succeeds. */
+    g_desc_nopts = 2; g_desc_opts[0] = dqo_rss[0]; g_desc_opts[1] = dqo_rss[1];
+    g_max_tx = g_max_rx = 8; g_msix = 64; g_msix_avail = 64;
+    g_msix_setup_fail_after = -1; total_processors = 1;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    init_gve((kernel_heaps)0);
+    apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    gve b = g_life_netif->state;
+    CHECK(b->rss_supported, "RSS option advertised -> rss_supported");
+    g_adminq_fail_op = GVE_ADMINQ_CONFIGURE_RSS;
+    CHECK(apply((netif_dev_setup)&b->ndev.setup, (tuple)0),
+          "setup still succeeds when RSS config is rejected (best-effort)");
+    g_adminq_fail_op = 0;
+
+    /* reset: cfg-resources fails. */
+    gve c = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_adminq_fail_op = GVE_ADMINQ_CONFIGURE_DEVICE_RESOURCES;
+    gve_trigger_reset(c);
+    g_adminq_fail_op = 0;
+    CHECK(!(c->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING)),
+          "reset with cfg failure leaves the adapter down");
+
+    /* reset: ptype-map fails. */
+    gve d = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_adminq_fail_op = GVE_ADMINQ_GET_PTYPE_MAP;
+    gve_trigger_reset(d);
+    g_adminq_fail_op = 0;
+    CHECK(!(d->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING)),
+          "reset with ptype failure leaves the adapter down");
+
+    /* reset: RSS fails — best-effort, reset completes. */
+    gve e = bring_up_opts(dqo_rss, 2, 1);
+    g_adminq_fail_op = GVE_ADMINQ_CONFIGURE_RSS;
+    gve_trigger_reset(e);
+    g_adminq_fail_op = 0;
+    CHECK(e->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING),
+          "reset completes despite RSS config failure");
+
+    total_processors = saved_tp;
+}
+
+/* Scenario 45: an admin-queue command that the device never answers times
+ * out, marks the queue dead, and makes later commands fast-fail. */
+static void scenario_adminq_timeout(void)
+{
+    rprintf("scenario_adminq_timeout\n");
+    int saved_tp = total_processors;
+
+    g_desc_nopts = 1; g_desc_opts[0] = GVE_DEV_OPT_ID_DQO_RDA;
+    g_max_tx = g_max_rx = 8; g_msix = 64; g_msix_avail = 64;
+    g_msix_setup_fail_after = -1; total_processors = 1;
+    g_adminq = NULL; g_probe = 0; g_life_netif = 0;
+    g_adminq_no_answer = 1;            /* device stops replying */
+    init_gve((kernel_heaps)0);
+    boolean pr = apply(g_probe, (pci_dev)pointer_from_u64(0x42));
+    g_adminq_no_answer = 0;
+    CHECK(!pr, "probe fails when the device never answers the admin queue");
+
+    total_processors = saved_tp;
+}
+
+/* Scenario 46: GQI-QPL multi-segment TX writes the per-segment seg
+ * descriptors, and a copy that crosses the QPL byte-FIFO end wraps to the
+ * front. */
+static void scenario_gqi_qpl_multiseg(void)
+{
+    rprintf("scenario_gqi_qpl_multiseg\n");
+    gve adapter = make_adapter_gqi(false);     /* GQI-QPL */
+    gve_tx_queue tx = &adapter->tx[0];
+    make_tx_gqi(adapter, tx, 256);
+    gve_setup_linkoutput(adapter, &adapter->ndev.n);
+    int live_before = pbufs_live;
+
+    /* Push the byte FIFO close to the end so the next copy wraps. */
+    tx->qpl_head = tx->qpl_size - 128;
+    struct pbuf *p = make_chain(3, 200);       /* 600 bytes, 3 segments */
+    err_t e = adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+    CHECK(e == ERR_OK, "GQI-QPL multi-seg linkoutput ok");
+    CHECK(tx->head == 3, "pkt + 2 seg descriptors written, got %d", tx->head);
+    CHECK(tx->qpl_head < tx->qpl_size, "QPL head wrapped and stayed in range");
+
+    gqi_dev_tx_complete_all(adapter, tx);
+    run_tx_gqi_cleanup(tx);
+    CHECK(tx->tail == tx->head, "all segments retired");
+    pbuf_free(p);
+    CHECK(pbufs_live == live_before, "no leak across the QPL multi-seg wrap");
+}
+
+/* Scenario 47: GQI RX — a runt buffer in the middle of a started chain
+ * frees the partial, and a multi-buffer packet the stack rejects is freed
+ * by the driver. */
+static void scenario_gqi_rx_midchain(void)
+{
+    rprintf("scenario_gqi_rx_midchain\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+
+    /* good first fragment then a runt continuation (length <= pad). */
+    gqi_dev_rx_complete(rx, 1400, GVE_RXF_PKT_CONT);   /* frag 1 -> ctx_head */
+    gqi_dev_rx_complete(rx, 0,    GVE_RXF_PKT_CONT);   /* runt continuation */
+    gqi_dev_rx_complete(rx, 600,  0);                  /* EOP of the chain */
+    apply((thunk)&rx->service);
+    CHECK(rx->ctx_head == NULL, "runt continuation freed the partial chain");
+
+    /* a multi-buffer packet the stack rejects: the driver frees the chain. */
+    int delivered_at = rx_delivered;
+    g_input_err = 1;
+    gqi_dev_rx_complete(rx, 1400, GVE_RXF_PKT_CONT);
+    gqi_dev_rx_complete(rx, 600,  0);
+    apply((thunk)&rx->service);
+    g_input_err = 0;
+    CHECK(rx_delivered == delivered_at + 1, "rejected GQI chain reached input once");
+}
+
+/* Scenario 48: more DQO RX branches — a QPL error on a started chain frees
+ * the partial, and processing a full ring's worth of completions flips the
+ * expected generation bit at the wrap. */
+static void scenario_dqo_rx_more(void)
+{
+    rprintf("scenario_dqo_rx_more\n");
+
+    /* QPL: good fragment then an error fragment (ctx_head was set). */
+    {
+        gve adapter = make_adapter();
+        gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+        make_rx_dqo_mode(adapter, rx, 256, true);   /* DQO-QPL */
+        gve_rx_dqo_fill(rx);
+        dqo_dev_rx_complete(rx, 1400, false, false);  /* frag 1: copied */
+        dqo_dev_rx_complete(rx, 600,  false, true);   /* frag 2: error */
+        dqo_dev_rx_complete(rx, 1,    true,  false);  /* EOP, recycled */
+        run_rx_service(rx);
+        CHECK(rx->ctx_head == NULL, "QPL error on a started chain freed the partial");
+        free_rx_dqo(rx);
+    }
+
+    /* RDA: a small ring processed past a full wrap flips expected_gen. */
+    {
+        gve adapter = make_adapter();
+        gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+        make_rx_dqo(adapter, rx, 8);                 /* tiny ring -> quick wrap */
+        u8 gen0 = rx->expected_gen;
+        boolean flipped = false;
+        for (int i = 0; i < 16; i++) {
+            gve_rx_dqo_fill(rx);
+            dqo_dev_rx_complete(rx, 100, true, false);
+            run_rx_service(rx);
+            if (rx->expected_gen != gen0)
+                flipped = true;
+        }
+        CHECK(flipped, "expected_gen flipped at the RX completion-ring wrap");
+        free_rx_dqo(rx);
+    }
+}
+
+/* Scenario 49: queue teardown frees held resources — an undrained software
+ * TX queue, in-flight pending pbufs, a partial RX chain and a still-held RX
+ * pbuf — for GQI-RDA, GQI-QPL and DQO-RDA. */
+static void scenario_teardown_held(void)
+{
+    rprintf("scenario_teardown_held\n");
+    int saved_tp = total_processors;
+
+    /* GQI-RDA. */
+    {
+        const u16 opts[] = { GVE_DEV_OPT_ID_GQI_RDA };
+        gve adapter = bring_up_opts(opts, 1, 1);
+        gve_tx_queue tx = &adapter->tx[0];
+        gve_rx_queue rx = &adapter->rx[0];
+        struct pbuf *q = make_pkt(64); pbuf_ref(q);
+        enqueue(tx->br, q);                          /* undrained -> freed */
+        struct pbuf *p = make_pkt(100);
+        adapter->ndev.n.linkoutput(&adapter->ndev.n, p);  /* pending[0] = p */
+        rx->ctx_head = make_pkt(200);                /* partial chain */
+        rx->pbufs[0].ref++;                          /* still-held warning */
+        gve_teardown_queues(adapter);
+        CHECK(tx->br == NULL && tx->q_res == NULL, "GQI-RDA TX torn down");
+        CHECK(rx->q_res == NULL, "GQI-RDA RX torn down");
+        pbuf_free(q);
+        pbuf_free(p);
+    }
+
+    /* GQI-QPL: the non-raw teardown unregisters the page lists. */
+    {
+        gve adapter = bring_up(0, 1);                /* GQI-QPL */
+        gve_rx_queue rx = &adapter->rx[0];
+        rx->ctx_head = make_pkt(200);
+        gve_teardown_queues(adapter);
+        CHECK(adapter->tx[0].qpl_base == NULL, "GQI-QPL TX QPL released");
+        CHECK(rx->qpl_base == NULL, "GQI-QPL RX QPL released");
+    }
+
+    /* DQO-RDA: pending pbufs and a partial RX chain freed at teardown. */
+    {
+        gve adapter = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+        gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+        gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+        struct pbuf *q = make_pkt(64); pbuf_ref(q);
+        enqueue(tx->br, q);
+        struct pbuf *p = make_pkt(100);
+        send_pkt(tx, adapter, p);                    /* leaves pending[tag] */
+        gve_rx_dqo_fill(rx);                         /* post RX pbufs */
+        rx->ctx_head = make_pkt(200);
+        gve_teardown_queues(adapter);
+        CHECK(tx->br == NULL && tx->q_res == NULL, "DQO-RDA TX torn down");
+        CHECK(rx->q_res == NULL && rx->pbufs == NULL, "DQO-RDA RX torn down");
+        pbuf_free(q);
+        pbuf_free(p);
+    }
+
+    total_processors = saved_tp;
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -2309,6 +2571,12 @@ int main(int argc, char **argv)
     scenario_rx_gqi_edge();
     scenario_rx_dqo_qpl_edge();
     scenario_setup_fail_sweep();
+    scenario_cmd_failures();
+    scenario_adminq_timeout();
+    scenario_gqi_qpl_multiseg();
+    scenario_gqi_rx_midchain();
+    scenario_dqo_rx_more();
+    scenario_teardown_held();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
