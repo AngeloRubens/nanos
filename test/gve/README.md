@@ -87,6 +87,19 @@ gve_adminq.c 96%, gve_main.c 99%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 
+The multi-queue and scheduling machinery is exercised directly: per-CPU TX
+dispatch (CPU n -> queue n % nq) with cross-queue tag isolation; RX
+multi-queue, where four RX queues consume their own completions independently
+and deliver packets tagged with their own per-queue napi_id; the RX cleaning
+budget, where one service call retires a bounded number of completions (two
+sweeps of GVE_CLEAN_BUDGET x GVE_RX_BUDGET around the IRQ re-arm) and a second
+finishes the rest; the TX cleaning budget (<= GVE_TX_CLEAN_BUDGET per call);
+the watchdog queue rotation (8 queues, GVE_TX_MONITORED_QUEUES=4 per tick, the
+cursor advancing 0->4->0 over a full sweep); the buf_ring backpressure cycle
+(ring full -> queue_stop -> completion -> queue_wakeup); and the per-queue
+MSI-X layout (mgmt IRQ at slot 2N, one RX IRQ per queue at N..2N-1, the polled
+TX notify slots 0..N-1 left without a handler).
+
 A block of `_Static_assert`s at the top of `harness.c` pins the descriptor
 struct sizes and the offsets of every field the driver/device read or write
 to literals transcribed from the official Google headers (gve_desc.h,

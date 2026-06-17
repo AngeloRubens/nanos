@@ -236,11 +236,13 @@ static int g_input_hold;        /* 1 = lwIP keeps the pbuf (models a held ref) *
 static int g_input_err;         /* 1 = input returns !=ERR_OK (driver frees) */
 static struct pbuf *g_last_input;  /* last pbuf handed to input (for inspection) */
 static u16 g_last_input_totlen;    /* its tot_len, captured before any free */
+static u16 g_last_input_napi;      /* its napi_id, captured before any free */
 static err_t harness_input(struct pbuf *p, struct netif *inp)
 {
     rx_delivered++;
     g_last_input = p;
     g_last_input_totlen = p->tot_len;
+    g_last_input_napi = p->napi_id;
     if (g_input_err)
         return ERR_MEM;         /* the stack rejects it; the driver frees p */
     if (!g_input_hold)
@@ -363,12 +365,16 @@ void register_pci_driver(pci_probe p, pci_remove remove) { g_probe = p; }
 static int g_msix_avail = 64;             /* vectors pci_enable_msix reports */
 int  pci_enable_msix(pci_dev dev) { return g_msix_avail; }
 static int g_msix_setup_fail_after = -1;  /* >=0: fail that many calls in */
+static int g_msix_slots[2 * GVE_MAX_IO_QUEUES + 1];  /* slots requested */
+static int g_msix_nslots;
 u64  pci_setup_msix_aff(pci_dev dev, int s, thunk h, sstring n, range a)
 {
     if (g_msix_setup_fail_after == 0)
         return INVALID_PHYSICAL;
     if (g_msix_setup_fail_after > 0)
         g_msix_setup_fail_after--;
+    if (g_msix_nslots < (int)(sizeof(g_msix_slots) / sizeof(g_msix_slots[0])))
+        g_msix_slots[g_msix_nslots++] = s;
     return 0;
 }
 void pci_teardown_msix(pci_dev dev, int msi_slot) { }
@@ -677,9 +683,11 @@ static void scenario_tx_miss_reinject(void)
 /* RX device model + queue setup                                        */
 /* ------------------------------------------------------------------ */
 
-static u32 rx_buf_cursor;       /* device: next buf_ring entry to consume */
-static u32 rx_compl_cursor;     /* device: next compl_ring entry to write */
-static u8  rx_compl_gen;        /* device generation bit */
+/* Device RX cursors, per queue (indexed by rx->idx) so multiple RX queues
+ * can be driven independently. */
+static u32 rx_buf_cursor[GVE_MAX_IO_QUEUES];    /* next buf_ring entry to consume */
+static u32 rx_compl_cursor[GVE_MAX_IO_QUEUES];  /* next compl_ring entry to write */
+static u8  rx_compl_gen[GVE_MAX_IO_QUEUES];     /* device generation bit */
 
 static void make_rx_dqo_mode(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs,
                              boolean qpl)
@@ -708,7 +716,7 @@ static void make_rx_dqo_mode(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs,
     rx->next_to_clean = num_bufs;
     rx->adapter = adapter;
     rx->db_idx = 0;
-    rx->idx = 0;
+    rx->idx = (u16)(rx - adapter->rx_dqo);   /* array position = queue index */
     rx->ctx_head = NULL;
     rx->drop_pkt = false;
     rx->db_head = 0;
@@ -718,8 +726,8 @@ static void make_rx_dqo_mode(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs,
     zero(&rx->rx_stats, sizeof(rx->rx_stats));
     gve_rx_dqo_init(rx);
 
-    rx_buf_cursor = rx_compl_cursor = 0;
-    rx_compl_gen = 1;
+    rx_buf_cursor[rx->idx] = rx_compl_cursor[rx->idx] = 0;
+    rx_compl_gen[rx->idx] = 1;
 }
 
 static void make_rx_dqo(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs)
@@ -731,25 +739,26 @@ static void make_rx_dqo(gve adapter, gve_rx_dqo_queue rx, u16 num_bufs)
 static void dqo_dev_rx_complete(gve_rx_dqo_queue rx, u16 len, boolean eop,
                                 boolean err)
 {
-    u16 buf_id = rx->buf_ring[rx_buf_cursor & rx->mask].buf_id;
-    rx_buf_cursor++;
+    u16 q = rx->idx;
+    u16 buf_id = rx->buf_ring[rx_buf_cursor[q] & rx->mask].buf_id;
+    rx_buf_cursor[q]++;
     /* DQO-QPL: the device writes the payload into the registered slot the
      * driver will copy out. */
     if (rx->adapter->dqo_qpl && !err && len) {
         u8 *dst = (u8 *)rx->qpl_base + (u64)buf_id * GVE_DQO_BUF_SIZE;
         for (u16 i = 0; i < len; i++) dst[i] = (u8)(i + 7);
     }
-    u32 slot = rx_compl_cursor & rx->mask;
+    u32 slot = rx_compl_cursor[q] & rx->mask;
     struct gve_rx_compl_desc_dqo *c = &rx->compl_ring[slot];
     c->buf_id   = buf_id;
     c->err_flags = err ? GVE_DQO_RX_ERR : 0;
     c->status0  = eop ? GVE_DQO_RX_EOP : 0;
     write_barrier();
     c->pkt_len_gen = (u16)(len & GVE_DQO_RX_PKT_LEN_MASK) |
-                     (rx_compl_gen ? GVE_DQO_RX_GEN : 0);
-    rx_compl_cursor++;
-    if ((rx_compl_cursor & rx->mask) == 0)
-        rx_compl_gen ^= 1;
+                     (rx_compl_gen[q] ? GVE_DQO_RX_GEN : 0);
+    rx_compl_cursor[q]++;
+    if ((rx_compl_cursor[q] & rx->mask) == 0)
+        rx_compl_gen[q] ^= 1;
 }
 
 /* Free every pbuf the queue still holds (posted buffers + partial chain). */
@@ -2223,7 +2232,7 @@ static void scenario_rx_dqo_edge(void)
     gve_rx_dqo_fill(rx);
 
     /* spurious completion: drop the posted pbuf so the slot looks unposted. */
-    u16 bid = rx->buf_ring[rx_buf_cursor & rx->mask].buf_id;
+    u16 bid = rx->buf_ring[rx_buf_cursor[rx->idx] & rx->mask].buf_id;
     struct pbuf *lost = rx->pbufs[bid];
     rx->pbufs[bid] = NULL;
     pbuf_free(lost);
@@ -3174,6 +3183,159 @@ static void scenario_conc_rx(void)
 }
 #endif /* GVE_HARNESS_SMP */
 
+/* Scenario 60: RX multiqueue — four RX queues each consume their own
+ * completions independently (own compl_head / buffer pool) and deliver
+ * packets tagged with their own per-queue napi_id. */
+static void scenario_rx_multiqueue(void)
+{
+    rprintf("scenario_rx_multiqueue\n");
+    gve adapter = make_adapter();
+    adapter->num_queues = 4;
+    for (int q = 0; q < 4; q++)
+        make_rx_dqo(adapter, &adapter->rx_dqo[q], 256);
+    int delivered_before = rx_delivered;
+    int live_before = pbufs_live;
+    int counts[4] = { 5, 12, 3, 20 };
+
+    for (int q = 0; q < 4; q++) {
+        gve_rx_dqo_queue rx = &adapter->rx_dqo[q];
+        gve_rx_dqo_fill(rx);
+        for (int i = 0; i < counts[q]; i++)
+            dqo_dev_rx_complete(rx, 100, true, false);
+    }
+    int total = 0;
+    for (int q = 0; q < 4; q++) {
+        g_last_input_napi = 0xffff;
+        run_rx_service(&adapter->rx_dqo[q]);
+        CHECK(adapter->rx_dqo[q].compl_head == (u32)counts[q],
+              "queue %d consumed exactly its %d completions (%u)",
+              q, counts[q], adapter->rx_dqo[q].compl_head);
+        CHECK(g_last_input_napi == (u16)(q + 1),
+              "queue %d packets tagged napi_id %d (got %d)",
+              q, q + 1, g_last_input_napi);
+        total += counts[q];
+    }
+    CHECK(rx_delivered == delivered_before + total,
+          "every queue delivered its packets (%d total)", total);
+    for (int q = 0; q < 4; q++)
+        free_rx_dqo(&adapter->rx_dqo[q]);
+    CHECK(pbufs_live == live_before, "no leak across the RX queues");
+}
+
+/* Scenario 61: RX cleaning budget — one service call retires a bounded
+ * number of completions (two sweeps of GVE_CLEAN_BUDGET x GVE_RX_BUDGET
+ * around the IRQ re-arm), and a second call finishes the rest, so a single
+ * run cannot monopolise the runloop CPU. */
+static void scenario_rx_budget(void)
+{
+    rprintf("scenario_rx_budget\n");
+    gve adapter = make_adapter();
+    gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+    make_rx_dqo(adapter, rx, 2048);
+    gve_rx_dqo_fill(rx);
+    const int per_call = 2 * GVE_CLEAN_BUDGET * GVE_RX_BUDGET;   /* 1024 */
+    const int N = per_call + 100;
+    for (int i = 0; i < N; i++)
+        dqo_dev_rx_complete(rx, 100, true, false);
+
+    run_rx_service(rx);
+    CHECK(rx->compl_head == (u32)per_call,
+          "one service call bounded to %d completions (got %u)",
+          per_call, rx->compl_head);
+    run_rx_service(rx);
+    CHECK(rx->compl_head == (u32)N, "a second call drains the rest (%u)",
+          rx->compl_head);
+    free_rx_dqo(rx);
+}
+
+/* Scenario 62: TX cleaning budget — one cleanup retires at most
+ * GVE_TX_CLEAN_BUDGET completions; the rest wait for the next call. */
+static void scenario_tx_cleanup_budget(void)
+{
+    rprintf("scenario_tx_cleanup_budget\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 1024);
+    int live_before = pbufs_live;
+    const int N = 200;
+    struct pbuf *pkts[200];
+    u16 tags[200];
+    for (int i = 0; i < N; i++) {
+        pkts[i] = make_pkt(64);
+        tags[i] = send_pkt(tx, adapter, pkts[i]);
+    }
+    for (int i = 0; i < N; i++)
+        dqo_dev_complete_pkt(&the_dev, tags[i], GVE_DQO_COMPL_TYPE_PKT);
+
+    run_cleanup(tx);
+    CHECK(tx->compl_head == (u32)GVE_TX_CLEAN_BUDGET,
+          "one cleanup bounded to %d completions (got %u)",
+          GVE_TX_CLEAN_BUDGET, tx->compl_head);
+    while (tx->compl_head < (u32)N)
+        run_cleanup(tx);
+    CHECK(tx->compl_head == (u32)N, "subsequent cleanups retire the rest");
+    for (int i = 0; i < N; i++)
+        pbuf_free(pkts[i]);
+    CHECK(pbufs_live == live_before, "no leak across the budgeted cleanup");
+}
+
+/* Scenario 63: watchdog queue rotation — with 8 queues and
+ * GVE_TX_MONITORED_QUEUES=4 checked per tick, the cursor advances by 4 each
+ * tick and wraps after two ticks (a full sweep), so all queues are monitored
+ * over ceil(N/4) ticks without checking them all every tick. */
+static void scenario_watchdog_rotation(void)
+{
+    rprintf("scenario_watchdog_rotation\n");
+    int saved_tp = total_processors;
+    gve a = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 8);
+    CHECK(a->num_queues == 8, "8 queues for the rotation test (got %d)",
+          a->num_queues);
+    for (u32 q = 0; q < a->num_queues; q++)
+        a->rx_dqo[q].first_interrupt = true;     /* avoid the no-interrupt reset */
+    a->next_monitored_tx_qid = 0;
+    u64 wd0 = a->dev_stats.wd_expired;
+
+    apply((timer_handler)&a->watchdog_task, (u64)0, (u64)1);
+    CHECK(a->next_monitored_tx_qid == GVE_TX_MONITORED_QUEUES,
+          "tick 1 advanced the cursor to %d (got %d)",
+          GVE_TX_MONITORED_QUEUES, a->next_monitored_tx_qid);
+    apply((timer_handler)&a->watchdog_task, (u64)0, (u64)1);
+    CHECK(a->next_monitored_tx_qid == 0,
+          "tick 2 wrapped the cursor back to 0 (got %d)",
+          a->next_monitored_tx_qid);
+    CHECK(a->dev_stats.wd_expired == wd0, "healthy queues: no reset during rotation");
+    total_processors = saved_tp;
+}
+
+/* Scenario 64: per-queue MSI-X layout — bring-up installs one mgmt IRQ at
+ * slot 2N and one RX IRQ per queue at slots N..2N-1 (the TX notify slots
+ * 0..N-1 are allocated but have no handler — TX completion is polled). */
+static void scenario_msix_layout(void)
+{
+    rprintf("scenario_msix_layout\n");
+    int saved_tp = total_processors;
+    g_msix_nslots = 0;
+    gve a = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 4);
+    u32 nq = a->num_queues;
+    CHECK(nq == 4, "4 queues (got %d)", nq);
+    CHECK(g_msix_nslots == (int)(nq + 1),
+          "nq+1 MSI-X handlers installed (mgmt + one per RX queue), got %d",
+          g_msix_nslots);
+    CHECK(g_msix_slots[0] == (int)(2 * nq),
+          "management IRQ at slot 2N=%d (got %d)", 2 * nq, g_msix_slots[0]);
+    boolean rx_ok = true;
+    for (u32 i = 0; i < nq; i++) {
+        boolean found = false;
+        for (int j = 1; j < g_msix_nslots; j++)
+            if (g_msix_slots[j] == (int)(nq + i))
+                found = true;
+        if (!found)
+            rx_ok = false;
+    }
+    CHECK(rx_ok, "each RX queue i has an MSI-X handler at slot N+i");
+    total_processors = saved_tp;
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -3239,6 +3401,11 @@ int main(int argc, char **argv)
     scenario_dqo_desc_layout();
     scenario_doorbell_format();
     scenario_rx_fill_wrap();
+    scenario_rx_multiqueue();
+    scenario_rx_budget();
+    scenario_tx_cleanup_budget();
+    scenario_watchdog_rotation();
+    scenario_msix_layout();
 #ifdef GVE_HARNESS_SMP
     scenario_conc_tx();
     scenario_conc_rx();
