@@ -12,6 +12,59 @@
 #include "gve_dqo.c"
 
 /* ------------------------------------------------------------------ */
+/* Descriptor layout cross-check against the official Google driver.    */
+/*                                                                      */
+/* These _Static_asserts are the one check independent of the driver    */
+/* itself: the sizes and field offsets are transcribed as literals from */
+/* the public Google headers (gve_desc.h, gve_desc_dqo.h, gve_adminq.h  */
+/* in GoogleCloudPlatform/compute-virtual-ethernet-linux), so a         */
+/* reordered field or wrong type in gve_priv.h fails the build even     */
+/* though the driver and the device model would agree with each other.  */
+/* Only fields the driver/device actually read or write are pinned.     */
+/* ------------------------------------------------------------------ */
+#define OFF(t, m) __builtin_offsetof(t, m)
+
+/* --- GQI: gve_desc.h --- */
+_Static_assert(sizeof(struct gve_tx_pkt_desc) == 16, "gve_tx_pkt_desc 16B");
+_Static_assert(OFF(struct gve_tx_pkt_desc, l4_csum_offset) == 1, "");
+_Static_assert(OFF(struct gve_tx_pkt_desc, l4_hdr_offset) == 2, "");
+_Static_assert(OFF(struct gve_tx_pkt_desc, len) == 4, "");
+_Static_assert(OFF(struct gve_tx_pkt_desc, seg_len) == 6, "");
+_Static_assert(OFF(struct gve_tx_pkt_desc, seg_addr) == 8, "");
+_Static_assert(sizeof(struct gve_tx_seg_desc) == 16, "gve_tx_seg_desc 16B");
+_Static_assert(OFF(struct gve_tx_seg_desc, mss) == 4, "");
+_Static_assert(OFF(struct gve_tx_seg_desc, seg_len) == 6, "");
+_Static_assert(OFF(struct gve_tx_seg_desc, seg_addr) == 8, "");
+_Static_assert(sizeof(struct gve_rx_desc) == 64, "gve_rx_desc 64B");
+_Static_assert(OFF(struct gve_rx_desc, len) == 60, "");
+_Static_assert(OFF(struct gve_rx_desc, flags_seq) == 62, "");
+
+/* --- adminq: gve_adminq.h --- */
+_Static_assert(sizeof(struct gve_queue_resources) == 64, "gve_queue_resources 64B");
+_Static_assert(OFF(struct gve_queue_resources, db_index) == 0, "");
+_Static_assert(OFF(struct gve_queue_resources, counter_index) == 4, "");
+
+/* --- DQO: gve_desc_dqo.h --- */
+_Static_assert(sizeof(struct gve_tx_pkt_desc_dqo) == 16, "gve_tx_pkt_desc_dqo 16B");
+_Static_assert(OFF(struct gve_tx_pkt_desc_dqo, dtype_flags) == 8, "");
+_Static_assert(OFF(struct gve_tx_pkt_desc_dqo, compl_tag) == 12, "");
+_Static_assert(OFF(struct gve_tx_pkt_desc_dqo, buf_size) == 14, "");
+_Static_assert(sizeof(struct gve_tx_ctx_desc_dqo) == 16, "gve_tx_ctx_desc_dqo 16B");
+_Static_assert(OFF(struct gve_tx_ctx_desc_dqo, cmd_dtype) == 8, "");
+_Static_assert(sizeof(struct gve_tx_compl_desc_dqo) == 8, "gve_tx_compl_desc_dqo 8B");
+_Static_assert(OFF(struct gve_tx_compl_desc_dqo, completion_tag) == 2, "");
+_Static_assert(sizeof(struct gve_rx_buf_desc_dqo) == 32, "gve_rx_buf_desc_dqo 32B");
+_Static_assert(OFF(struct gve_rx_buf_desc_dqo, buf_addr) == 8, "");
+_Static_assert(OFF(struct gve_rx_buf_desc_dqo, header_buf_addr) == 16, "");
+_Static_assert(sizeof(struct gve_rx_compl_desc_dqo) == 32, "gve_rx_compl_desc_dqo 32B");
+_Static_assert(OFF(struct gve_rx_compl_desc_dqo, err_flags) == 1, "");
+_Static_assert(OFF(struct gve_rx_compl_desc_dqo, pkt_len_gen) == 4, "");
+_Static_assert(OFF(struct gve_rx_compl_desc_dqo, status0) == 8, "");
+_Static_assert(OFF(struct gve_rx_compl_desc_dqo, buf_id) == 12, "");
+
+#undef OFF
+
+/* ------------------------------------------------------------------ */
 /* Test harness state and assertions                                    */
 /* ------------------------------------------------------------------ */
 

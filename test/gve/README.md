@@ -87,6 +87,14 @@ gve_adminq.c 96%, gve_main.c 99%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 
+A block of `_Static_assert`s at the top of `harness.c` pins the descriptor
+struct sizes and the offsets of every field the driver/device read or write
+to literals transcribed from the official Google headers (gve_desc.h,
+gve_desc_dqo.h, gve_adminq.h).  This is the one check independent of both the
+driver and the device model: a reordered field or wrong type in gve_priv.h
+fails the build even though the driver and the model would still agree with
+each other.
+
 `make -C test/gve sanitize` builds and runs the suite under
 AddressSanitizer + UBSan — an independent check of the memory and
 undefined-behaviour properties the functional assertions do not cover
