@@ -24,7 +24,7 @@ driver, not a copy.
 
 ## Coverage
 
-52 scenarios (348 checks) exercise every queue format in both directions
+59 scenarios (381 checks) exercise every queue format in both directions
 (GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
 backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
 and drop-to-EOP, an out-of-order completion fuzzer, the device-option
@@ -68,6 +68,19 @@ chain at the real buffer dimension, not the earlier arbitrary 2-buffer
 splits) for DQO-RDA, DQO-QPL and GQI (which pads only the first buffer), plus
 the DQO-QPL TX rejection of a single segment larger than one fixed bounce
 slot.
+
+A final set asserts protocol/behaviour the line coverage cannot — what the
+driver actually emits and the invariants it must hold, checked against the
+ENA patterns and the official Google driver: ring-size backoff restores the
+canonical sizes after transient pressure (no permanent shrink); RSS uses a
+fresh random Toeplitz key per configure with the Toeplitz algorithm and the
+TCP/UDP v4+v6 hash types; no TX checksum offload (descriptor csum fields and
+the DQO context-descriptor flex fields stay zero — guarding the reverted L4
+offload); DQO sets the report_event bit sparsely (>= 32 descriptors apart),
+not per packet; the DQO stream is a mandatory context descriptor (dtype 0x4)
+then packet descriptors all carrying the one completion tag; the TX doorbell
+is big-endian free-running for GQI and a masked little-endian index for DQO;
+and the GQI RX fill predicate stays correct across the u32 wrap.
 
 Measured line coverage (gcov): gve_dqo.c 98%, gve_datapath.c 94%,
 gve_adminq.c 96%, gve_main.c 99%.  To measure: compile the four driver

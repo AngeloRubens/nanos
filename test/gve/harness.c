@@ -203,6 +203,10 @@ static u32  g_adminq_fail_op;          /* opcode to fail (0 = none) */
 static int  g_adminq_no_answer;        /* 1 = device never writes a status */
 static u32  g_rss_lut[128];           /* captured from CONFIGURE_RSS */
 static u16  g_rss_lut_size;
+static u8   g_rss_key[40];            /* captured Toeplitz key */
+static u16  g_rss_key_size;
+static u16  g_rss_hash_types;
+static u8   g_rss_hash_alg;
 static u32  g_dev_status;             /* value returned for DEVICE_STATUS */
 
 /* Process one admin-queue command: build any response the driver reads back,
@@ -256,6 +260,12 @@ static void adminq_process(struct gve_adminq_command *cmd)
         g_rss_lut_size = n;
         for (u16 i = 0; i < n && i < 128; i++)
             g_rss_lut[i] = be32toh(lut[i]);
+        g_rss_hash_types = be16toh(cmd->configure_rss.hash_types);
+        g_rss_hash_alg   = cmd->configure_rss.hash_alg;
+        g_rss_key_size   = be16toh(cmd->configure_rss.hash_key_size);
+        u8 *key = pointer_from_u64(be64toh(cmd->configure_rss.hash_key_addr));
+        for (u16 i = 0; i < g_rss_key_size && i < sizeof(g_rss_key); i++)
+            g_rss_key[i] = key[i];
         break;
     }
     default:
@@ -2706,6 +2716,270 @@ static void scenario_tx_qpl_oversize(void)
     CHECK(pbufs_live == live_before, "no leak across oversize drop + normal send");
 }
 
+/* Scenario 53: ring-size backoff does not permanently shrink the rings.
+ * A setup under sustained allocation failure backs off to the minimum and
+ * gives up (leaving the working sizes small); the next clean setup restores
+ * them to the device-reported canonical sizes (the ENA set_io_rings_size
+ * alignment — earlier the working sizes were mutated in place and never
+ * restored, so rings only ever shrank across resets). */
+static void scenario_ring_size_restore(void)
+{
+    rprintf("scenario_ring_size_restore\n");
+    int saved_tp = total_processors;
+
+    gve a = bring_up_to_cfg(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    u32 tx_dev = a->tx_desc_cnt_dev, rx_dev = a->rx_desc_cnt_dev;
+
+    a->contiguous = fail_heap(); a->general = fail_heap();
+    g_alloc_fail_after = 2;            /* fail early -> backoff to give-up */
+    CHECK(!gve_setup_queues(a), "setup gives up under sustained alloc failure");
+    CHECK(a->tx_desc_cnt < tx_dev, "working TX ring shrank during backoff (%u < %u)",
+          a->tx_desc_cnt, tx_dev);
+    g_alloc_fail_after = -1;
+    a->contiguous = gh; a->general = gh;
+
+    CHECK(gve_setup_queues(a), "the next clean setup succeeds");
+    CHECK(a->tx_desc_cnt == tx_dev, "TX ring restored to canonical %u, got %u",
+          tx_dev, a->tx_desc_cnt);
+    CHECK(a->rx_desc_cnt == rx_dev, "RX ring restored to canonical %u, got %u",
+          rx_dev, a->rx_desc_cnt);
+
+    total_processors = saved_tp;
+}
+
+/* Scenario 54: RSS uses a fresh random Toeplitz key on each configure (anti
+ * hash-flooding) and declares the Toeplitz algorithm and the TCP/UDP v4/v6
+ * hash types Google's driver uses. */
+static void scenario_rss_key_fresh(void)
+{
+    rprintf("scenario_rss_key_fresh\n");
+    const u16 opts[] = { GVE_DEV_OPT_ID_DQO_RDA, GVE_DEV_OPT_ID_RSS_CONFIG };
+    gve a = bring_up_opts(opts, 2, 1);
+    CHECK(a->rss_supported, "RSS supported");
+
+    u8 key1[40];
+    CHECK(gve_configure_rss(a), "first configure_rss ok");
+    CHECK(g_rss_key_size == GVE_RSS_KEY_SIZE, "40-byte key");
+    CHECK(g_rss_hash_alg == GVE_RSS_HASH_ALG_TOEPLITZ, "Toeplitz algorithm");
+    CHECK(g_rss_hash_types == GVE_RSS_HASH_TYPES, "TCP/UDP v4+v6 hash types");
+    runtime_memcpy(key1, g_rss_key, sizeof(key1));
+
+    CHECK(gve_configure_rss(a), "second configure_rss ok");
+    boolean differs = false;
+    for (int i = 0; i < GVE_RSS_KEY_SIZE; i++)
+        if (g_rss_key[i] != key1[i]) differs = true;
+    CHECK(differs, "a fresh random key is generated on each configure");
+
+    boolean nonzero = false;
+    for (int i = 0; i < GVE_RSS_KEY_SIZE; i++)
+        if (g_rss_key[i]) nonzero = true;
+    CHECK(nonzero, "the key is not all-zero");
+}
+
+/* Scenario 55: no TX checksum offload — the driver leaves the descriptor
+ * checksum fields zero and lets lwIP compute checksums in software (the
+ * ENA-aligned model; guards against re-introducing the reverted L4 offload).
+ * Verified on both GQI and DQO descriptors after a send. */
+static void scenario_no_csum_offload(void)
+{
+    rprintf("scenario_no_csum_offload\n");
+
+    /* GQI: pkt descriptor csum offsets stay zero. */
+    {
+        gve adapter = make_adapter_gqi(true);
+        gve_tx_queue tx = &adapter->tx[0];
+        make_tx_gqi(adapter, tx, 256);
+        gve_setup_linkoutput(adapter, &adapter->ndev.n);
+        struct pbuf *p = make_pkt(100);
+        adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+        struct gve_tx_pkt_desc *d = &tx->desc[0].pkt;
+        CHECK(d->l4_csum_offset == 0 && d->l4_hdr_offset == 0,
+              "GQI pkt descriptor carries no checksum offload");
+        gqi_dev_tx_complete_all(adapter, tx);
+        run_tx_gqi_cleanup(tx);
+        pbuf_free(p);
+    }
+
+    /* DQO: the packet descriptor has no checksum-enable bits set (dtype only). */
+    {
+        gve adapter = make_adapter();
+        gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+        make_tx_dqo(adapter, tx, 256);
+        struct pbuf *p = make_pkt(100);
+        u16 tag = send_pkt(tx, adapter, p);
+        struct gve_tx_pkt_desc_dqo *d = &tx->desc[1];   /* pkt desc (after ctx) */
+        CHECK((d->dtype_flags & 0x1f) == GVE_DQO_TX_DTYPE_PKT,
+              "DQO packet descriptor dtype is PKT");
+        /* the only extra bit allowed is end_of_packet; no checksum bits. */
+        CHECK((d->dtype_flags & ~GVE_DQO_TX_EOP) == GVE_DQO_TX_DTYPE_PKT,
+              "DQO packet descriptor sets no flags beyond dtype + EOP");
+        /* the context descriptor (where Google carries csum/TSO metadata) is
+         * all-zero except its dtype, and the TSO bit (cmd_dtype bit 5) clear. */
+        struct gve_tx_ctx_desc_dqo *ctx = (struct gve_tx_ctx_desc_dqo *)&tx->desc[0];
+        CHECK(ctx->cmd_dtype == GVE_DQO_TX_DTYPE_CTX,
+              "context descriptor carries only its dtype (no TSO/csum bit)");
+        boolean flex_zero = true;
+        for (int i = 0; i < 8; i++) if (ctx->flex_hi[i]) flex_zero = false;
+        for (int i = 0; i < 4; i++) if (ctx->flex_lo[i]) flex_zero = false;
+        CHECK(flex_zero, "context descriptor metadata flex fields are zero");
+        dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+        pbuf_free(p);
+    }
+}
+
+/* Scenario 56: DQO report_event — the driver sets the REPORT bit sparsely
+ * (at least GVE_TX_MIN_RE_INTERVAL descriptors apart, per Google), not on
+ * every packet, and advances last_re_idx. */
+static void scenario_dqo_report_event(void)
+{
+    rprintf("scenario_dqo_report_event\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+
+    const int N = 40;                  /* 40 pkts * 2 descs = 80 descriptors */
+    struct pbuf *pkts[N];
+    u16 tags[N];
+    for (int i = 0; i < N; i++) {
+        pkts[i] = make_pkt(64);
+        tags[i] = send_pkt(tx, adapter, pkts[i]);
+    }
+
+    int reports = 0, last = -1, min_gap = 1 << 30;
+    for (u32 s = 0; s < tx->head; s++) {
+        if (tx->desc[s].dtype_flags & GVE_DQO_TX_REPORT) {
+            if (last >= 0 && (int)s - last < min_gap) min_gap = (int)s - last;
+            last = (int)s;
+            reports++;
+        }
+    }
+    CHECK(reports >= 1 && reports < N,
+          "REPORT bit set sparsely (%d reports over %d packets)", reports, N);
+    CHECK(min_gap >= GVE_TX_MIN_RE_INTERVAL,
+          "reports at least %d descriptors apart (min gap %d)",
+          GVE_TX_MIN_RE_INTERVAL, min_gap == (1 << 30) ? -1 : min_gap);
+    CHECK(tx->last_re_idx != 0, "last_re_idx advanced");
+
+    for (int i = 0; i < N; i++) {
+        dqo_dev_complete_pkt(&the_dev, tags[i], GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+        pbuf_free(pkts[i]);
+    }
+}
+
+/* Scenario 57: DQO descriptor stream layout — every packet is one mandatory
+ * general context descriptor (dtype 0x4) followed by its packet
+ * descriptor(s), and the same completion tag is stamped on every packet
+ * descriptor of the packet (matches the official Google driver). */
+static void scenario_dqo_desc_layout(void)
+{
+    rprintf("scenario_dqo_desc_layout\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+
+    /* single-segment packet: ctx desc then one pkt desc. */
+    struct pbuf *p = make_pkt(100);
+    u16 tag = send_pkt(tx, adapter, p);
+    struct gve_tx_ctx_desc_dqo *ctx = (struct gve_tx_ctx_desc_dqo *)&tx->desc[0];
+    CHECK((ctx->cmd_dtype & 0x1f) == GVE_DQO_TX_DTYPE_CTX,
+          "packet starts with a general context descriptor (dtype 0x4)");
+    CHECK((tx->desc[1].dtype_flags & 0x1f) == GVE_DQO_TX_DTYPE_PKT,
+          "the context descriptor is followed by a packet descriptor");
+    CHECK(tx->desc[1].compl_tag == tag, "packet descriptor carries the compl tag");
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+    pbuf_free(p);
+
+    /* multi-segment packet: ctx desc then one pkt desc per segment, all with
+     * the same tag. */
+    u32 h0 = tx->head;
+    struct pbuf *c = make_chain(3, 200);
+    u16 tag2 = send_pkt(tx, adapter, c);
+    struct gve_tx_ctx_desc_dqo *ctx2 =
+        (struct gve_tx_ctx_desc_dqo *)&tx->desc[h0 & tx->mask];
+    CHECK((ctx2->cmd_dtype & 0x1f) == GVE_DQO_TX_DTYPE_CTX,
+          "multi-seg packet also starts with a context descriptor");
+    boolean all_tag = true;
+    for (u32 s = h0 + 1; s < tx->head; s++)
+        if (tx->desc[s & tx->mask].compl_tag != tag2) all_tag = false;
+    CHECK(all_tag, "every segment's packet descriptor carries the same tag");
+    CHECK(tx->head - h0 == 4, "ctx + 3 segment descriptors written");
+    dqo_dev_complete_pkt(&the_dev, tag2, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+    pbuf_free(c);
+}
+
+/* Scenario 58: TX doorbell value format differs by protocol — GQI rings a
+ * free-running big-endian producer index, DQO rings a masked little-endian
+ * ring index (Google: iowrite32be for GQI, iowrite32 of the masked tail for
+ * DQO). */
+static void scenario_doorbell_format(void)
+{
+    rprintf("scenario_doorbell_format\n");
+
+    /* GQI: big-endian free-running head. */
+    {
+        gve adapter = make_adapter_gqi(true);
+        gve_tx_queue tx = &adapter->tx[0];
+        make_tx_gqi(adapter, tx, 256);
+        gve_setup_linkoutput(adapter, &adapter->ndev.n);
+        the_dev.last_tx_doorbell = 0;
+        struct pbuf *p = make_pkt(100);
+        adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+        CHECK(be32toh(the_dev.last_tx_doorbell) == tx->head,
+              "GQI doorbell is the big-endian head (%u)", tx->head);
+        CHECK(the_dev.last_tx_doorbell != tx->head,
+              "GQI doorbell is byte-swapped (not native LE)");
+        gqi_dev_tx_complete_all(adapter, tx);
+        run_tx_gqi_cleanup(tx);
+        pbuf_free(p);
+    }
+
+    /* DQO: little-endian masked ring index. */
+    {
+        gve adapter = make_adapter();
+        gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+        make_tx_dqo(adapter, tx, 256);
+        the_dev.last_tx_doorbell = 0xffffffff;
+        struct pbuf *p = make_pkt(100);
+        u16 tag = send_pkt(tx, adapter, p);
+        CHECK(the_dev.last_tx_doorbell == (tx->head & tx->mask),
+              "DQO doorbell is the masked LE ring index (%u)", tx->head & tx->mask);
+        dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+        run_cleanup(tx);
+        pbuf_free(p);
+    }
+}
+
+/* Scenario 59: GQI RX fill is u32-wrap-safe — with head/tail near the 32-bit
+ * wrap, the `head - tail < cnt` predicate keeps posting buffers (the old
+ * `head < tail + cnt` form overflowed and deadlocked RX after 2^32 posted
+ * buffers per queue). */
+static void scenario_rx_fill_wrap(void)
+{
+    rprintf("scenario_rx_fill_wrap\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+
+    /* Drive head/tail right up to the u32 wrap with a fully available QPL. */
+    u32 base = 0xfffffff0;
+    rx->head = rx->tail = base;
+    rx->qpl_head = 0;
+    rx->qpl_available = rx->qpl_count;
+    gve_rx_fill(rx);
+
+    u32 posted = rx->head - base;      /* wrap-safe subtraction */
+    CHECK(posted == adapter->rx_desc_cnt,
+          "fill posted a full ring across the wrap (%u of %u)",
+          posted, adapter->rx_desc_cnt);
+    CHECK(rx->head < base, "head wrapped past 2^32 (now %u)", rx->head);
+    CHECK(rx->head - rx->tail == adapter->rx_desc_cnt,
+          "head-tail predicate stays correct across the wrap");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -2764,6 +3038,13 @@ int main(int argc, char **argv)
     scenario_teardown_held();
     scenario_rx_fixed_buffer_split();
     scenario_tx_qpl_oversize();
+    scenario_ring_size_restore();
+    scenario_rss_key_fresh();
+    scenario_no_csum_offload();
+    scenario_dqo_report_event();
+    scenario_dqo_desc_layout();
+    scenario_doorbell_format();
+    scenario_rx_fill_wrap();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
