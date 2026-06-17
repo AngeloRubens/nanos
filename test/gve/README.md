@@ -24,7 +24,7 @@ driver, not a copy.
 
 ## Coverage
 
-49 scenarios (330 checks) exercise every queue format in both directions
+51 scenarios (344 checks) exercise every queue format in both directions
 (GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
 backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
 and drop-to-EOP, an out-of-order completion fuzzer, the device-option
@@ -58,9 +58,15 @@ timing out and marking the queue dead), the GQI-QPL multi-segment TX seg
 descriptors with a byte-FIFO wrap, more GQI/DQO RX chain-error branches, and
 queue teardown freeing held resources (an undrained software queue, in-flight
 pending pbufs, a partial RX chain and a still-held RX pbuf) for GQI-RDA,
-GQI-QPL and DQO-RDA.
+GQI-QPL and DQO-RDA.  Finally, fixed-buffer packet splitting: a frame the
+device splits across several full 2 KB (GVE_DQO_BUF_SIZE) RX buffers is
+reassembled into one chain of the right total length and buffer count (a long
+chain at the real buffer dimension, not the earlier arbitrary 2-buffer
+splits) for DQO-RDA, DQO-QPL and GQI (which pads only the first buffer), plus
+the DQO-QPL TX rejection of a single segment larger than one fixed bounce
+slot.
 
-Measured line coverage (gcov): gve_dqo.c 98%, gve_datapath.c 93%,
+Measured line coverage (gcov): gve_dqo.c 98%, gve_datapath.c 94%,
 gve_adminq.c 95%, gve_main.c 99%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.

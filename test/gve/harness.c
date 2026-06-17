@@ -157,9 +157,13 @@ u16  net_get_napi_id(u8 netif_num, u16 queue_idx) { return queue_idx + 1; }
 static int rx_delivered;        /* packets handed to net_if->input */
 static int g_input_hold;        /* 1 = lwIP keeps the pbuf (models a held ref) */
 static int g_input_err;         /* 1 = input returns !=ERR_OK (driver frees) */
+static struct pbuf *g_last_input;  /* last pbuf handed to input (for inspection) */
+static u16 g_last_input_totlen;    /* its tot_len, captured before any free */
 static err_t harness_input(struct pbuf *p, struct netif *inp)
 {
     rx_delivered++;
+    g_last_input = p;
+    g_last_input_totlen = p->tot_len;
     if (g_input_err)
         return ERR_MEM;         /* the stack rejects it; the driver frees p */
     if (!g_input_hold)
@@ -1070,6 +1074,7 @@ static void scenario_gqi_tx_qpl(void)
 /* GQI RX setup (mirrors gve_create_rx_queue; n = rx_desc_cnt ==
  * rx_data_slot_cnt, the GQI invariant). */
 static u32 gqi_rx_cursor;        /* device: next desc/data slot to fill */
+static boolean gqi_dev_in_packet;   /* device-side: currently mid-packet? */
 
 static void make_rx_gqi(gve adapter, gve_rx_queue rx, u16 n)
 {
@@ -1108,19 +1113,26 @@ static void make_rx_gqi(gve adapter, gve_rx_queue rx, u16 n)
     gve_rx_init(rx);
     gve_rx_fill(rx);
     gqi_rx_cursor = 0;
+    gqi_dev_in_packet = false;
 }
 
 /* GQI device: write packet data into the posted QPL slot and a descriptor,
- * then advance the event counter.  flags carries ERR / PKT_CONT (be16). */
+ * then advance the event counter.  flags carries ERR / PKT_CONT (be16).
+ * Real GQI prepends the 2-byte IP-alignment pad on the FIRST buffer of a
+ * packet only (Google gve_rx.c), so the model pads only when starting a new
+ * packet; pkt_len is the data length the device delivers in this buffer. */
 static void gqi_dev_rx_complete(gve_rx_queue rx, u16 pkt_len, u16 flags)
 {
     u32 slot = gqi_rx_cursor & rx->mask;
     u64 offset = be64toh(rx->data[slot]) - rx->rda_base_phys;
-    /* write the payload after the 2-byte alignment pad */
-    u8 *dst = (u8 *)rx->qpl_base + offset + GVE_RX_PADDING;
+    u16 pad = gqi_dev_in_packet ? 0 : GVE_RX_PADDING;   /* pad first buffer only */
+    u8 *dst = (u8 *)rx->qpl_base + offset + pad;
     for (u16 i = 0; i < pkt_len; i++) dst[i] = (u8)(i + 1);
-    rx->desc[slot].len = htobe16(pkt_len + GVE_RX_PADDING);
+    rx->desc[slot].len = htobe16(pkt_len + pad);
     rx->desc[slot].flags_seq = flags;
+    /* PKT_CONT means more buffers follow -> stay in-packet; otherwise the
+     * next buffer starts a fresh packet. */
+    gqi_dev_in_packet = !!(flags & GVE_RXF_PKT_CONT);
     gqi_rx_cursor++;
     rx->adapter->event_counters[rx->event_counter_idx] = htobe32(gqi_rx_cursor);
 }
@@ -2522,6 +2534,132 @@ static void scenario_teardown_held(void)
     total_processors = saved_tp;
 }
 
+/* count the buffers in a pbuf chain */
+static int pbuf_chain_len(struct pbuf *p)
+{
+    int n = 0;
+    for (; p != NULL; p = p->next) n++;
+    return n;
+}
+
+/* Scenario 50: a frame the device splits across several fixed-size
+ * (GVE_DQO_BUF_SIZE = 2 KB) RX buffers is reassembled into one pbuf chain of
+ * the right total length and buffer count — for DQO-RDA, DQO-QPL and GQI.
+ * The earlier chain scenarios used arbitrary 2-buffer splits; this one uses
+ * full buffer-sized fragments and a long chain, the realistic shape for a
+ * jumbo frame over 2 KB buffers. */
+static void scenario_rx_fixed_buffer_split(void)
+{
+    rprintf("scenario_rx_fixed_buffer_split\n");
+    /* four full 2 KB buffers + an 808-byte tail = 8 KB + 808 = a 8.99 KB frame */
+    const u16 full = GVE_DQO_BUF_SIZE;     /* 2048 */
+    const u16 tail = 808;
+    const u32 expect = (u32)full * 4 + tail;
+
+    /* DQO-RDA. */
+    {
+        gve adapter = make_adapter();
+        gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+        make_rx_dqo(adapter, rx, 256);
+        gve_rx_dqo_fill(rx);
+        g_input_hold = 1; g_last_input = NULL;
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, tail, true,  false);
+        run_rx_service(rx);
+        g_input_hold = 0;
+        CHECK(g_last_input_totlen == expect,
+              "DQO-RDA 5-buffer split reassembled to %u, got %u",
+              expect, g_last_input_totlen);
+        CHECK(pbuf_chain_len(g_last_input) == 5, "DQO-RDA chain has 5 buffers");
+        if (g_last_input) pbuf_free(g_last_input);
+        free_rx_dqo(rx);
+    }
+
+    /* DQO-QPL (copy-out path). */
+    {
+        gve adapter = make_adapter();
+        gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+        make_rx_dqo_mode(adapter, rx, 256, true);
+        gve_rx_dqo_fill(rx);
+        g_input_hold = 1; g_last_input = NULL;
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, full, false, false);
+        dqo_dev_rx_complete(rx, tail, true,  false);
+        run_rx_service(rx);
+        g_input_hold = 0;
+        CHECK(g_last_input_totlen == expect,
+              "DQO-QPL 5-buffer split reassembled to %u, got %u",
+              expect, g_last_input_totlen);
+        CHECK(pbuf_chain_len(g_last_input) == 5, "DQO-QPL chain has 5 buffers");
+        if (g_last_input) pbuf_free(g_last_input);
+        free_rx_dqo(rx);
+    }
+
+    /* GQI: the device strips a 2-byte pad on the first buffer only, so the
+     * first fragment carries (buffer - pad) data and continuations a full
+     * buffer.  Feed the per-buffer data lengths the device delivers. */
+    {
+        gve adapter = make_adapter_gqi(true);
+        gve_rx_queue rx = &adapter->rx[0];
+        make_rx_gqi(adapter, rx, 64);
+        u16 first = full - GVE_RX_PADDING;     /* 2046 of data on buffer 1 */
+        g_input_hold = 1; g_last_input = NULL;
+        gqi_dev_rx_complete(rx, first, GVE_RXF_PKT_CONT);
+        gqi_dev_rx_complete(rx, full,  GVE_RXF_PKT_CONT);
+        gqi_dev_rx_complete(rx, full,  GVE_RXF_PKT_CONT);
+        gqi_dev_rx_complete(rx, tail,  0);
+        apply((thunk)&rx->service);
+        g_input_hold = 0;
+        u32 gqi_expect = (u32)first + full + full + tail;
+        CHECK(g_last_input_totlen == gqi_expect,
+              "GQI 4-buffer split reassembled to %u, got %u",
+              gqi_expect, g_last_input_totlen);
+        CHECK(pbuf_chain_len(g_last_input) == 4, "GQI chain has 4 buffers");
+        if (g_last_input) pbuf_free(g_last_input);
+    }
+}
+
+/* Scenario 51: DQO-QPL TX rejects a single segment larger than one fixed
+ * bounce slot (GVE_DQO_BUF_SIZE), since a buffer may not cross a registered
+ * QPL page.  Such a segment is dropped (not re-queued forever) and the
+ * queue stays usable.  (The RDA too-many-segments drop is scenario_tx_drop_
+ * oversize; this is the QPL fixed-slot constraint.) */
+static void scenario_tx_qpl_oversize(void)
+{
+    rprintf("scenario_tx_qpl_oversize\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo_mode(adapter, tx, 256, true);      /* DQO-QPL */
+    int live_before = pbufs_live;
+    int free0 = (int)(tx->tags_ntc - tx->tags_ntu);
+    u32 slots0 = tx->qpl_free_slots;
+
+    struct pbuf *p = make_pkt(GVE_DQO_BUF_SIZE + 1000);   /* 3 KB > 2 KB slot */
+    err_t e = gve_linkoutput_dqo(&adapter->ndev.n, p);
+    CHECK(e == ERR_OK, "QPL oversize linkoutput accepts then drops, returns OK");
+    CHECK(tx->head == 0, "no descriptors written for the oversize segment");
+    CHECK((int)(tx->tags_ntc - tx->tags_ntu) == free0, "no tag consumed");
+    CHECK(tx->qpl_free_slots == slots0, "no bounce slot taken");
+    CHECK(tx->running == true, "queue not wedged by the oversize drop");
+    CHECK(p->ref == 1, "driver released its ref on the dropped segment");
+
+    /* the queue still works: a normal packet goes through afterwards. */
+    struct pbuf *q = make_pkt(128);
+    u16 tag = send_pkt(tx, adapter, q);
+    CHECK(tx->head == 2, "a normal packet sends after the oversize drop");
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+
+    pbuf_free(p);
+    pbuf_free(q);
+    CHECK(pbufs_live == live_before, "no leak across oversize drop + normal send");
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -2577,6 +2715,8 @@ int main(int argc, char **argv)
     scenario_gqi_rx_midchain();
     scenario_dqo_rx_more();
     scenario_teardown_held();
+    scenario_rx_fixed_buffer_split();
+    scenario_tx_qpl_oversize();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
