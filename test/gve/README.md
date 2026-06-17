@@ -24,7 +24,7 @@ driver, not a copy.
 
 ## Coverage
 
-42 scenarios (244 checks) exercise every queue format in both directions
+43 scenarios (306 checks) exercise every queue format in both directions
 (GQI-QPL/RDA, DQO-RDA/QPL TX and RX), multi-segment packets, TX
 backpressure, the MISS/REINJECT tag pool and its edge encodings, RX chaining
 and drop-to-EOP, an out-of-order completion fuzzer, the device-option
@@ -48,10 +48,13 @@ pass, and linkoutput returning ERR_MEM on a full software queue), and the RX
 error/drop branches (DQO-RDA bad_req_id, errored continuation freeing a
 partial chain, zero-length and stack-rejected packets; GQI runt buffers and
 continuation-alloc failures; DQO-QPL drop-to-EOP recycle and copy-out alloc
-failure).
+failure).  Finally a sweep walks the allocation-failure point across every
+queue-create cascade for all four formats, unwinding the create functions'
+err_after_* cleanup labels from progressively deeper points until the rings
+come up (the QPL page-list and slot-list allocations included).
 
 Measured line coverage (gcov): gve_dqo.c 97%, gve_datapath.c 89%,
-gve_adminq.c 80%, gve_main.c 93%.  To measure: compile the four driver
+gve_adminq.c 94%, gve_main.c 93%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 
@@ -60,9 +63,11 @@ actually steers RX flows across queues per the RSS table — that is Toeplitz
 hashing in the NIC, and is the open question (#2165) answered only by
 per-queue RX counters on real GCP hardware.
 
-The remaining uncovered lines are mostly the deeper allocation-failure
-cleanup cascades that need failure injected at specific later allocation
-points, and msg_err diagnostics on those paths.
+The remaining uncovered lines are mostly the admin-queue command timeout
+path (the device never answering, which the synchronous device model cannot
+reproduce), the GQI RX non-zero-copy fallback (the half-page buffer lands at
+a ring slot the in-order device model never reaches), and a few QPL slot
+wrap and msg_err diagnostic lines.
 
 ## Build & run
 

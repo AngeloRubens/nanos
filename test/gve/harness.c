@@ -2223,6 +2223,43 @@ static void scenario_rx_dqo_qpl_edge(void)
     free_rx_dqo(rx);
 }
 
+/* Scenario 43: sweep the allocation-failure point across every queue-create
+ * cascade.  Each step fails one allocation deeper than the last (on a fresh
+ * adapter), so the create functions' err_after_* cleanup labels are unwound
+ * from progressively deeper points until the rings come up.  Covers the
+ * TX/RX create-and-destroy error paths for all four queue formats, including
+ * the QPL page-list and slot-list allocations. */
+static void sweep_setup_fail(u16 opt)
+{
+    int saved_tp = total_processors;
+    boolean reached_success = false;
+    for (int k = 0; k < 48 && !reached_success; k++) {
+        gve a = bring_up_to_cfg(opt, 1);
+        a->contiguous = fail_heap();
+        a->general = fail_heap();
+        g_alloc_fail_after = k;
+        boolean ok = gve_setup_queues(a);
+        g_alloc_fail_after = -1;
+        a->contiguous = gh; a->general = gh;
+        if (ok)
+            reached_success = true;    /* every cascade depth exercised */
+        else
+            CHECK(!(a->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING)),
+                  "setup-queues failure leaves DEVICE_RUNNING clear (k=%d)", k);
+    }
+    CHECK(reached_success, "setup-queues sweep reaches a working ring (opt 0x%x)", opt);
+    total_processors = saved_tp;
+}
+
+static void scenario_setup_fail_sweep(void)
+{
+    rprintf("scenario_setup_fail_sweep\n");
+    sweep_setup_fail(GVE_DEV_OPT_ID_DQO_RDA);
+    sweep_setup_fail(GVE_DEV_OPT_ID_DQO_QPL);
+    sweep_setup_fail(GVE_DEV_OPT_ID_GQI_RDA);
+    sweep_setup_fail(0);                       /* GQI-QPL */
+}
+
 int main(int argc, char **argv)
 {
     gh = init_process_runtime();
@@ -2271,6 +2308,7 @@ int main(int argc, char **argv)
     scenario_rx_dqo_edge();
     scenario_rx_gqi_edge();
     scenario_rx_dqo_qpl_edge();
+    scenario_setup_fail_sweep();
 
     rprintf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
