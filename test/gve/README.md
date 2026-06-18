@@ -176,4 +176,11 @@ diagnostic lines.
 
 ## Build & run
 
-    make -C test/gve run
+    make -C test/gve run        # functional suite (463 checks)
+    make -C test/gve sanitize   # same scenarios under ASan + UBSan
+    make -C test/gve tsan       # concurrency scenarios under ThreadSanitizer
+    make -C test/gve litmus     # memory-ordering litmus matrix
+
+All four run in CI (`.github/workflows/gve-ci.yml`): `dqo-harness` (run),
+`harness-sanitize`, `harness-tsan` and `litmus-x86` on x86 runners, plus
+`litmus-arm64` on a native arm64 runner.

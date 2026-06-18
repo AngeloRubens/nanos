@@ -91,3 +91,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run litmus matrix
         run: cd test/gve && ITERS=8000000 ./litmus-check.sh
+
+  # Same datapath/lifecycle scenarios under AddressSanitizer + UBSan: an
+  # independent check of memory safety (use-after-free, overflow, bad frees)
+  # across the ref-ownership, wrap-stress and out-of-order fuzzer paths.
+  harness-sanitize:
+    name: DQO harness (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: make -C test/gve sanitize
+
+  # And under ThreadSanitizer with real atomic spinlocks: the concurrency
+  # scenarios (multi-producer TX, concurrent RX service, per-queue, reset
+  # single-flight) must report no data races.
+  harness-tsan:
+    name: DQO harness (ThreadSanitizer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: make -C test/gve tsan
