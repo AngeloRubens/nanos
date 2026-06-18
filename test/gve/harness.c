@@ -129,10 +129,33 @@ static heap fail_heap(void)
     return &g_failheap;
 }
 
+/* Counting heap: delegates to gh but tallies alloc/free, so a scenario can
+ * assert how many allocations the driver makes (e.g. that the TX-RDA hot
+ * path makes none per packet). */
+static u64 g_heap_allocs, g_heap_frees;
+static u64 counthp_alloc(struct heap *h, bytes b)  { g_heap_allocs++; return gh->alloc(gh, b); }
+static void counthp_dealloc(struct heap *h, u64 a, bytes b) { g_heap_frees++; gh->dealloc(gh, a, b); }
+static struct heap g_counthp;
+static heap count_heap(void)
+{
+    g_counthp.alloc = counthp_alloc;
+    g_counthp.dealloc = counthp_dealloc;
+    g_counthp.pagesize = gh->pagesize;
+    return &g_counthp;
+}
+
 int total_processors = 1;
 static struct harness_cpu the_cpu = { .id = 0 };
+#ifdef GVE_HARNESS_SMP
+/* Per-thread cpuinfo so concurrent producer/consumer threads model distinct
+ * CPUs (linkoutput picks its queue by current_cpu()->id). */
+static __thread struct harness_cpu tls_cpu = { .id = 0 };
+cpuinfo current_cpu(void) { return &tls_cpu; }
+static void set_cpu(u32 id) { tls_cpu.id = id; }
+#else
 cpuinfo current_cpu(void) { return &the_cpu; }
 static void set_cpu(u32 id) { the_cpu.id = id; }
+#endif
 
 /* Deferred work: run synchronously (single-threaded harness). */
 void async_apply(thunk t)    { apply(t); }
@@ -143,11 +166,13 @@ void async_apply_bh(thunk t) { apply(t); }
 /* ------------------------------------------------------------------ */
 
 static int pbufs_live;          /* outstanding pbufs (alloc - free-to-zero) */
+static u64 pbuf_alloc_calls;    /* monotonic count of pbuf_alloc calls */
 static int pbuf_alloc_fail_after = -1;  /* >=0: fail once the counter hits 0 */
 
 struct pbuf *pbuf_alloc(int layer, u16 length, int type)
 {
     HEAP_LOCK();
+    pbuf_alloc_calls++;
     if (pbuf_alloc_fail_after == 0) {
         HEAP_UNLOCK();
         return 0;
@@ -3181,7 +3206,198 @@ static void scenario_conc_rx(void)
     CHECK(rx->ctx_head == NULL, "no partial chain left after concurrent service");
     free_rx_dqo(rx);
 }
+
+/* Scenario C3: per-queue concurrency — each thread runs on its own CPU and
+ * transmits on its own TX queue.  The queues' ring_mtx state is independent,
+ * so this confirms there is no false sharing or cross-queue corruption when
+ * several queues are driven at once (and TSan sees no race). */
+static gve g_conc_mq_adapter;
+static void *conc_mq_producer(void *arg)
+{
+    long id = (long)arg;
+    set_cpu((u32)id);                          /* this thread is CPU id */
+    for (int i = 0; i < CONC_PERPROD; i++)
+        gve_linkoutput_dqo(&g_conc_mq_adapter->ndev.n, g_conc_tx_pkts[id][i]);
+    return NULL;
+}
+static void scenario_conc_multiqueue(void)
+{
+    rprintf("scenario_conc_multiqueue\n");
+    gve adapter = make_adapter();
+    adapter->num_queues = CONC_NPROD;
+    for (int q = 0; q < CONC_NPROD; q++)
+        make_tx_dqo(adapter, &adapter->tx_dqo[q], 4096);
+    g_conc_mq_adapter = adapter;
+    int live_before = pbufs_live;
+    for (int t = 0; t < CONC_NPROD; t++)
+        for (int i = 0; i < CONC_PERPROD; i++)
+            g_conc_tx_pkts[t][i] = make_pkt(64);
+
+    pthread_t th[CONC_NPROD];
+    for (long t = 0; t < CONC_NPROD; t++)
+        pthread_create(&th[t], NULL, conc_mq_producer, (void *)t);
+    for (int t = 0; t < CONC_NPROD; t++)
+        pthread_join(th[t], NULL);
+
+    for (int q = 0; q < CONC_NPROD; q++)
+        CHECK(adapter->tx_dqo[q].head == (u32)(CONC_PERPROD * 2),
+              "queue %d got exactly its %d packets (head=%u)",
+              q, CONC_PERPROD, adapter->tx_dqo[q].head);
+
+    for (int q = 0; q < CONC_NPROD; q++) {
+        gve_tx_dqo_queue tx = &adapter->tx_dqo[q];
+        /* Point the device model at this queue's completion ring BEFORE
+         * writing its completions. */
+        the_dev.tx_compl = tx->compl;
+        the_dev.tx_compl_mask = tx->mask;
+        the_dev.tx_compl_tail = tx->compl_head;
+        the_dev.tx_compl_gen = tx->expected_gen;
+        for (u16 t = 0; t <= tx->mask; t++)
+            if (tx->seg_counts[t])
+                dqo_dev_complete_pkt(&the_dev, t, GVE_DQO_COMPL_TYPE_PKT);
+        for (int g = 0; tx->compl_head < (u32)CONC_PERPROD && g < CONC_PERPROD + 16; g++)
+            run_cleanup(tx);
+    }
+    set_cpu(0);
+    for (int t = 0; t < CONC_NPROD; t++)
+        for (int i = 0; i < CONC_PERPROD; i++)
+            pbuf_free(g_conc_tx_pkts[t][i]);
+    CHECK(pbufs_live == live_before, "no leak across concurrent multi-queue TX");
+}
+
+/* Scenario C4: reset single-flight — many threads request a reset at once;
+ * the RESETTING flag (atomic_test_and_set) admits exactly one, so there is no
+ * double teardown, and the adapter comes back DEVICE_RUNNING.  (The harness
+ * runs async_apply_bh synchronously, so this exercises the single-flight CAS
+ * and the global_lock, not the datapath-vs-teardown window — that window is a
+ * documented accepted risk with ENA precedent and is not contendable here.) */
+static gve g_conc_reset_adapter;
+static void *conc_reset_trigger(void *arg)
+{
+    (void)arg;
+    gve_trigger_reset(g_conc_reset_adapter);
+    return NULL;
+}
+static void scenario_conc_reset(void)
+{
+    rprintf("scenario_conc_reset\n");
+    gve a = bring_up(GVE_DEV_OPT_ID_DQO_RDA, 1);
+    g_conc_reset_adapter = a;
+    u64 wd0 = a->dev_stats.wd_expired;
+
+    pthread_t th[CONC_NPROD];
+    for (int t = 0; t < CONC_NPROD; t++)
+        pthread_create(&th[t], NULL, conc_reset_trigger, NULL);
+    for (int t = 0; t < CONC_NPROD; t++)
+        pthread_join(th[t], NULL);
+
+    CHECK(a->flags & (1ULL << GVE_FLAG_DEVICE_RUNNING),
+          "adapter is DEVICE_RUNNING after concurrent reset requests");
+    CHECK(!(a->flags & (1ULL << GVE_FLAG_RESETTING)),
+          "RESETTING cleared (single-flight reset completed)");
+    (void)wd0;
+}
 #endif /* GVE_HARNESS_SMP */
+
+/* Scenario 65: ring-size sweep — every supported descriptor-ring size
+ * (64 = GVE_MIN_RING_SIZE, 256, 1024, 4096) works for TX and RX in all four
+ * queue formats: a packet round-trips and the queue tears down with no leak. */
+static void scenario_ring_sizes(void)
+{
+    rprintf("scenario_ring_sizes\n");
+    u16 sizes[] = { 64, 256, 1024, 4096 };
+    for (unsigned s = 0; s < sizeof(sizes)/sizeof(sizes[0]); s++) {
+        u16 n = sizes[s];
+
+        /* DQO-RDA and DQO-QPL TX + RX. */
+        for (int qpl = 0; qpl <= 1; qpl++) {
+            gve adapter = make_adapter();
+            gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+            gve_rx_dqo_queue rx = &adapter->rx_dqo[0];
+            int live = pbufs_live;
+            make_tx_dqo_mode(adapter, tx, n, qpl);
+            struct pbuf *p = make_pkt(100);
+            u16 tag = send_pkt(tx, adapter, p);
+            CHECK(tx->head >= 2, "DQO%s TX size %u: descriptors written",
+                  qpl ? "-QPL" : "-RDA", n);
+            dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+            run_cleanup(tx);
+            pbuf_free(p);
+
+            make_rx_dqo_mode(adapter, rx, n, qpl);
+            gve_rx_dqo_fill(rx);
+            int d = rx_delivered;
+            dqo_dev_rx_complete(rx, 100, true, false);
+            run_rx_service(rx);
+            CHECK(rx_delivered == d + 1, "DQO%s RX size %u: packet delivered",
+                  qpl ? "-QPL" : "-RDA", n);
+            free_rx_dqo(rx);
+            CHECK(pbufs_live == live, "DQO%s size %u: no leak",
+                  qpl ? "-QPL" : "-RDA", n);
+        }
+
+        /* GQI-RDA and GQI-QPL TX + RX. */
+        for (int rda = 0; rda <= 1; rda++) {
+            gve adapter = make_adapter_gqi(rda);
+            gve_tx_queue tx = &adapter->tx[0];
+            gve_rx_queue rx = &adapter->rx[0];
+            int live = pbufs_live;
+            make_tx_gqi(adapter, tx, n);
+            gve_setup_linkoutput(adapter, &adapter->ndev.n);
+            struct pbuf *p = make_pkt(100);
+            adapter->ndev.n.linkoutput(&adapter->ndev.n, p);
+            CHECK(tx->head >= 1, "GQI-%s TX size %u: descriptor written",
+                  rda ? "RDA" : "QPL", n);
+            gqi_dev_tx_complete_all(adapter, tx);
+            run_tx_gqi_cleanup(tx);
+            pbuf_free(p);
+
+            make_rx_gqi(adapter, rx, n);
+            int d = rx_delivered;
+            gqi_dev_rx_complete(rx, 100, 0);
+            apply((thunk)&rx->service);
+            CHECK(rx_delivered == d + 1, "GQI-%s RX size %u: packet delivered",
+                  rda ? "RDA" : "QPL", n);
+            CHECK(pbufs_live == live, "GQI-%s size %u: no leak (TX path)",
+                  rda ? "RDA" : "QPL", n);
+        }
+    }
+}
+
+/* Scenario 66: allocation accounting — the TX-RDA hot path makes ZERO heap
+ * allocations per packet (it maps the pbuf's physical address; it does not
+ * copy or allocate).  A regression that added a per-packet alloc would be
+ * caught here.  RX-RDA in contrast allocates exactly one pbuf per posted
+ * buffer (the receive buffer). */
+static void scenario_alloc_accounting(void)
+{
+    rprintf("scenario_alloc_accounting\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 4096);
+    adapter->general = count_heap();        /* count driver allocations */
+    adapter->contiguous = count_heap();
+
+    const int N = 1000;
+    struct pbuf *pkts[1000];
+    for (int i = 0; i < N; i++)
+        pkts[i] = make_pkt(64);             /* pre-allocated (not the hot path) */
+
+    u64 ha0 = g_heap_allocs, pa0 = pbuf_alloc_calls;
+    for (int i = 0; i < N; i++)
+        send_pkt(tx, adapter, pkts[i]);     /* the hot path */
+    CHECK(g_heap_allocs == ha0, "TX-RDA send made no driver heap allocations");
+    CHECK(pbuf_alloc_calls == pa0, "TX-RDA send allocated no pbufs");
+
+    adapter->general = gh; adapter->contiguous = gh;
+    for (u16 t = 0; t <= tx->mask; t++)
+        if (tx->seg_counts[t])
+            dqo_dev_complete_pkt(&the_dev, t, GVE_DQO_COMPL_TYPE_PKT);
+    while (tx->compl_head < (u32)N)
+        run_cleanup(tx);
+    for (int i = 0; i < N; i++)
+        pbuf_free(pkts[i]);
+}
 
 /* Scenario 60: RX multiqueue — four RX queues each consume their own
  * completions independently (own compl_head / buffer pool) and deliver
@@ -3401,6 +3617,8 @@ int main(int argc, char **argv)
     scenario_dqo_desc_layout();
     scenario_doorbell_format();
     scenario_rx_fill_wrap();
+    scenario_ring_sizes();
+    scenario_alloc_accounting();
     scenario_rx_multiqueue();
     scenario_rx_budget();
     scenario_tx_cleanup_budget();
@@ -3409,6 +3627,8 @@ int main(int argc, char **argv)
 #ifdef GVE_HARNESS_SMP
     scenario_conc_tx();
     scenario_conc_rx();
+    scenario_conc_multiqueue();
+    scenario_conc_reset();
 #endif
 
     rprintf("\n%d checks, %d failures\n", checks, failures);

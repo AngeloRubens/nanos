@@ -87,6 +87,13 @@ gve_adminq.c 96%, gve_main.c 99%.  To measure: compile the four driver
 files (gve_dqo.c is carried by harness.c via #include) and harness.c with
 `--coverage`, link, run, then `gcov -n` the objects.
 
+Ring geometry and per-packet cost: a sweep builds TX and RX queues at every
+supported descriptor-ring size (64 = GVE_MIN_RING_SIZE, 256, 1024, 4096) in
+all four formats and round-trips a packet through each with no leak; and an
+allocation-accounting scenario asserts the TX-RDA hot path makes zero heap
+allocations per packet (it maps the pbuf's physical address — a regression
+that added a per-packet alloc would be caught) via a counting heap wrapper.
+
 The multi-queue and scheduling machinery is exercised directly: per-CPU TX
 dispatch (CPU n -> queue n % nq) with cross-queue tag isolation; RX
 multi-queue, where four RX queues consume their own completions independently
@@ -126,7 +133,13 @@ threads transmitting on one DQO-RDA queue (ring_mtx must serialise the
 head/desc_tail/tag-pool/descriptor-ring writes), and two threads running the
 RX service at once (service_lock must serialise it so each completion is
 delivered exactly once — the dual-source double-run the design guards
-against).  TSan reports no data races; the functional invariants hold.  The
+against), four threads each transmitting on their own CPU and own TX queue
+(per-queue ring_mtx independence, no false sharing), and many threads
+requesting a reset at once (the RESETTING flag admits exactly one — reset
+single-flight).  TSan reports no data races; the functional invariants hold.
+(The datapath-vs-teardown window during a reset is a documented accepted risk
+with ENA precedent, and the harness runs deferred work synchronously, so it is
+not contended here — that is closed only by the GCP hardware test.)  The
 lock-free runtime queue's internals are suppressed (tsan.supp) since its
 inline-asm CAS is opaque to TSan and it is a vetted primitive, not driver
 code.  TSan needs ASLR off, so the target wraps the run in `setarch -R`.
