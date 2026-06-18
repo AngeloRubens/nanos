@@ -63,14 +63,27 @@ jobs:
 
   # Host harness that compiles and executes the real DQO datapath
   # (src/gcp/gve/gve_dqo.c) against a software device model — the only
-  # pre-hardware test that runs the datapath/lifecycle logic.
-  dqo-harness:
-    name: DQO datapath harness
-    runs-on: ubuntu-latest
+  # pre-hardware test that runs the datapath/lifecycle logic.  Run on both
+  # arches (the Makefile selects src/$(uname -m) for the arch primitives), in
+  # three modes: plain (functional), ASan+UBSan (memory safety) and
+  # ThreadSanitizer (concurrency / data races).
+  harness:
+    name: DQO harness ${{ matrix.mode }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        mode: [run, sanitize, tsan]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - name: Build and run
-        run: make -C test/gve run
+        run: make -C test/gve ${{ matrix.mode }}
 
   # Memory-ordering litmus matrix: confirms the driver's barriers are
   # necessary (each one's absence is detectable on the arch that needs it)
@@ -91,25 +104,3 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run litmus matrix
         run: cd test/gve && ITERS=8000000 ./litmus-check.sh
-
-  # Same datapath/lifecycle scenarios under AddressSanitizer + UBSan: an
-  # independent check of memory safety (use-after-free, overflow, bad frees)
-  # across the ref-ownership, wrap-stress and out-of-order fuzzer paths.
-  harness-sanitize:
-    name: DQO harness (ASan + UBSan)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build and run
-        run: make -C test/gve sanitize
-
-  # And under ThreadSanitizer with real atomic spinlocks: the concurrency
-  # scenarios (multi-producer TX, concurrent RX service, per-queue, reset
-  # single-flight) must report no data races.
-  harness-tsan:
-    name: DQO harness (ThreadSanitizer)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build and run
-        run: make -C test/gve tsan

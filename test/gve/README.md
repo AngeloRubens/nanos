@@ -181,6 +181,8 @@ diagnostic lines.
     make -C test/gve tsan       # concurrency scenarios under ThreadSanitizer
     make -C test/gve litmus     # memory-ordering litmus matrix
 
-All four run in CI (`.github/workflows/gve-ci.yml`): `dqo-harness` (run),
-`harness-sanitize`, `harness-tsan` and `litmus-x86` on x86 runners, plus
-`litmus-arm64` on a native arm64 runner.
+All four run in CI (`.github/workflows/gve-ci.yml`).  The Makefile selects
+`src/$(uname -m)` for the arch primitives, so the harness builds natively on
+both arches: the `harness` job is a matrix of {x86_64, aarch64} x {run,
+sanitize, tsan} (aarch64 on a native runner), and the litmus matrix runs as
+`litmus-x86` and `litmus-arm64`.

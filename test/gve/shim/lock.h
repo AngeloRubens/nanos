@@ -20,6 +20,16 @@ typedef struct rw_spinlock {
     volatile u64 readers;
 } *rw_spinlock;
 
+/* CPU relax hint while spinning — arch-generic so the harness builds on both
+ * x86 and arm64. */
+#if defined(__x86_64__)
+# define GVE_CPU_RELAX() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+# define GVE_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#else
+# define GVE_CPU_RELAX() __asm__ __volatile__("" ::: "memory")
+#endif
+
 static inline void spin_lock_init(spinlock l)
 {
     __atomic_store_n(&l->w, 0, __ATOMIC_RELAXED);
@@ -39,7 +49,7 @@ static inline boolean spin_try(spinlock l)
 static inline void spin_lock(spinlock l)
 {
     while (!spin_try(l))
-        __builtin_ia32_pause();
+        GVE_CPU_RELAX();
 }
 static inline void spin_unlock(spinlock l)
 {

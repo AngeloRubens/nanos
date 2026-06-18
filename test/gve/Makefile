@@ -7,8 +7,13 @@
 ROOT := ../..
 CONTGEN := $(ROOT)/output/tools/bin/contgen
 
+# Host arch: uname -m matches the src/<arch> directory names (x86_64,
+# aarch64), so the harness builds natively on both — the arch primitives
+# (barriers, spinlock CAS, htobe) come from src/$(ARCH)/machine.h.
+ARCH := $(shell uname -m)
+
 INC := -Ishim -I. \
-       -I$(ROOT)/src/gcp/gve -I$(ROOT)/src/x86_64 -I$(ROOT)/src \
+       -I$(ROOT)/src/gcp/gve -I$(ROOT)/src/$(ARCH) -I$(ROOT)/src \
        -I$(ROOT)/src/runtime -I$(ROOT)/src/unix -I$(ROOT)/src/unix_process
 
 CFLAGS := -O2 -std=gnu11 $(INC)
