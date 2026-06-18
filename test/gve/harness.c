@@ -2945,6 +2945,41 @@ static void scenario_no_csum_offload(void)
 /* Scenario 56: DQO report_event — the driver sets the REPORT bit sparsely
  * (at least GVE_TX_MIN_RE_INTERVAL descriptors apart, per Google), not on
  * every packet, and advances last_re_idx. */
+/* Scenario 56b: a descriptor (type 0x4) completion — which the device emits
+ * in response to the report_event bit we set — is skipped gracefully.  The
+ * port deliberately drives TX ring space from PKT completions and ignores
+ * DESC completions (unlike Linux, which advances hw_tx_head from them), so
+ * the cleanup must step over a DESC completion without mis-parsing it as a
+ * packet tag, without counting a bad tag, and without retiring anything. */
+static void scenario_dqo_desc_completion(void)
+{
+    rprintf("scenario_dqo_desc_completion\n");
+    gve adapter = make_adapter();
+    gve_tx_dqo_queue tx = &adapter->tx_dqo[0];
+    make_tx_dqo(adapter, tx, 256);
+
+    struct pbuf *p = make_pkt(100);
+    u16 tag = send_pkt(tx, adapter, p);          /* one real packet outstanding */
+    u64 reset_before = (adapter->flags >> GVE_FLAG_RESETTING) & 1;
+
+    /* The device emits a descriptor completion (type DESC) for the
+     * report_event we requested; its tag field carries a desc index, not a
+     * packet tag. */
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_DESC);
+    run_cleanup(tx);
+    CHECK(tx->compl_head == 1, "DESC completion skipped (cursor advanced)");
+    CHECK(tx->tx_stats.bad_compl_tag == 0, "DESC completion is not a bad tag");
+    CHECK(tx->seg_counts[tag] != 0, "the real packet was not retired by the DESC compl");
+    CHECK(((adapter->flags >> GVE_FLAG_RESETTING) & 1) == reset_before,
+          "no reset scheduled for a DESC completion");
+
+    /* the packet's own PKT completion still retires it normally. */
+    dqo_dev_complete_pkt(&the_dev, tag, GVE_DQO_COMPL_TYPE_PKT);
+    run_cleanup(tx);
+    CHECK(tx->seg_counts[tag] == 0, "PKT completion retires the packet after the DESC");
+    pbuf_free(p);
+}
+
 static void scenario_dqo_report_event(void)
 {
     rprintf("scenario_dqo_report_event\n");
@@ -3613,6 +3648,7 @@ int main(int argc, char **argv)
     scenario_ring_size_restore();
     scenario_rss_key_fresh();
     scenario_no_csum_offload();
+    scenario_dqo_desc_completion();
     scenario_dqo_report_event();
     scenario_dqo_desc_layout();
     scenario_doorbell_format();
