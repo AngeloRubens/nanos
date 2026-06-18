@@ -1,6 +1,9 @@
 gve_harness
 gve_harness_san
 gve_harness_tsan
+litmus_full
+litmus_nomb
+litmus_normb
 closure_templates.h
 *.o
 *.gcno

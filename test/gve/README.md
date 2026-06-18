@@ -144,6 +144,25 @@ lock-free runtime queue's internals are suppressed (tsan.supp) since its
 inline-asm CAS is opaque to TSan and it is a vetted primitive, not driver
 code.  TSan needs ASLR off, so the target wraps the run in `setarch -R`.
 
+`make -C test/gve litmus` runs the memory-ordering litmus matrix
+(litmus.c, a standalone program with no runtime deps that mirrors the
+driver's barrier macros).  Two patterns on pinned cores stand in for the
+driver's ordering contracts: MP (message passing) — a producer writes the
+body, write_barrier, sets a flag; a consumer waits the flag, read_barrier,
+reads the body — the completion gen-bit / RX event-counter / doorbell shape
+(the sibling of the audited arm64 fix bc3855ae); and SB (store buffering) —
+each thread stores then loads the other's store with a full barrier between —
+the TX stop/wake recheck.  litmus-check.sh builds three variants and asserts
+the matrix per arch: the full build never violates; stripping the SB full
+barrier violates on both arches (StoreLoad reorders everywhere); stripping the
+MP read barrier violates ONLY on arm64, with x86 staying clean as the TSO
+control.  This turns "the barriers are present" into "the barriers are present
+AND necessary", and is wired into CI as `litmus-x86` and `litmus-arm64` jobs
+(the arm64 job on a native runner).  It validates the ordering contract and
+the architecture, not the driver's barrier placement (that is the static
+presence check and review); CPU-CPU ordering stands in for device DMA, which
+together with the backend remains a GCP-hardware question.
+
 What the harness cannot test (hardware behaviour): whether the device
 actually steers RX flows across queues per the RSS table — that is Toeplitz
 hashing in the NIC, and is the open question (#2165) answered only by

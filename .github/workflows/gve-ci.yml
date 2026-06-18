@@ -71,3 +71,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build and run
         run: make -C test/gve run
+
+  # Memory-ordering litmus matrix: confirms the driver's barriers are
+  # necessary (each one's absence is detectable on the arch that needs it)
+  # and that x86 behaves as the assumed TSO control.  Runs the same matrix on
+  # x86 and on a native arm64 runner; see test/gve/litmus.c and litmus-check.sh.
+  litmus-x86:
+    name: ordering litmus x86_64 (TSO control)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run litmus matrix
+        run: cd test/gve && ITERS=8000000 ./litmus-check.sh
+
+  litmus-arm64:
+    name: ordering litmus aarch64 (weak ordering)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run litmus matrix
+        run: cd test/gve && ITERS=8000000 ./litmus-check.sh

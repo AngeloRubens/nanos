@@ -63,7 +63,7 @@ closure_templates.h: $(CONTGEN)
 $(CONTGEN):
 	$(MAKE) -C $(ROOT)/tools contgen
 
-.PHONY: run sanitize tsan clean
+.PHONY: run sanitize tsan litmus clean
 run: gve_harness
 	./gve_harness
 
@@ -73,5 +73,12 @@ sanitize: gve_harness_san
 tsan: gve_harness_tsan
 	setarch $$(uname -m) -R env TSAN_OPTIONS=suppressions=tsan.supp ./gve_harness_tsan
 
+# Memory-ordering litmus matrix (standalone, no runtime deps): proves the
+# driver's barriers are necessary on the arch that needs them, with x86 as the
+# TSO control.  Same matrix on x86 and arm64; see litmus.c / litmus-check.sh.
+litmus: litmus.c litmus-check.sh
+	./litmus-check.sh
+
 clean:
-	rm -f gve_harness gve_harness_san gve_harness_tsan closure_templates.h
+	rm -f gve_harness gve_harness_san gve_harness_tsan \
+		litmus_full litmus_nomb litmus_normb closure_templates.h
