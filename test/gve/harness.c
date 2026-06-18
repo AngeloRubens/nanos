@@ -2579,6 +2579,52 @@ static void scenario_gqi_qpl_multiseg(void)
     CHECK(pbufs_live == live_before, "no leak across the QPL multi-seg wrap");
 }
 
+/* Scenario 47b: GQI RX non-zero-copy fallback.  When a QPL page's pbuf is
+ * still held by lwIP, gve_rx_fill posts the buffer at the page's half-way
+ * offset instead of recycling the page; gve_rx_service then detects the
+ * offset mismatch (qpl_offset != qpl_index * PAGESIZE) and COPIES the payload
+ * into a fresh pbuf rather than zero-copying the wrong slot.  The in-order
+ * device model cannot make the natural fill->recycle path land a half-page
+ * buffer at a reachable ring slot, so this drives the service branch directly
+ * with a half-page-offset completion and checks the copied bytes are right. */
+static void scenario_gqi_rx_copy_fallback(void)
+{
+    rprintf("scenario_gqi_rx_copy_fallback\n");
+    gve adapter = make_adapter_gqi(true);
+    gve_rx_queue rx = &adapter->rx[0];
+    make_rx_gqi(adapter, rx, 64);
+
+    /* Plant a known payload at the half-way point of QPL page 0 (after the
+     * 2-byte pad), and post that buffer's address at ring slot 0. */
+    const u16 len = 200;
+    u8 *src = (u8 *)rx->qpl_base + PAGESIZE / 2 + GVE_RX_PADDING;
+    for (u16 i = 0; i < len; i++) src[i] = (u8)(i * 3 + 5);
+
+    rx->qpl_head = 0;
+    rx->qpl_available = 0;                 /* qpl_index = 0 */
+    rx->tail = 0;
+    rx->data[0] = htobe64(rx->rda_base_phys + PAGESIZE / 2);   /* != 0*PAGESIZE */
+    rx->desc[0].len = htobe16(len + GVE_RX_PADDING);
+    rx->desc[0].flags_seq = 0;             /* single-buffer packet */
+    adapter->event_counters[rx->event_counter_idx] = htobe32(1);
+
+    u64 copy0 = rx->rx_stats.rx_copy;
+    int delivered0 = rx_delivered;
+    g_input_hold = 1; g_last_input = NULL;
+    apply((thunk)&rx->service);
+    g_input_hold = 0;
+
+    CHECK(rx->rx_stats.rx_copy == copy0 + 1, "fallback took the copy path");
+    CHECK(rx_delivered == delivered0 + 1, "the copied packet was delivered");
+    CHECK(g_last_input && g_last_input->tot_len == len,
+          "copied packet has the right length");
+    boolean match = g_last_input != NULL;
+    for (u16 i = 0; match && i < len; i++)
+        if (((u8 *)g_last_input->payload)[i] != (u8)(i * 3 + 5)) match = false;
+    CHECK(match, "copied payload matches the half-page source bytes");
+    if (g_last_input) pbuf_free(g_last_input);
+}
+
 /* Scenario 47: GQI RX — a runt buffer in the middle of a started chain
  * frees the partial, and a multi-buffer packet the stack rejects is freed
  * by the driver. */
@@ -3640,6 +3686,7 @@ int main(int argc, char **argv)
     scenario_adminq_timeout();
     scenario_watchdog_deadline_edges();
     scenario_gqi_qpl_multiseg();
+    scenario_gqi_rx_copy_fallback();
     scenario_gqi_rx_midchain();
     scenario_dqo_rx_more();
     scenario_teardown_held();
