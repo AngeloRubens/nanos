@@ -163,6 +163,16 @@ the architecture, not the driver's barrier placement (that is the static
 presence check and review); CPU-CPU ordering stands in for device DMA, which
 together with the backend remains a GCP-hardware question.
 
+`make -C test/gve mutate` runs mutation testing (mutate-check.sh): it injects
+realistic bugs into the driver — DQO doorbell endianness, the ring-size
+canonical restore, report_event spacing, per-CPU TX dispatch, the DQO
+completion gen-bit check, the RSS indirection table, the TX cleanup budget —
+and confirms the suite catches each (the harness exits non-zero), reverting
+every mutation.  A surviving mutation would mean the corresponding behaviour
+is not actually verified (an assertTrue(true)); the script fails if any
+survives.  This is the evidence that line coverage (the lines run) is matched
+by assertion coverage (a wrong driver fails the suite).
+
 What the harness cannot test (hardware behaviour): whether the device
 actually steers RX flows across queues per the RSS table — that is Toeplitz
 hashing in the NIC, and is the open question (#2165) answered only by
@@ -180,6 +190,7 @@ diagnostic lines.
     make -C test/gve sanitize   # same scenarios under ASan + UBSan
     make -C test/gve tsan       # concurrency scenarios under ThreadSanitizer
     make -C test/gve litmus     # memory-ordering litmus matrix
+    make -C test/gve mutate     # mutation testing (the suite is non-vacuous)
 
 All four run in CI (`.github/workflows/gve-ci.yml`).  The Makefile selects
 `src/$(uname -m)` for the arch primitives, so the harness builds natively on

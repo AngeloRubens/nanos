@@ -68,7 +68,7 @@ closure_templates.h: $(CONTGEN)
 $(CONTGEN):
 	$(MAKE) -C $(ROOT)/tools contgen
 
-.PHONY: run sanitize tsan litmus clean
+.PHONY: run sanitize tsan litmus mutate clean
 run: gve_harness
 	./gve_harness
 
@@ -83,6 +83,12 @@ tsan: gve_harness_tsan
 # TSO control.  Same matrix on x86 and arm64; see litmus.c / litmus-check.sh.
 litmus: litmus.c litmus-check.sh
 	./litmus-check.sh
+
+# Mutation testing: inject realistic driver bugs and confirm the suite catches
+# each (proves the tests are non-vacuous — no assertTrue(true)).  Reverts every
+# mutation; refuses to run with uncommitted driver changes.
+mutate: mutate-check.sh
+	./mutate-check.sh
 
 clean:
 	rm -f gve_harness gve_harness_san gve_harness_tsan \
