@@ -1797,7 +1797,7 @@ static gve bring_up(u16 opt, int ncpu)
     g_desc_nopts = opt ? 1 : 0;
     g_desc_opts[0] = opt;
     g_max_tx = g_max_rx = 8;
-    g_msix = 64;
+    g_msix = 64; g_msix_avail = 64; g_msix_setup_fail_after = -1;
     total_processors = ncpu;
     g_adminq = NULL; g_probe = 0; g_life_netif = 0;
     init_gve((kernel_heaps)0);

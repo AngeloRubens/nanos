@@ -88,16 +88,20 @@ static long mp_violations, sb_violations;
 
 /* Tight two-thread sense-reversing barrier: releases both threads within a
  * few cycles of each other (unlike pthread_barrier_wait, whose wake latency
- * decorrelates the threads and hides the store-buffering window). */
-static volatile int bar_count, bar_sense;
+ * decorrelates the threads and hides the store-buffering window).  Uses
+ * acquire/release atomics so the count reset is visible before the release is
+ * observed — otherwise on a weak arch the released thread could see the new
+ * sense but a stale count and corrupt the next round (the barrier must itself
+ * be correct so it never injects a false violation). */
+static int bar_count, bar_sense;
 static void rendezvous(int *sense)
 {
     *sense = !*sense;
-    if (__sync_add_and_fetch(&bar_count, 1) == 2) {
-        bar_count = 0;
-        bar_sense = *sense;            /* release the other thread */
+    if (__atomic_add_fetch(&bar_count, 1, __ATOMIC_ACQ_REL) == 2) {
+        __atomic_store_n(&bar_count, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&bar_sense, *sense, __ATOMIC_RELEASE);  /* release peer */
     } else {
-        while (bar_sense != *sense)
+        while (__atomic_load_n(&bar_sense, __ATOMIC_ACQUIRE) != *sense)
             LIT_CC();
     }
 }
