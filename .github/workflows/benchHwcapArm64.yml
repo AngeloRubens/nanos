@@ -16,6 +16,15 @@ name: HWCAP20 crypto A/B (arm64 · KVM · no TCG)
 #     OpenJ9 would print <n/a> and gate crypto differently).
 
 on:
+  # Runs from the feature branch itself (like gve-ci.yml) — no need to land the
+  # file on the default branch. Scoped to the files that affect the result.
+  push:
+    branches: [feat/jvm-hwcap-cpu-features]
+    paths:
+      - 'src/aarch64/unix_machine.h'
+      - 'src/aarch64/kernel_machine.h'
+      - 'test/jvm/CryptoBench.java'
+      - '.github/workflows/benchHwcapArm64.yml'
   workflow_dispatch:
     inputs:
       jre_package:
@@ -30,7 +39,8 @@ on:
 
 jobs:
   crypto-ab:
-    runs-on: ${{ inputs.runner_label }}
+    # push runs can't pass inputs -> fall back to the hosted arm64 label.
+    runs-on: ${{ inputs.runner_label || 'ubuntu-24.04-arm' }}
     steps:
       - name: Checkout (this ref = the patch candidate)
         uses: actions/checkout@v4
