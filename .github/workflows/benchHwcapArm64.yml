@@ -66,11 +66,13 @@ jobs:
       - name: Install build deps
         run: |
           # ops's get.sh gates on `which qemu-system-x86_64` even on arm64, so
-          # install qemu-system-x86 just to satisfy that check; qemu-system-arm
-          # provides qemu-system-aarch64, which actually boots the arm64 guest.
+          # the qemu-system metapackage (pulls qemu-system-x86) is required just
+          # to satisfy that check; qemu-system-arm/aarch64 actually boot the
+          # arm64 guest. Mirrors the known-good ops-jre-arm64 testJreArm64 job.
           sudo apt-get update
           sudo apt-get install -y build-essential binutils wget git python3 \
-            qemu-system-x86 qemu-system-arm qemu-utils
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
           which qemu-system-x86_64 qemu-system-aarch64
 
       - name: Set up a JDK to compile the benchmark
@@ -288,11 +290,13 @@ jobs:
       - name: Install build deps
         run: |
           # ops's get.sh gates on `which qemu-system-x86_64` even on arm64, so
-          # install qemu-system-x86 just to satisfy that check; qemu-system-arm
-          # provides qemu-system-aarch64, which actually boots the arm64 guest.
+          # the qemu-system metapackage (pulls qemu-system-x86) is required just
+          # to satisfy that check; qemu-system-arm/aarch64 actually boot the
+          # arm64 guest. Mirrors the known-good ops-jre-arm64 testJreArm64 job.
           sudo apt-get update
           sudo apt-get install -y build-essential binutils wget git python3 \
-            qemu-system-x86 qemu-system-arm qemu-utils
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
           which qemu-system-x86_64 qemu-system-aarch64
 
       - name: Set up a JDK to compile the benchmark
