@@ -162,13 +162,114 @@ static inline void thread_frame_restore_tls(context_frame f)
     }
 }
 
-/* We currently only check for the atomic feature as it is the only one used
-   to generate the necessary dynamic library search paths */
+/* AT_HWCAP bit positions (Linux arm64 ABI, <asm/hwcap.h>).  glibc's ifunc
+   resolvers and the JVM (HotSpot reads getauxval(AT_HWCAP)) gate SIMD/crypto
+   feature use on these.  We advertise only features whose instructions run at
+   EL0 without trapping AND whose register state is preserved across a context
+   switch, i.e. everything living in the V0-V31 / FPSR / FPCR block already
+   saved in the exception frame (FP/SIMD are enabled: CPACR_EL1.FPEN=NO_TRAP in
+   crt0.S; DC CVAP is enabled: SCTLR_EL1.UCI in page.c).  Each bit is derived
+   from the real ID register field, never hardcoded, so a CPU lacking a feature
+   never sees it advertised.
+
+   SVE is deliberately NOT advertised: its Z/P/FFR state is not saved on context
+   switch (the frame only holds Q0-Q31), so announcing it would silently corrupt
+   vector registers across threads.  Pointer authentication (needs key setup),
+   user access to ID registers (traps here), and RNDR (MRS may trap) are omitted
+   for the same "advertise only what we truly support" reason. */
+#define HWCAP_FP        (1 << 0)
+#define HWCAP_ASIMD     (1 << 1)
+#define HWCAP_AES       (1 << 3)
+#define HWCAP_PMULL     (1 << 4)
+#define HWCAP_SHA1      (1 << 5)
+#define HWCAP_SHA2      (1 << 6)
+#define HWCAP_CRC32     (1 << 7)
 #define HWCAP_ATOMICS   (1 << 8)
+#define HWCAP_FPHP      (1 << 9)
+#define HWCAP_ASIMDHP   (1 << 10)
+#define HWCAP_ASIMDRDM  (1 << 12)
+#define HWCAP_JSCVT     (1 << 13)
+#define HWCAP_FCMA      (1 << 14)
+#define HWCAP_LRCPC     (1 << 15)
+#define HWCAP_DCPOP     (1 << 16)
+#define HWCAP_SHA3      (1 << 17)
+#define HWCAP_SM3       (1 << 18)
+#define HWCAP_SM4       (1 << 19)
+#define HWCAP_ASIMDDP   (1 << 20)
+#define HWCAP_SHA512    (1 << 21)
+#define HWCAP_ASIMDFHM  (1 << 23)
+#define HWCAP_ILRCPC    (1 << 26)
+#define HWCAP_FLAGM     (1 << 27)
+#define HWCAP_SB        (1 << 29)
+
 static inline u64 get_cpu_capabilities(void)
 {
-    if (field_from_u64(read_psr(ID_AA64ISAR0_EL1), ID_AA64ISAR0_EL1_ATOMIC)
-        == ID_AA64ISAR0_EL1_ATOMIC_IMPLEMENTED)
-        return HWCAP_ATOMICS;
-    return 0;
+    u64 isar0 = read_psr(ID_AA64ISAR0_EL1);
+    u64 isar1 = read_psr(ID_AA64ISAR1_EL1);
+    u64 pfr0 = read_psr(ID_AA64PFR0_EL1);
+    u64 caps = 0;
+
+    /* FP / AdvSIMD: a field of 0xf means "not implemented" (signed sentinel);
+       a value of 1 additionally means half-precision (fp16) support. */
+    u64 fp = field_from_u64(pfr0, ID_AA64PFR0_EL1_FP);
+    if (fp != 0xf) {
+        caps |= HWCAP_FP;
+        if (fp == 1)
+            caps |= HWCAP_FPHP;
+    }
+    u64 simd = field_from_u64(pfr0, ID_AA64PFR0_EL1_ADVSIMD);
+    if (simd != 0xf) {
+        caps |= HWCAP_ASIMD;
+        if (simd == 1)
+            caps |= HWCAP_ASIMDHP;
+    }
+
+    /* ID_AA64ISAR0_EL1 */
+    u64 aes = field_from_u64(isar0, ID_AA64ISAR0_EL1_AES);
+    if (aes >= 1)
+        caps |= HWCAP_AES;
+    if (aes >= 2)
+        caps |= HWCAP_PMULL;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_SHA1) >= 1)
+        caps |= HWCAP_SHA1;
+    u64 sha2 = field_from_u64(isar0, ID_AA64ISAR0_EL1_SHA2);
+    if (sha2 >= 1)
+        caps |= HWCAP_SHA2;
+    if (sha2 >= 2)
+        caps |= HWCAP_SHA512;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_CRC32) >= 1)
+        caps |= HWCAP_CRC32;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_ATOMIC) >= ID_AA64ISAR0_EL1_ATOMIC_IMPLEMENTED)
+        caps |= HWCAP_ATOMICS;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_RDM) >= 1)
+        caps |= HWCAP_ASIMDRDM;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_SHA3) >= 1)
+        caps |= HWCAP_SHA3;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_SM3) >= 1)
+        caps |= HWCAP_SM3;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_SM4) >= 1)
+        caps |= HWCAP_SM4;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_DP) >= 1)
+        caps |= HWCAP_ASIMDDP;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_FHM) >= 1)
+        caps |= HWCAP_ASIMDFHM;
+    if (field_from_u64(isar0, ID_AA64ISAR0_EL1_TS) >= 1)
+        caps |= HWCAP_FLAGM;
+
+    /* ID_AA64ISAR1_EL1 */
+    if (field_from_u64(isar1, ID_AA64ISAR1_EL1_DPB) >= 1)
+        caps |= HWCAP_DCPOP;
+    if (field_from_u64(isar1, ID_AA64ISAR1_EL1_JSCVT) >= 1)
+        caps |= HWCAP_JSCVT;
+    if (field_from_u64(isar1, ID_AA64ISAR1_EL1_FCMA) >= 1)
+        caps |= HWCAP_FCMA;
+    u64 lrcpc = field_from_u64(isar1, ID_AA64ISAR1_EL1_LRCPC);
+    if (lrcpc >= 1)
+        caps |= HWCAP_LRCPC;
+    if (lrcpc >= 2)
+        caps |= HWCAP_ILRCPC;
+    if (field_from_u64(isar1, ID_AA64ISAR1_EL1_SB) >= 1)
+        caps |= HWCAP_SB;
+
+    return caps;
 }
