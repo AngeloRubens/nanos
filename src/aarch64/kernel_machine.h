@@ -144,21 +144,27 @@
 #define ID_AA64PFR0_EL1_GIC_GICC_SYSREG_3_0_4_0 1
 #define ID_AA64PFR0_EL1_GIC_GICC_SYSREG_4_1     3
 
-/* ID_AA64PFR0_EL1 FP / AdvSIMD fields: 0x0 = implemented, 0x1 = implemented
-   with half-precision, 0xf = not implemented (signed: 0xf means absent). */
+/* ID_AA64PFR0_EL1 FP / AdvSIMD fields (signed): 0 = implemented, 1 = also
+   half-precision, 0xf = not implemented. */
 #define ID_AA64PFR0_EL1_FP_BITS         4
 #define ID_AA64PFR0_EL1_FP_SHIFT        16
+#define ID_AA64PFR0_EL1_FP_NI           0xf
+#define ID_AA64PFR0_EL1_FP_FP16         1
 #define ID_AA64PFR0_EL1_ADVSIMD_BITS    4
 #define ID_AA64PFR0_EL1_ADVSIMD_SHIFT   20
+#define ID_AA64PFR0_EL1_ADVSIMD_NI      0xf
+#define ID_AA64PFR0_EL1_ADVSIMD_FP16    1
 
 /* ID_AA64ISAR0_EL1 feature fields (each 4 bits; 0 = absent, >=1 = present).
    ATOMIC (shift 20) and RNDR (shift 60) are defined above. */
 #define ID_AA64ISAR0_EL1_AES_BITS       4
 #define ID_AA64ISAR0_EL1_AES_SHIFT      4
+#define ID_AA64ISAR0_EL1_AES_PMULL      2   /* >= this also has PMULL/PMULL2 */
 #define ID_AA64ISAR0_EL1_SHA1_BITS      4
 #define ID_AA64ISAR0_EL1_SHA1_SHIFT     8
 #define ID_AA64ISAR0_EL1_SHA2_BITS      4
 #define ID_AA64ISAR0_EL1_SHA2_SHIFT     12
+#define ID_AA64ISAR0_EL1_SHA2_SHA512    2   /* >= this also has SHA512H/H2/SU0/SU1 */
 #define ID_AA64ISAR0_EL1_CRC32_BITS     4
 #define ID_AA64ISAR0_EL1_CRC32_SHIFT    16
 #define ID_AA64ISAR0_EL1_RDM_BITS       4
@@ -185,6 +191,7 @@
 #define ID_AA64ISAR1_EL1_FCMA_SHIFT     16
 #define ID_AA64ISAR1_EL1_LRCPC_BITS     4
 #define ID_AA64ISAR1_EL1_LRCPC_SHIFT    20
+#define ID_AA64ISAR1_EL1_LRCPC_ILRCPC   2   /* >= this also has LDAPR immediate offset */
 #define ID_AA64ISAR1_EL1_SB_BITS        4
 #define ID_AA64ISAR1_EL1_SB_SHIFT       36
 
