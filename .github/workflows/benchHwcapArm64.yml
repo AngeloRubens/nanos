@@ -64,7 +64,7 @@ jobs:
                           || echo "no /dev/kvm (expected on hosted arm64) — fine, TCG it is."
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y build-essential binutils wget git python3
+        run: sudo apt-get update && sudo apt-get install -y build-essential binutils wget git python3 qemu-system-arm qemu-utils
 
       - name: Set up a JDK to compile the benchmark
         uses: actions/setup-java@v4
@@ -279,7 +279,7 @@ jobs:
             | grep -iE 'aes|sha1|sha2|sha3|pmull|crc32|asimd|^fp$' | sort -u || true
 
       - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y build-essential binutils wget git python3
+        run: sudo apt-get update && sudo apt-get install -y build-essential binutils wget git python3 qemu-system-arm qemu-utils
 
       - name: Set up a JDK to compile the benchmark
         uses: actions/setup-java@v4
