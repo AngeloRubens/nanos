@@ -102,7 +102,7 @@ jobs:
           cp bench-classes/CryptoBench.class .
           cat > bench-config.json <<EOF
           {
-            "Args": ["-Xlog:os+cpu", "-XX:+PrintFlagsFinal",
+            "Args": ["-Xlog:os+cpu", "-XX:+UnlockDiagnosticVMOptions", "-XX:+PrintFlagsFinal",
                      "-Dbench.ms=${BENCH_MS}", "-cp", "/", "CryptoBench"],
             "Files": ["CryptoBench.class"],
             "RunConfig": { "Memory": "2G" }
@@ -326,7 +326,7 @@ jobs:
           cp bench-classes/CryptoBench.class .
           cat > bench-config.json <<EOF
           {
-            "Args": ["-Xlog:os+cpu", "-XX:+PrintFlagsFinal",
+            "Args": ["-Xlog:os+cpu", "-XX:+UnlockDiagnosticVMOptions", "-XX:+PrintFlagsFinal",
                      "-Dbench.ms=${BENCH_MS}", "-cp", "/", "CryptoBench"],
             "Files": ["CryptoBench.class"],
             "RunConfig": { "Memory": "2G" }
