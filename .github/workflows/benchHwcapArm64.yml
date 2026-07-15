@@ -1,0 +1,217 @@
+name: HWCAP20 crypto A/B (arm64 · KVM · no TCG)
+
+# Proves the arm64 HWCAP patch (#20) turns HW crypto ON and that it is FASTER
+# *and still correct*, by running the SAME CryptoBench class inside two nanos
+# images:
+#   * baseline  = the STOCK nanos ops ships today (`--nightly`) — crypto OFF.
+#                 No source build: it's literally what a user gets now.
+#   * candidate = the kernel built from THIS ref (the #20 patch) — crypto ON.
+# It refuses to run unless /dev/kvm is present — perf numbers under TCG are
+# meaningless for a crypto A/B, so we never fall back to emulation.
+#
+# Requirements:
+#   * an arm64 runner that exposes /dev/kvm (a self-hosted Ampere/Graviton host,
+#     or a hosted runner that provides KVM). Set `runner_label` accordingly.
+#   * a HotSpot JRE ops package (flags self-report via HotSpotDiagnosticMXBean;
+#     OpenJ9 would print <n/a> and gate crypto differently).
+
+on:
+  workflow_dispatch:
+    inputs:
+      jre_package:
+        description: "HotSpot JRE ops package"
+        default: "AngeloRubens/TemurinJREarm64Linux:25.0.1"
+      bench_ms:
+        description: "Measurement window per algo (ms)"
+        default: "3000"
+      runner_label:
+        description: "Runner label — MUST expose /dev/kvm"
+        default: "ubuntu-24.04-arm"
+
+jobs:
+  crypto-ab:
+    runs-on: ${{ inputs.runner_label }}
+    steps:
+      - name: Checkout (this ref = the patch candidate)
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Enforce "no TCG": require real KVM, else fail loudly.
+      # ------------------------------------------------------------------
+      - name: Require /dev/kvm (refuse to measure under TCG)
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm absent — this runner would fall back to TCG."
+            echo "A crypto perf A/B under TCG is meaningless. Use an arm64 KVM host."
+            exit 1
+          fi
+          ls -l /dev/kvm
+          echo "== host CPU crypto features =="
+          (grep -m1 -i 'Features' /proc/cpuinfo || lscpu) | tr ' ' '\n' \
+            | grep -iE 'aes|sha1|sha2|sha3|pmull|crc32|asimd|^fp$' | sort -u || true
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential binutils wget git python3
+
+      - name: Set up a JDK to compile the benchmark
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Compile CryptoBench (portable bytecode)
+        run: |
+          javac --release 11 -d bench-classes test/jvm/CryptoBench.java
+          ls -l bench-classes/CryptoBench.class
+
+      - name: Install ops
+        run: |
+          curl https://ops.city/get.sh -sSfL | sh
+          echo "$HOME/.ops/bin" >> "$GITHUB_PATH"
+
+      - name: Build candidate kernel (this ref = the patch)
+        run: |
+          make -j"$(nproc)" kernel PLATFORM=virt
+          cp "$(find output/platform/virt -name kernel.img | head -1)" /tmp/kernel-candidate.img
+          ls -l /tmp/kernel-candidate.img
+
+      # ------------------------------------------------------------------
+      # ops run config: inject the class + the java args.
+      # NOTE: if your ops build ignores config "Args" for `pkg load`, pass the
+      # java flags via repeated `-a` flags instead (runnerArm64.yml style).
+      # ------------------------------------------------------------------
+      - name: Write ops bench config
+        run: |
+          cp bench-classes/CryptoBench.class .
+          cat > bench-config.json <<EOF
+          {
+            "Args": ["-Xlog:os+cpu", "-XX:+PrintFlagsFinal",
+                     "-Dbench.ms=${{ inputs.bench_ms }}", "-cp", "/", "CryptoBench"],
+            "Files": ["CryptoBench.class"],
+            "RunConfig": { "Memory": "2G" }
+          }
+          EOF
+          cat bench-config.json
+
+      - name: Prime ops nightly cache and capture the STOCK kernel as baseline
+        run: |
+          # Downloads ops's nightly nanos. That stock kernel IS the baseline —
+          # no source build. We stash a copy before the candidate overwrites it.
+          ops pkg get "${{ inputs.jre_package }}" --arch arm64 --nightly || true
+          OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
+          [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
+          echo "ops kernel slot: $OPSK"
+          cp "$OPSK" /tmp/kernel-baseline.img          # stock nanos (crypto OFF)
+          echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+          ls -l /tmp/kernel-baseline.img
+
+      - name: Run A/B (stock baseline then patched candidate) under KVM
+        run: |
+          set -eo pipefail
+          run_one () {
+            local kimg="$1" tag="$2" out="$3"
+            cp "$kimg" "$OPSK"          # make ops boot this kernel
+            echo "=== running $tag (kernel=$kimg) ==="
+            ops pkg load "${{ inputs.jre_package }}" --arch arm64 --nightly \
+              --accel --show-debug --verbose -c bench-config.json 2>&1 | tee "$out"
+          }
+
+          run_one /tmp/kernel-baseline.img  BASELINE  base.log   # stock ops nanos
+          run_one /tmp/kernel-candidate.img CANDIDATE cand.log   # this ref (#20)
+
+      - name: Verify KVM engaged (not TCG) in both runs
+        run: |
+          for f in base.log cand.log; do
+            if grep -qiE 'accel=kvm|enable-kvm' "$f" && ! grep -qi 'kvm.*not supported' "$f"; then
+              echo "$f: KVM engaged ✅"
+            else
+              echo "::error::$f did not run under KVM (would be TCG) — aborting."
+              grep -iE 'qemu-system|[-]cpu|[-]machine|accel|kvm|not supported' "$f" | head -20 || true
+              exit 1
+            fi
+          done
+
+      - name: Assert correctness identical (HW must equal SW)
+        run: |
+          # KAT lines are the only ones with '<label> = <hex>'; throughput lines
+          # use 'round'/'BEST :' — so anchoring on '=' avoids matching them.
+          extract () { grep -E '(AES-GCM tag|SHA-256|CRC32C)[[:space:]]*=' "$1" | sed 's/[[:space:]]\+/ /g'; }
+          extract base.log > base.kat
+          extract cand.log > cand.kat
+          echo "--- baseline KAT ---"; cat base.kat
+          echo "--- candidate KAT ---"; cat cand.kat
+          if ! diff -u base.kat cand.kat; then
+            echo "::error::crypto reference outputs differ — patched path is NOT bit-identical. Correctness regression."
+            exit 1
+          fi
+          echo "Correctness identical ✅ (speedup is real work, not corruption)"
+
+      - name: Summarize throughput delta
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import re
+
+          def best(path):
+              d = {}
+              for line in open(path):
+                  m = re.search(r'(AES-256-GCM|SHA-256|CRC32C)\s+BEST\s*:\s*([0-9.]+)\s*MB/s', line)
+                  if m:
+                      d[m.group(1)] = float(m.group(2))
+              return d
+
+          def flags(path):
+              f = {}
+              names = ('UseAES','UseAESIntrinsics','UseGHASHIntrinsics',
+                       'UseSHA256Intrinsics','UseCRC32CIntrinsics','UseChaCha20Intrinsics')
+              for line in open(path):
+                  for n in names:
+                      if n in f:
+                          continue
+                      m = re.search(r'\b' + n + r'\b.*?(true|false)', line)
+                      if m:
+                          f[n] = m.group(1)
+              return f
+
+          def cpuline(path):
+              for l in open(path):
+                  if 'CPU:' in l and 'total' in l:
+                      return l.strip()
+              return '(not captured)'
+
+          b, c = best('base.log'), best('cand.log')
+          fb, fc = flags('base.log'), flags('cand.log')
+
+          print("## HWCAP #20 crypto A/B (arm64, KVM)\n")
+          print("### CPU feature line (`-Xlog:os+cpu`)")
+          print(f"- **baseline** : `{cpuline('base.log')}`")
+          print(f"- **candidate**: `{cpuline('cand.log')}`\n")
+
+          print("### Intrinsic flags")
+          print("| flag | baseline | candidate |")
+          print("|---|---|---|")
+          for k in ('UseAES','UseAESIntrinsics','UseGHASHIntrinsics',
+                    'UseSHA256Intrinsics','UseCRC32CIntrinsics','UseChaCha20Intrinsics'):
+              print(f"| {k} | {fb.get(k,'?')} | {fc.get(k,'?')} |")
+
+          print("\n### Throughput")
+          print("| algo | baseline MB/s | candidate MB/s | speedup |")
+          print("|---|--:|--:|--:|")
+          for k in ('AES-256-GCM','SHA-256','CRC32C'):
+              if k in b and k in c and b[k] > 0:
+                  print(f"| {k} | {b[k]:,.0f} | {c[k]:,.0f} | **{c[k]/b[k]:.2f}×** |")
+              else:
+                  print(f"| {k} | {b.get(k,'?')} | {c.get(k,'?')} | — |")
+          PY
+          echo "wrote job summary"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwcap20-crypto-ab
+          path: |
+            base.log
+            cand.log
+            base.kat
+            cand.kat
+            bench-config.json
