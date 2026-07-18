@@ -1,0 +1,159 @@
+name: cpuinfo identity A/B (arm64)
+
+# Proves the /proc/cpuinfo synthesis patch makes the guest core identifiable by
+# running the SAME os+cpu / PrintFlagsFinal probe inside two nanos images:
+#   * baseline  = the STOCK nanos ops ships today (`--nightly`) — no
+#                 /proc/cpuinfo, so HotSpot reports "0x00:0x0:0x000:0" and
+#                 "/proc/cpuinfo: <Not Available>".
+#   * candidate = the kernel built from THIS ref (the cpuinfo patch) —
+#                 /proc/cpuinfo synthesized from MIDR_EL1, so the core identity
+#                 (implementer:variant:part:revision) is real.
+#
+# TCG on the free hosted arm64 runner is enough: the identity comes from the
+# emulated CPU's MIDR_EL1, which the patch reads at EL1 — no KVM needed.
+# (GitHub-hosted arm64 runners do NOT expose /dev/kvm.)
+#
+# The gate asserts the AFTER identity line is no longer the all-zero "unknown
+# core" line. Whether an identity-gated tuning (UseSIMDForMemoryOps, ...) flips
+# depends on the emulated -cpu matching a recognized model, so those are
+# reported for observation, not gated.
+
+on:
+  push:
+    branches: [ci/cpuinfo-verify-arm64]
+    paths:
+      - 'src/aarch64/kernel_machine.h'
+      - 'src/unix/special.c'
+      - '.github/workflows/verifyCpuinfoArm64.yml'
+  workflow_dispatch:
+    inputs:
+      jre_package:
+        description: "HotSpot JRE ops package"
+        default: "AngeloRubens/TemurinJREarm64Linux:25.0.1"
+
+env:
+  JRE_PACKAGE: ${{ inputs.jre_package || 'AngeloRubens/TemurinJREarm64Linux:25.0.1' }}
+
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout (this ref = the patch candidate)
+        uses: actions/checkout@v4
+
+      - name: Note environment (TCG expected here)
+        run: |
+          echo "Proves the core identity goes from 0x00:0x0:0x000:0 -> real MIDR under TCG."
+          [ -e /dev/kvm ] && echo "note: /dev/kvm present, but this job runs TCG anyway." \
+                          || echo "no /dev/kvm (expected on hosted arm64) — fine, TCG it is."
+
+      - name: Install build deps
+        run: |
+          # ops's get.sh gates on `which qemu-system-x86_64` even on arm64, so
+          # the qemu-system metapackage (pulls qemu-system-x86) is required just
+          # to satisfy that check; qemu-system-arm/aarch64 actually boot the
+          # arm64 guest. Mirrors the known-good testJreArm64 job.
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
+          which qemu-system-x86_64 qemu-system-aarch64
+
+      - name: Install ops
+        run: |
+          curl https://ops.city/get.sh -sSfL | sh
+          echo "$HOME/.ops/bin" >> "$GITHUB_PATH"
+
+      - name: Build candidate kernel (this ref = the patch)
+        run: |
+          make -j"$(nproc)" kernel PLATFORM=virt
+          cp "$(find output/platform/virt -name kernel.img | head -1)" /tmp/kernel-candidate.img
+          ls -l /tmp/kernel-candidate.img
+
+      - name: Prime ops nightly cache and capture the STOCK kernel as baseline
+        run: |
+          ops pkg get "${JRE_PACKAGE}" --arch arm64 --nightly || true
+          OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
+          [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
+          echo "ops kernel slot: $OPSK"
+          cp "$OPSK" /tmp/kernel-baseline.img
+          echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+          ls -l /tmp/kernel-baseline.img
+
+      - name: Run A/B under TCG (stock baseline then patched candidate)
+        run: |
+          set -eo pipefail
+          run_one () {
+            local kimg="$1" tag="$2" out="$3"
+            cp "$kimg" "$OPSK"
+            echo "=== running $tag (kernel=$kimg) ==="
+            ops pkg load "${JRE_PACKAGE}" --arch arm64 --nightly \
+              --show-debug --verbose \
+              -a -Xlog:os+cpu=debug \
+              -a -XX:+UnlockDiagnosticVMOptions -a -XX:+PrintFlagsFinal \
+              -a -version 2>&1 | tee "$out"
+          }
+          run_one /tmp/kernel-baseline.img  BASELINE  base.log
+          run_one /tmp/kernel-candidate.img CANDIDATE cand.log
+
+      - name: Assert core identity is synthesized (0x00:0x0:0x000:0 -> real MIDR)
+        run: |
+          idre='0x[0-9a-fA-F]{2}:0x[0-9a-fA-F]+:0x[0-9a-fA-F]{3}:[0-9]+'
+          before_id=$(grep -oE "$idre" base.log | head -1 || true)
+          after_id=$(grep -oE "$idre" cand.log | head -1 || true)
+          echo "baseline  identity: ${before_id:-<not found>}"
+          echo "candidate identity: ${after_id:-<not found>}"
+
+          [ -s cand.log ] || { echo "::error::candidate produced no output — the JVM did not boot on our kernel. See cand.log."; exit 1; }
+          if [ -z "$after_id" ]; then
+            echo "::error::candidate os+cpu produced no identity line — check cand.log"
+            exit 1
+          fi
+          if [ "$after_id" = "0x00:0x0:0x000:0" ]; then
+            echo "::error::candidate identity still all-zero — /proc/cpuinfo not being read by HotSpot"
+            exit 1
+          fi
+          # Baseline is expected (but not required) to be the all-zero unknown core.
+          if [ "$before_id" != "0x00:0x0:0x000:0" ]; then
+            echo "::warning::baseline identity is '${before_id}', not the expected all-zero — stock nanos may already expose cpuinfo, or ops shipped a newer kernel."
+          fi
+          echo "PASS: core identified after the patch ($after_id)"
+
+      - name: Summarize (before vs after)
+        if: always()
+        run: |
+          idre='0x[0-9a-fA-F]{2}:0x[0-9a-fA-F]+:0x[0-9a-fA-F]{3}:[0-9]+'
+          {
+            echo "## /proc/cpuinfo synthesis — before vs after (arm64, TCG)"
+            echo ""
+            echo "Package: \`${JRE_PACKAGE}\`"
+            echo ""
+            echo "### Core identity line (\`-Xlog:os+cpu\`)"
+            echo "- **baseline** : \`$(grep -oE "$idre" base.log | head -1 || echo '<not found>')\`"
+            echo "- **candidate**: \`$(grep -oE "$idre" cand.log | head -1 || echo '<not found>')\`"
+            echo ""
+            echo "### os+cpu / cpuinfo availability"
+            echo '```'
+            echo "-- BASELINE --"
+            grep -iE 'CPU: total|/proc/cpuinfo|Online cpus' base.log | head -6 || echo "(none)"
+            echo "-- CANDIDATE --"
+            grep -iE 'CPU: total|/proc/cpuinfo|Online cpus' cand.log | head -6 || echo "(none)"
+            echo '```'
+            echo "### Identity-gated tunings (flip only when the emulated core is a recognized model)"
+            echo "| flag | baseline | candidate |"
+            echo "|---|---|---|"
+            for k in UseSIMDForMemoryOps OnSpinWaitInst AlwaysMergeDMB UseCryptoPmullForCRC32 CodeEntryAlignment AvoidUnalignedAccesses; do
+              b=$(grep -iE "[[:space:]]$k[[:space:]]+[:=]" base.log | grep -oiE '(true|false|isb|yield|none|[0-9]+)' | head -1 || echo '?')
+              c=$(grep -iE "[[:space:]]$k[[:space:]]+[:=]" cand.log | grep -oiE '(true|false|isb|yield|none|[0-9]+)' | head -1 || echo '?')
+              echo "| $k | ${b:-?} | ${c:-?} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpuinfo-identity-ab-tcg
+          path: |
+            base.log
+            cand.log
