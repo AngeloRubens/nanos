@@ -119,6 +119,82 @@ jobs:
           fi
           echo "PASS: core identified after the patch ($after_id)"
 
+      # ---- Boot the CANDIDATE kernel under recognized cores so the identity-gated
+      #      tunings actually fire. ops hardcodes `-cpu max` (implementer 0x00 =
+      #      unknown vendor), so we reuse ops's assembled image + qemu cmdline but
+      #      boot it by hand with a chosen -cpu. neoverse-n1 == Ampere Altra /
+      #      Graviton2 (impl 0x41, part 0xd0c); AmpereOne is emulated by overriding
+      #      MIDR on -cpu max (impl 0xc0, part 0xac3 = CPU_AMPERE/CPU_MODEL_AMPERE_1).
+      - name: Boot candidate under neoverse-n1 and AmpereOne
+        run: |
+          set -o pipefail
+          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          # Recover ops's exact qemu invocation (it printed it under --show-debug).
+          TMPL=$(strip_ansi < cand.log | grep -oE 'qemu-system-aarch64 .*-serial stdio' | head -1)
+          if [ -z "$TMPL" ]; then
+            echo "::error::could not recover ops qemu cmdline from cand.log"; exit 1
+          fi
+          echo "ops qemu template:"; echo "  $TMPL"
+
+          echo "== available aarch64 CPU models =="
+          qemu-system-aarch64 -machine virt -cpu help 2>/dev/null | awk '{print $2}' | tr '\n' ' '; echo
+
+          # label|cpu-spec  (neoverse-n1 falls back to neoverse-n2 if the runner's
+          # qemu lacks it; AmpereOne uses the always-present max + midr override)
+          N1=neoverse-n1
+          qemu-system-aarch64 -machine virt -cpu help 2>/dev/null | grep -qw neoverse-n1 || N1=neoverse-n2
+          MODELS=(
+            "neoverse-n1|${N1}"
+            "ampereone|max,midr=0xc00fac30"
+          )
+
+          for entry in "${MODELS[@]}"; do
+            label="${entry%%|*}"; spec="${entry##*|}"
+            cmd=$(echo "$TMPL" \
+              | sed -E "s#-kernel [^ ]+#-kernel /tmp/kernel-candidate.img#" \
+              | sed -E "s#-cpu [^ ]+#-cpu ${spec}#")
+            echo "=== boot ${label} (-cpu ${spec}) ==="
+            echo "  $cmd"
+            timeout 300 bash -c "$cmd" 2>&1 | strip_ansi | tee "run-${label}.txt" || true
+          done
+
+      - name: Summarize + assert identity-gated tunings by CPU model
+        run: |
+          idre='0x[0-9a-fA-F]{2}:0x[0-9a-fA-F]+:0x[0-9a-fA-F]{3}:[0-9]+'
+          val() { # $1=flag $2=file  -> extract value
+            grep -iE "[[:space:]]$1[[:space:]]+[:=]" "$2" 2>/dev/null \
+              | grep -oiE '(true|false|isb|yield|none|[0-9]+)' | head -1
+          }
+          {
+            echo "## Identity-gated tunings by emulated CPU (candidate kernel, TCG)"
+            echo ""
+            echo "| CPU (-cpu) | identity | UseSIMDForMemoryOps | OnSpinWaitInst | AlwaysMergeDMB | UseCryptoPmullForCRC32 | CodeEntryAlignment |"
+            echo "|---|---|--:|--:|--:|--:|--:|"
+            for f in "cand.log:max (ops, impl 0x00 = unknown)" "run-neoverse-n1.txt:neoverse-n1 (Ampere Altra / Graviton2)" "run-ampereone.txt:AmpereOne (midr 0xc0/0xac3)"; do
+              file="${f%%:*}"; name="${f##*:}"
+              id=$(grep -oE "$idre" "$file" 2>/dev/null | head -1 || echo '-')
+              echo "| $name | \`${id:-–}\` | $(val UseSIMDForMemoryOps "$file") | $(val OnSpinWaitInst "$file") | $(val AlwaysMergeDMB "$file") | $(val UseCryptoPmullForCRC32 "$file") | $(val CodeEntryAlignment "$file") |"
+            done
+            echo ""
+            echo "Expected: on the recognized cores UseSIMDForMemoryOps flips **true**, OnSpinWaitInst→**isb**, AlwaysMergeDMB→**false**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Gate: on a recognized core the memory-ops tuning MUST turn on. This is
+          # the concrete downstream proof that /proc/cpuinfo makes the core usable.
+          fail=0
+          for file in run-neoverse-n1.txt run-ampereone.txt; do
+            [ -s "$file" ] || { echo "::warning::$file empty (did the guest boot on this -cpu?)"; continue; }
+            v=$(val UseSIMDForMemoryOps "$file")
+            id=$(grep -oE "$idre" "$file" | head -1 || echo '?')
+            echo "$file: identity=$id UseSIMDForMemoryOps=$v"
+            if [ "$v" != "true" ]; then
+              echo "::error::$file: UseSIMDForMemoryOps=$v (expected true on a recognized core)"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "PASS: identity-gated tunings fired on recognized cores"
+          exit $fail
+
       - name: Summarize (before vs after)
         if: always()
         run: |
@@ -157,3 +233,5 @@ jobs:
           path: |
             base.log
             cand.log
+            run-neoverse-n1.txt
+            run-ampereone.txt
