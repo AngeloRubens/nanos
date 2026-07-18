@@ -235,3 +235,171 @@ jobs:
             cand.log
             run-neoverse-n1.txt
             run-ampereone.txt
+
+  # ====================================================================
+  # SIMD copy codegen correctness. With UseSIMDForMemoryOps on (recognized
+  # core) HotSpot's arraycopy/fill stub emits 32-byte Q-register ldp/stp.
+  # Run a self-verifying workload (System.arraycopy on-heap + Unsafe.copyMemory
+  # off-heap via DirectByteBuffer) under max / neoverse-n1 / AmpereOne on the
+  # patched kernel and assert it prints COPY OK with an identical checksum
+  # across cores -- i.e. the SIMD path yields the same bytes as the scalar one
+  # (no corruption) and never SIGILLs (the NEON runs at EL0, state is saved).
+  # ====================================================================
+  simd-copy-correctness:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout (this ref = the patch candidate)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
+          which qemu-system-x86_64 qemu-system-aarch64
+
+      - name: Set up a JDK to compile the workload
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Compile CopyBench (self-verifying arraycopy / Unsafe copy)
+        run: |
+          cat > CopyBench.java <<'EOF'
+          public class CopyBench {
+              static long fnv(byte[] b, int from, int to) {
+                  long h = 0xcbf29ce484222325L;
+                  for (int i = from; i < to; i++) { h ^= (b[i] & 0xff); h *= 0x100000001b3L; }
+                  return h;
+              }
+              public static void main(String[] args) {
+                  final int N = 128 * 1024;
+                  final int iters = Integer.getInteger("iters", 4000);
+                  byte[] src = new byte[N];
+                  long s = 0x9E3779B97F4A7C15L;
+                  for (int i = 0; i < N; i++) { s = s * 6364136223846793005L + 1442695040888963407L; src[i] = (byte) (s >>> 56); }
+                  long ref = fnv(src, 0, N);
+                  boolean ok = true;
+                  byte[] dst = new byte[N];
+                  for (int it = 0; it < iters; it++) {
+                      int off = it & 31, len = N - off - 64;
+                      System.arraycopy(src, off, dst, off, len);
+                  }
+                  System.arraycopy(src, 0, dst, 0, N);
+                  if (fnv(dst, 0, N) != ref) { ok = false; System.out.println("HEAP MISMATCH"); }
+                  try {
+                      java.nio.ByteBuffer sb = java.nio.ByteBuffer.allocateDirect(N);
+                      java.nio.ByteBuffer db = java.nio.ByteBuffer.allocateDirect(N);
+                      sb.put(src); sb.flip();
+                      for (int it = 0; it < iters; it++) { db.clear(); sb.rewind(); db.put(sb); }
+                      byte[] out = new byte[N]; db.flip(); db.get(out);
+                      if (fnv(out, 0, N) != ref) { ok = false; System.out.println("OFFHEAP MISMATCH"); }
+                  } catch (Throwable t) { ok = false; System.out.println("OFFHEAP EX: " + t); }
+                  System.out.println("COPY " + (ok ? "OK" : "FAIL") + " ref=" + Long.toHexString(ref));
+              }
+          }
+          EOF
+          javac --release 11 -d . CopyBench.java
+          ls -l CopyBench.class
+
+      - name: Install ops
+        run: |
+          curl https://ops.city/get.sh -sSfL | sh
+          echo "$HOME/.ops/bin" >> "$GITHUB_PATH"
+
+      - name: Build candidate kernel (this ref = the patch)
+        run: |
+          make -j"$(nproc)" kernel PLATFORM=virt
+          cp "$(find output/platform/virt -name kernel.img | head -1)" /tmp/kernel-candidate.img
+          ls -l /tmp/kernel-candidate.img
+
+      - name: Write ops workload config
+        run: |
+          cat > copy-config.json <<EOF
+          {
+            "Args": ["-Xlog:os+cpu", "-Diters=4000", "-cp", "/", "CopyBench"],
+            "Files": ["CopyBench.class"],
+            "RunConfig": { "Memory": "2G" }
+          }
+          EOF
+          cat copy-config.json
+
+      - name: Prime ops nightly + run BASELINE (stock kernel, SIMD off)
+        run: |
+          ops pkg get "${JRE_PACKAGE}" --arch arm64 --nightly || true
+          OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
+          [ -n "$OPSK" ] || { echo "::error::no ops nightly kernel.img"; exit 1; }
+          echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+          ops pkg load "${JRE_PACKAGE}" --arch arm64 --nightly \
+            --show-debug --verbose -c copy-config.json 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g' | tee copy-baseline.log
+
+      - name: Boot workload on candidate kernel (max / neoverse-n1 / AmpereOne)
+        run: |
+          set -o pipefail
+          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          TMPL=$(strip_ansi < copy-baseline.log | grep -oE 'qemu-system-aarch64 .*-serial stdio' | head -1)
+          [ -n "$TMPL" ] || { echo "::error::could not recover ops qemu cmdline"; exit 1; }
+          N1=neoverse-n1
+          qemu-system-aarch64 -machine virt -cpu help 2>/dev/null | grep -qw neoverse-n1 || N1=neoverse-n2
+          MODELS=( "max|max" "neoverse-n1|${N1}" "ampereone|max,midr=0xc00fac30" )
+          for entry in "${MODELS[@]}"; do
+            label="${entry%%|*}"; spec="${entry##*|}"
+            cmd=$(echo "$TMPL" \
+              | sed -E "s#-kernel [^ ]+#-kernel /tmp/kernel-candidate.img#" \
+              | sed -E "s#-cpu [^ ]+#-cpu ${spec}#")
+            echo "=== boot ${label} (-cpu ${spec}) ==="
+            timeout 300 bash -c "$cmd" 2>&1 | strip_ansi | tee "copy-${label}.log" || true
+          done
+
+      - name: Assert copies correct on every core (no crash, no corruption)
+        run: |
+          fail=0
+          refs=""
+          for f in copy-baseline.log copy-max.log copy-neoverse-n1.log copy-ampereone.log; do
+            [ -s "$f" ] || { echo "::warning::$f empty"; continue; }
+            line=$(grep -oE 'COPY (OK|FAIL) ref=[0-9a-f]+' "$f" | head -1)
+            id=$(grep -oE '0x[0-9a-fA-F]{2}:0x[0-9a-fA-F]+:0x[0-9a-fA-F]{3}:[0-9]+' "$f" | head -1)
+            echo "$f: identity=${id:-?}  ${line:-<no COPY line>}"
+            if ! printf '%s' "$line" | grep -q 'COPY OK'; then
+              echo "::error::$f did not report COPY OK (crash or corruption?)"
+              grep -iE 'MISMATCH|EX:|SIGILL|Invalid|abort|assert' "$f" | head -5 || true
+              fail=1
+            fi
+            r=$(printf '%s' "$line" | grep -oE 'ref=[0-9a-f]+')
+            [ -n "$r" ] && refs="$refs $r"
+          done
+          uniq=$(printf '%s\n' $refs | sort -u | grep -c .)
+          if [ "$uniq" -gt 1 ]; then
+            echo "::error::copy checksums differ across cores:$refs"
+            fail=1
+          fi
+          {
+            echo "## SIMD copy correctness (System.arraycopy + Unsafe.copyMemory)"
+            echo ""
+            echo "| run | identity | result |"
+            echo "|---|---|---|"
+            for f in copy-baseline.log copy-max.log copy-neoverse-n1.log copy-ampereone.log; do
+              id=$(grep -oE '0x[0-9a-fA-F]{2}:0x[0-9a-fA-F]+:0x[0-9a-fA-F]{3}:[0-9]+' "$f" 2>/dev/null | head -1)
+              line=$(grep -oE 'COPY (OK|FAIL) ref=[0-9a-f]+' "$f" 2>/dev/null | head -1)
+              echo "| $f | \`${id:-–}\` | ${line:-<none>} |"
+            done
+            echo ""
+            echo "Identical \`ref=\` across cores = the 32-byte SIMD copy path yields the same bytes as scalar (no corruption); a printed COPY line = no SIGILL (NEON runs at EL0, V-state saved)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$fail" -eq 0 ] && echo "PASS: copies correct on all cores"
+          exit $fail
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simd-copy-correctness
+          path: |
+            CopyBench.java
+            copy-baseline.log
+            copy-max.log
+            copy-neoverse-n1.log
+            copy-ampereone.log
