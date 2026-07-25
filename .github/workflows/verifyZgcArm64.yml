@@ -1,0 +1,520 @@
+name: ZGC on nanos — GC matrix + backing-store probe (arm64)
+
+# ZGC is the one GC that does NOT start on nanos today, and the cause is a
+# kernel gap, not a JVM one. ZPhysicalMemoryBacking (Linux) needs a shared
+# memory FILE to back the heap:
+#   1. primary path   -> memfd_create(2)                   [not a nanos syscall]
+#   2. fallback path  -> a file on a tmpfs/hugetlbfs mount, located by comparing
+#                        statfs(2) f_type against TMPFS_MAGIC (0x01021994)
+#                        [nanos statfs_internal() memsets the struct and never
+#                        sets f_type, and there is no tmpfs/mount at all]
+# Everything else ZGC needs is already there: fallocate(PUNCH_HOLE|KEEP_SIZE)
+# is implemented, and MADV_DONTNEED really unmaps.
+#
+# This workflow measures both halves of that claim, on the kernel built from
+# THIS ref (so it doubles as the A/B once a memfd_create patch lands here):
+#   * job "gc-matrix"      - boots a real allocation workload under every GC the
+#                            JRE ships. G1/Serial/Parallel are the control and
+#                            are GATED; Z/Shenandoah are reported.
+#   * job "backing-store"  - a C probe running INSIDE nanos that exercises the
+#                            exact primitives ZGC's backing store is built from
+#                            (memfd, statfs magic, huge PROT_NONE reservation,
+#                            MAP_SHARED multi-mapping + coherency, MAP_FIXED
+#                            commit into the reservation, punch-hole uncommit),
+#                            so the size of the kernel patch is measured, not
+#                            guessed.
+#
+# TCG on the free hosted arm64 runner is enough — nothing here needs KVM.
+# (GitHub-hosted arm64 runners do NOT expose /dev/kvm.)
+
+on:
+  push:
+    branches: [ci/zgc-probe]
+    paths:
+      - 'src/**'
+      - '.github/workflows/verifyZgcArm64.yml'
+  workflow_dispatch:
+    inputs:
+      jre_package:
+        description: "HotSpot JRE ops package"
+        default: "AngeloRubens/TemurinJREarm64Linux:25.0.1"
+      zgc_expect:
+        description: "report ZGC (measure) or require it to start (after the kernel patch)"
+        default: "report"
+        type: choice
+        options: [report, must-start]
+
+env:
+  JRE_PACKAGE: ${{ inputs.jre_package || 'AngeloRubens/TemurinJREarm64Linux:25.0.1' }}
+  ZGC_EXPECT: ${{ inputs.zgc_expect || 'report' }}
+
+jobs:
+  # ====================================================================
+  # Which garbage collectors actually run inside nanos? Each GC gets its own
+  # boot of the same self-verifying allocation workload, so the answer is
+  # "the GC completed a real collection", not merely "the VM initialized".
+  # ====================================================================
+  gc-matrix:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          # ops's get.sh gates on `which qemu-system-x86_64` even on arm64, so
+          # the qemu-system metapackage (pulls qemu-system-x86) is required just
+          # to satisfy that check; qemu-system-arm/aarch64 actually boot the
+          # arm64 guest. Mirrors the known-good verifyCpuinfoArm64 job.
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
+          which qemu-system-x86_64 qemu-system-aarch64
+
+      - name: Set up a JDK to compile the workload
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Compile GcChurn (forces real collections, then self-checks)
+        run: |
+          cat > GcChurn.java <<'EOF'
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /* Allocates several times the heap so the collector must actually run,
+             while keeping a live set that is checked at the end: a GC that
+             corrupts or drops a live object shows up as MISMATCH, not as a
+             silent pass. Kept small on purpose — this boots under TCG. */
+          public class GcChurn {
+              static long fnv(byte[] b) {
+                  long h = 0xcbf29ce484222325L;
+                  for (byte v : b) { h ^= (v & 0xff); h *= 0x100000001b3L; }
+                  return h;
+              }
+              public static void main(String[] args) throws Exception {
+                  final int liveCount = 64, liveSize = 512 * 1024;
+                  final int rounds = Integer.getInteger("rounds", 12);
+                  List<byte[]> live = new ArrayList<>(liveCount);
+                  long expect = 0;
+                  for (int i = 0; i < liveCount; i++) {
+                      byte[] a = new byte[liveSize];
+                      for (int j = 0; j < a.length; j += 997) a[j] = (byte) (i + j);
+                      live.add(a);
+                      expect ^= fnv(a);
+                  }
+                  long sink = 0;
+                  for (int r = 0; r < rounds; r++) {
+                      for (int i = 0; i < 16; i++) {           /* garbage */
+                          byte[] tmp = new byte[512 * 1024];
+                          tmp[0] = (byte) r; tmp[tmp.length - 1] = (byte) i;
+                          sink += tmp[0] + tmp[tmp.length - 1];
+                      }
+                      System.gc();                              /* and an explicit one */
+                  }
+                  long actual = 0;
+                  for (byte[] a : live) actual ^= fnv(a);
+                  boolean ok = (actual == expect);
+                  if (!ok) System.out.println("LIVE SET MISMATCH");
+                  System.out.println("GC " + (ok ? "OK" : "FAIL")
+                          + " collector=" + gcNames()
+                          + " maxHeap=" + (Runtime.getRuntime().maxMemory() >> 20) + "m"
+                          + " sink=" + sink);
+              }
+              static String gcNames() {
+                  StringBuilder sb = new StringBuilder();
+                  for (java.lang.management.GarbageCollectorMXBean b :
+                          java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()) {
+                      if (sb.length() > 0) sb.append('+');
+                      sb.append(b.getName().replace(' ', '_')).append('(').append(b.getCollectionCount()).append(')');
+                  }
+                  return sb.length() == 0 ? "none" : sb.toString();
+              }
+          }
+          EOF
+          javac --release 11 -d . GcChurn.java
+          ls -l GcChurn.class
+
+      - name: Install ops
+        run: |
+          curl https://ops.city/get.sh -sSfL | sh
+          echo "$HOME/.ops/bin" >> "$GITHUB_PATH"
+
+      - name: Build kernel from this ref
+        run: |
+          make -j"$(nproc)" kernel PLATFORM=virt
+          cp "$(find output/platform/virt -name kernel.img | head -1)" /tmp/kernel-candidate.img
+          ls -l /tmp/kernel-candidate.img
+
+      - name: Prime ops nightly cache and swap in our kernel
+        run: |
+          ops pkg get "${JRE_PACKAGE}" --arch arm64 --nightly || true
+          OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
+          [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
+          echo "ops kernel slot: $OPSK"
+          cp /tmp/kernel-candidate.img "$OPSK"
+          echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+
+      - name: Boot the workload once per GC
+        run: |
+          set -o pipefail
+          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          # label|flag — Shenandoah may simply not be in this build, which the
+          # log will say ("Unrecognized VM option"); that is a JRE fact, not a
+          # nanos one, and is reported as such.
+          MATRIX=(
+            "g1|UseG1GC"
+            "serial|UseSerialGC"
+            "parallel|UseParallelGC"
+            "shenandoah|UseShenandoahGC"
+            "z|UseZGC"
+          )
+          for entry in "${MATRIX[@]}"; do
+            label="${entry%%|*}"; flag="${entry##*|}"
+            cat > "cfg-${label}.json" <<EOF
+          {
+            "Args": ["-XX:+${flag}", "-Xlog:gc+init=debug", "-Xlog:gc", "-Xms192m", "-Xmx192m",
+                     "-Drounds=12", "-cp", "/", "GcChurn"],
+            "Files": ["GcChurn.class"],
+            "RunConfig": { "Memory": "2G" }
+          }
+          EOF
+            echo "=== ${label} (-XX:+${flag}) ==="
+            timeout 600 ops pkg load "${JRE_PACKAGE}" --arch arm64 --nightly \
+              --show-debug --verbose -c "cfg-${label}.json" 2>&1 \
+              | strip_ansi | tee "gc-${label}.log" || true
+          done
+
+      - name: Gate the control GCs, report Z/Shenandoah
+        run: |
+          verdict() { # $1=logfile -> OK | FAIL | ABSENT
+            if grep -q 'GC OK' "$1" 2>/dev/null; then echo OK
+            elif grep -qi 'Unrecognized VM option' "$1" 2>/dev/null; then echo ABSENT
+            else echo FAIL; fi
+          }
+          reason() { # first line that explains a non-start
+            grep -iE 'Error occurred during initialization|Unrecognized VM option|Failed to|Could not|memfd|tmpfs|hugetlbfs|AllocateHeapAt|Not enough space|out of memory' "$1" 2>/dev/null \
+              | head -1 | cut -c1-160
+          }
+          {
+            echo "## GC matrix inside nanos (arm64, TCG, kernel from this ref)"
+            echo ""
+            echo "| GC | result | collectors / reason |"
+            echo "|---|---|---|"
+            for l in g1 serial parallel shenandoah z; do
+              v=$(verdict "gc-${l}.log")
+              if [ "$v" = OK ]; then
+                d=$(grep -o 'collector=[^ ]*' "gc-${l}.log" | head -1)
+              else
+                d=$(reason "gc-${l}.log")
+              fi
+              echo "| \`$l\` | **$v** | ${d:-–} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          fail=0
+          for l in g1 serial parallel; do          # control: these must work
+            v=$(verdict "gc-${l}.log")
+            echo "$l: $v"
+            [ "$v" = OK ] || { echo "::error::${l} did not complete the workload — regression, see gc-${l}.log"; fail=1; }
+          done
+
+          zv=$(verdict gc-z.log)
+          echo "zgc: $zv  reason: $(reason gc-z.log)"
+          if [ "$zv" = OK ]; then
+            echo "ZGC STARTED and completed the workload."
+          else
+            r=$(reason gc-z.log)
+            if printf '%s' "$r" | grep -qiE 'memfd|tmpfs|hugetlbfs|AllocateHeapAt|backing'; then
+              echo "::warning::ZGC does not start — expected backing-store gap: $r"
+            else
+              echo "::warning::ZGC does not start for an UNEXPECTED reason (not the memfd/tmpfs gap): ${r:-<no reason line found>} — inspect gc-z.log"
+            fi
+            if [ "$ZGC_EXPECT" = "must-start" ]; then
+              echo "::error::zgc_expect=must-start but ZGC did not start"
+              fail=1
+            fi
+          fi
+
+          sv=$(verdict gc-shenandoah.log)
+          echo "shenandoah: $sv $( [ "$sv" = ABSENT ] && echo '(not built into this JRE)' )"
+          exit $fail
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc-matrix-logs
+          path: |
+            GcChurn.java
+            gc-*.log
+            cfg-*.json
+
+  # ====================================================================
+  # What exactly would a memfd_create patch have to provide? Rather than
+  # inferring it from ZGC's failure message, run a C probe INSIDE nanos that
+  # calls the same primitives ZPhysicalMemoryBacking uses, one at a time, and
+  # prints a PASS/FAIL line for each. The interesting one is #5: whether two
+  # MAP_SHARED mappings of the same file are coherent — that is the property a
+  # memfd implementation has to deliver, and the thing that decides whether the
+  # patch is small or structural.
+  # ====================================================================
+  backing-store:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
+          which qemu-system-x86_64 qemu-system-aarch64
+
+      - name: Build the probe (static, so the image needs no libs)
+        run: |
+          cat > zgcprobe.c <<'EOF'
+          /* Exercises, inside nanos, the primitives ZGC's Linux backing store is
+             built from. Every check prints "PROBE <name> <PASS|FAIL> <detail>";
+             nothing aborts, so one missing piece does not hide the others. */
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <stdarg.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <unistd.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/statfs.h>
+          #include <sys/syscall.h>
+
+          #ifndef MFD_CLOEXEC
+          #define MFD_CLOEXEC 0x0001U
+          #endif
+          #ifndef FALLOC_FL_KEEP_SIZE
+          #define FALLOC_FL_KEEP_SIZE 0x01
+          #endif
+          #ifndef FALLOC_FL_PUNCH_HOLE
+          #define FALLOC_FL_PUNCH_HOLE 0x02
+          #endif
+          #define TMPFS_MAGIC     0x01021994
+          #define HUGETLBFS_MAGIC 0x958458f6
+
+          #define MB (1024UL * 1024UL)
+          #define GB (1024UL * MB)
+
+          static void ok(const char *name, int pass, const char *fmt, ...)
+          {
+              va_list ap; va_start(ap, fmt);
+              printf("PROBE %-22s %s ", name, pass ? "PASS" : "FAIL");
+              vprintf(fmt, ap);
+              printf("\n");
+              fflush(stdout);
+              va_end(ap);
+          }
+
+          static long meminfo_free_kb(void)
+          {
+              FILE *f = fopen("/proc/meminfo", "r");
+              char line[256];
+              long v = -1;
+              if (!f)
+                  return -1;
+              while (fgets(line, sizeof(line), f))
+                  if (sscanf(line, "MemFree: %ld kB", &v) == 1)
+                      break;
+              fclose(f);
+              return v;
+          }
+
+          int main(void)
+          {
+              /* 1. memfd_create: ZGC's primary heap backing file. Raw syscall so
+                    a missing kernel entry shows up as ENOSYS, unambiguously. */
+              long mfd = syscall(SYS_memfd_create, "zgc-probe", (unsigned)MFD_CLOEXEC);
+              ok("memfd_create", mfd >= 0, "rv=%ld errno=%d (%s)",
+                 mfd, mfd < 0 ? errno : 0, mfd < 0 ? strerror(errno) : "-");
+
+              /* 2. statfs f_type: how ZGC decides a directory is tmpfs/hugetlbfs
+                    when memfd_create is unavailable. */
+              struct statfs sb;
+              if (statfs("/", &sb) == 0) {
+                  const char *kind = (sb.f_type == TMPFS_MAGIC) ? " = tmpfs, usable by ZGC"
+                      : (sb.f_type == HUGETLBFS_MAGIC) ? " = hugetlbfs, usable by ZGC"
+                      : (sb.f_type == 0) ? " = unset, no filesystem type reported at all"
+                      : " = some other filesystem (fine, just not a ZGC fallback)";
+                  /* The nanos gap is f_type never being filled in; a non-tmpfs
+                     value is correct behaviour, so only zero counts as a fail. */
+                  ok("statfs_f_type", sb.f_type != 0, "f_type=0x%lx%s bsize=%ld (ZGC wants tmpfs=0x%x or hugetlbfs=0x%x)",
+                     (unsigned long)sb.f_type, kind, (long)sb.f_bsize, TMPFS_MAGIC, HUGETLBFS_MAGIC);
+              } else
+                  ok("statfs_f_type", 0, "statfs failed errno=%d (%s)", errno, strerror(errno));
+
+              /* 3. Huge PROT_NONE reservation: ZGC reserves a multi-TB address
+                    range up front and commits into it later. */
+              static const unsigned long sizes[] = { 16UL * GB, 256UL * GB, 4096UL * GB, 16384UL * GB };
+              static const char *names[] = { "reserve_16G", "reserve_256G", "reserve_4T", "reserve_16T" };
+              void *biggest = MAP_FAILED;
+              unsigned long biggest_len = 0;
+              for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+                  void *r = mmap(NULL, sizes[i], PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                  ok(names[i], r != MAP_FAILED, "addr=%p errno=%d (%s)",
+                     r, r == MAP_FAILED ? errno : 0, r == MAP_FAILED ? strerror(errno) : "-");
+                  if (r != MAP_FAILED) {
+                      if (biggest == MAP_FAILED) { biggest = r; biggest_len = sizes[i]; }
+                      else { munmap(r, sizes[i]); }
+                  }
+              }
+
+              /* 4. A writable file to stand in for the memfd (the tmpfs fallback
+                    ZGC would use). */
+              const char *path = "/zgcprobe.dat";
+              const unsigned long flen = 8 * MB;
+              int fd = (mfd >= 0) ? (int)mfd : open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+              ok("backing_file_open", fd >= 0, "%s fd=%d errno=%d (%s)",
+                 (mfd >= 0) ? "via memfd" : path, fd, fd < 0 ? errno : 0,
+                 fd < 0 ? strerror(errno) : "-");
+              if (fd < 0) {
+                  printf("PROBE DONE (no backing file — remaining checks skipped)\n");
+                  return 0;
+              }
+              int tr = ftruncate(fd, flen);
+              ok("ftruncate_8M", tr == 0, "rv=%d errno=%d (%s)", tr, tr ? errno : 0,
+                 tr ? strerror(errno) : "-");
+
+              /* 5. THE decisive one: two MAP_SHARED mappings of the same file
+                    offset must observe each other's writes. Without this a memfd
+                    is only a name, and ZGC's heap views would silently diverge. */
+              char *a = mmap(NULL, flen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+              char *b = mmap(NULL, flen, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+              if (a != MAP_FAILED && b != MAP_FAILED) {
+                  memset(a, 0xa5, 4096);
+                  a[flen - 1] = 0x5a;
+                  int coherent = ((unsigned char)b[0] == 0xa5) &&
+                                 ((unsigned char)b[4095] == 0xa5) &&
+                                 ((unsigned char)b[flen - 1] == 0x5a);
+                  ok("mmap_shared_coherent", coherent, "a=%p b=%p b[0]=0x%02x b[end]=0x%02x",
+                     a, b, (unsigned char)b[0], (unsigned char)b[flen - 1]);
+              } else {
+                  ok("mmap_shared_coherent", 0, "a=%p b=%p errno=%d (%s)", a, b, errno, strerror(errno));
+              }
+
+              /* 6. Commit into the reservation: MAP_FIXED of the file over a
+                    PROT_NONE range is exactly how ZGC maps a granule. */
+              if (biggest != MAP_FAILED && biggest_len >= 2 * MB) {
+                  void *c = mmap(biggest, 2 * MB, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_FIXED, fd, 0);
+                  int good = (c == biggest);
+                  if (good) {
+                      ((char *)c)[0] = 0x11;
+                      good = (a != MAP_FAILED) ? ((unsigned char)a[0] == 0x11) : 1;
+                  }
+                  ok("mapfixed_into_reserve", good, "want=%p got=%p a[0]=0x%02x",
+                     biggest, c, (a != MAP_FAILED) ? (unsigned char)a[0] : 0);
+              } else {
+                  ok("mapfixed_into_reserve", 0, "no reservation to commit into");
+              }
+
+              /* 7. Punch-hole uncommit: how ZGC returns memory. Check both that
+                    the call is accepted and that the pages really came back. */
+              long free_before = meminfo_free_kb();
+              if (a != MAP_FAILED)
+                  memset(a, 0x77, flen);            /* fault the whole file in */
+              long free_touched = meminfo_free_kb();
+              int pr = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, flen);
+              long free_after = meminfo_free_kb();
+              ok("punch_hole", pr == 0, "rv=%d errno=%d (%s) MemFree kB: start=%ld touched=%ld punched=%ld (reclaimed=%ld)",
+                 pr, pr ? errno : 0, pr ? strerror(errno) : "-",
+                 free_before, free_touched, free_after, free_after - free_touched);
+              if (pr == 0 && a != MAP_FAILED)
+                  ok("punch_hole_reads_zero", (unsigned char)a[0] == 0x00,
+                     "a[0]=0x%02x (Linux re-faults holes as zero)", (unsigned char)a[0]);
+
+              /* 8. Anonymous shared memory, the other shape of the same need. */
+              void *s = mmap(NULL, 2 * MB, PROT_READ | PROT_WRITE,
+                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+              ok("mmap_shared_anon", s != MAP_FAILED, "addr=%p errno=%d (%s)",
+                 s, s == MAP_FAILED ? errno : 0, s == MAP_FAILED ? strerror(errno) : "-");
+
+              printf("PROBE DONE\n");
+              fflush(stdout);
+              return 0;
+          }
+          EOF
+          gcc -O2 -static -Wall -o zgcprobe zgcprobe.c
+          file zgcprobe
+
+      - name: Install ops
+        run: |
+          curl https://ops.city/get.sh -sSfL | sh
+          echo "$HOME/.ops/bin" >> "$GITHUB_PATH"
+
+      - name: Build kernel from this ref
+        run: |
+          make -j"$(nproc)" kernel PLATFORM=virt
+          cp "$(find output/platform/virt -name kernel.img | head -1)" /tmp/kernel-candidate.img
+
+      - name: Prime ops nightly cache and swap in our kernel
+        run: |
+          # ops needs a package pulled once to populate the nightly kernel slot;
+          # any package works, the JRE one is already cached across these jobs.
+          ops pkg get "${JRE_PACKAGE}" --arch arm64 --nightly || true
+          OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
+          [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
+          cp /tmp/kernel-candidate.img "$OPSK"
+          echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+
+      - name: Run the probe inside nanos
+        run: |
+          set -o pipefail
+          cat > probe-config.json <<'EOF'
+          {
+            "RunConfig": { "Memory": "2G" }
+          }
+          EOF
+          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
+            -c probe-config.json 2>&1 | strip_ansi | tee probe.log || true
+          if ! grep -q '^PROBE ' probe.log; then
+            echo "--- retry without --show-debug/--verbose (ops flag differences) ---"
+            timeout 420 ops run ./zgcprobe --nightly -c probe-config.json 2>&1 \
+              | strip_ansi | tee probe.log || true
+          fi
+
+      - name: Report what a memfd patch would have to provide
+        run: |
+          echo "--- probe output ---"
+          grep '^PROBE' probe.log || true
+          {
+            echo "## ZGC backing-store primitives, measured inside nanos"
+            echo ""
+            echo "| check | result | detail |"
+            echo "|---|---|---|"
+            grep '^PROBE ' probe.log | grep -vE '^PROBE DONE' | while read -r _ name verdict detail; do
+              echo "| \`$name\` | **$verdict** | ${detail:-–} |"
+            done
+            echo ""
+            echo "\`memfd_create\` FAIL + \`statfs_f_type\` FAIL = the two ways ZGC can obtain a heap backing file, both closed."
+            echo "\`mmap_shared_coherent\` is the one that sizes the patch: PASS means a memfd can be a thin wrapper over machinery nanos already has."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if ! grep -q '^PROBE DONE' probe.log; then
+            echo "::error::probe did not reach the end — it crashed or the guest never booted; see probe.log"
+            exit 1
+          fi
+          echo "PASS: probe completed; see the summary table for the capability matrix"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zgc-backing-store-probe
+          path: |
+            zgcprobe.c
+            probe.log
