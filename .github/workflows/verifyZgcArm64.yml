@@ -1,28 +1,31 @@
 name: ZGC on nanos — GC matrix + backing-store probe (arm64)
 
-# ZGC is the one GC that does NOT start on nanos today, and the cause is a
-# kernel gap, not a JVM one. ZPhysicalMemoryBacking (Linux) needs a shared
-# memory FILE to back the heap:
-#   1. primary path   -> memfd_create(2)                   [not a nanos syscall]
-#   2. fallback path  -> a file on a tmpfs/hugetlbfs mount, located by comparing
-#                        statfs(2) f_type against TMPFS_MAGIC (0x01021994)
-#                        [nanos statfs_internal() memsets the struct and never
-#                        sets f_type, and there is no tmpfs/mount at all]
-# Everything else ZGC needs is already there: fallocate(PUNCH_HOLE|KEEP_SIZE)
-# is implemented, and MADV_DONTNEED really unmaps.
+# ZGC is the one GC that does not start in a stock nanos image: it needs a
+# shared memory FILE to back the heap, and asks for one via memfd_create(2),
+# whose handler lives in the *shmem klib* (klib/shmem.c: a tmpfs instance plus
+# swap_syscall_handler) rather than in the base kernel. An image built without
+# that klib gets ENOSYS, and ZGC's only fallback -- a file on a filesystem whose
+# statfs f_type is TMPFS_MAGIC -- is closed too, because statfs_internal() never
+# fills f_type in. So the fix is a manifest one, not a patch: ask ops for the
+# klib. Everything else ZGC needs already works (huge PROT_NONE reservations,
+# MAP_FIXED commit, MADV_DONTNEED, fallocate PUNCH_HOLE).
 #
-# This workflow measures both halves of that claim, on the kernel built from
-# THIS ref (so it doubles as the A/B once a memfd_create patch lands here):
+# Both jobs therefore run stock-vs-klib on the kernel built from THIS ref:
 #   * job "gc-matrix"      - boots a real allocation workload under every GC the
 #                            JRE ships. G1/Serial/Parallel are the control and
-#                            are GATED; Z/Shenandoah are reported.
+#                            are gated; ZGC runs twice, without the klib (must
+#                            fail on the backing file) and with it (must start).
 #   * job "backing-store"  - a C probe running INSIDE nanos that exercises the
 #                            exact primitives ZGC's backing store is built from
 #                            (memfd, statfs magic, huge PROT_NONE reservation,
 #                            MAP_SHARED multi-mapping + coherency, MAP_FIXED
-#                            commit into the reservation, punch-hole uncommit),
-#                            so the size of the kernel patch is measured, not
-#                            guessed.
+#                            commit into the reservation, punch-hole uncommit,
+#                            and whether the memory ever comes back), once
+#                            without the klib and once with it.
+#
+# The klibs are the ones ops already ships (~/.ops/<ver>/klibs/{tmpfs,shmem});
+# nanos's own test/runtime/shmem.c covers the same multi-mapping pattern ZGC
+# relies on, so this is exercising a supported path, not a hack.
 #
 # TCG on the free hosted arm64 runner is enough — nothing here needs KVM.
 # (GitHub-hosted arm64 runners do NOT expose /dev/kvm.)
@@ -39,14 +42,14 @@ on:
         description: "HotSpot JRE ops package"
         default: "AngeloRubens/TemurinJREarm64Linux:25.0.1"
       zgc_expect:
-        description: "report ZGC (measure) or require it to start (after the kernel patch)"
-        default: "report"
+        description: "gate ZGC-with-klib (default) or only measure it"
+        default: "must-start"
         type: choice
-        options: [report, must-start]
+        options: [must-start, report]
 
 env:
   JRE_PACKAGE: ${{ inputs.jre_package || 'AngeloRubens/TemurinJREarm64Linux:25.0.1' }}
-  ZGC_EXPECT: ${{ inputs.zgc_expect || 'report' }}
+  ZGC_EXPECT: ${{ inputs.zgc_expect || 'must-start' }}
 
 jobs:
   # ====================================================================
@@ -161,20 +164,29 @@ jobs:
         run: |
           set -o pipefail
           strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
-          # label|flag — Shenandoah may simply not be in this build, which the
-          # log will say ("Unrecognized VM option"); that is a JRE fact, not a
-          # nanos one, and is reported as such.
+          # label|flag|klibs — Shenandoah may simply not be in this build, which
+          # the log will say ("Unrecognized VM option"); that is a JRE fact, not
+          # a nanos one, and is reported as such. ZGC runs twice: the stock
+          # image has no memfd_create, the second one asks ops for the klibs
+          # that provide it (tmpfs is listed explicitly because shmem's
+          # tmpfs_new() resolves against it, exactly as test/runtime/shmem.manifest
+          # does upstream).
           MATRIX=(
-            "g1|UseG1GC"
-            "serial|UseSerialGC"
-            "parallel|UseParallelGC"
-            "shenandoah|UseShenandoahGC"
-            "z|UseZGC"
+            "g1|UseG1GC|"
+            "serial|UseSerialGC|"
+            "parallel|UseParallelGC|"
+            "shenandoah|UseShenandoahGC|"
+            "z|UseZGC|"
+            "z-shmem|UseZGC|\"tmpfs\", \"shmem\""
           )
           for entry in "${MATRIX[@]}"; do
-            label="${entry%%|*}"; flag="${entry##*|}"
+            label="$(echo "$entry" | cut -d'|' -f1)"
+            flag="$(echo "$entry" | cut -d'|' -f2)"
+            klibs="$(echo "$entry" | cut -d'|' -f3)"
+            [ -n "$klibs" ] && klibline="  \"Klibs\": [${klibs}]," || klibline=""
             cat > "cfg-${label}.json" <<EOF
           {
+          ${klibline}
             "Args": ["-XX:+${flag}", "-Xlog:gc+init=debug", "-Xlog:gc", "-Xms192m", "-Xmx192m",
                      "-Drounds=12", "-cp", "/", "GcChurn"],
             "Files": ["GcChurn.class"],
@@ -187,30 +199,43 @@ jobs:
               | strip_ansi | tee "gc-${label}.log" || true
           done
 
-      - name: Gate the control GCs, report Z/Shenandoah
+      - name: Gate the control GCs and ZGC-with-klib, report the rest
         run: |
           verdict() { # $1=logfile -> OK | FAIL | ABSENT
             if grep -q 'GC OK' "$1" 2>/dev/null; then echo OK
             elif grep -qi 'Unrecognized VM option' "$1" 2>/dev/null; then echo ABSENT
             else echo FAIL; fi
           }
-          reason() { # first line that explains a non-start
-            grep -iE 'Error occurred during initialization|Unrecognized VM option|Failed to|Could not|memfd|tmpfs|hugetlbfs|AllocateHeapAt|Not enough space|out of memory' "$1" 2>/dev/null \
-              | head -1 | cut -c1-160
+          reason() { # the most specific line that explains a non-start
+            # Ordered: the specific cause first, the generic "initialization
+            # failed" banner only as a last resort — HotSpot prints the banner
+            # BEFORE the detail, so a plain head -1 would always report the
+            # useless line and misclassify a known gap as unexpected.
+            for pat in 'memfd|tmpfs|hugetlbfs|AllocateHeapAt|backing file' \
+                       'Unrecognized VM option' \
+                       'Failed to|Could not|Not enough space|out of memory' \
+                       'Error occurred during initialization'; do
+              m=$(grep -iE "$pat" "$1" 2>/dev/null | head -1 | cut -c1-160)
+              [ -n "$m" ] && { echo "$m"; return; }
+            done
           }
           {
             echo "## GC matrix inside nanos (arm64, TCG, kernel from this ref)"
             echo ""
-            echo "| GC | result | collectors / reason |"
-            echo "|---|---|---|"
-            for l in g1 serial parallel shenandoah z; do
+            echo "| GC | image | result | collectors / reason |"
+            echo "|---|---|---|---|"
+            for l in g1 serial parallel shenandoah z z-shmem; do
               v=$(verdict "gc-${l}.log")
               if [ "$v" = OK ]; then
                 d=$(grep -o 'collector=[^ ]*' "gc-${l}.log" | head -1)
               else
                 d=$(reason "gc-${l}.log")
               fi
-              echo "| \`$l\` | **$v** | ${d:-–} |"
+              case "$l" in
+                z-shmem) img="+ tmpfs/shmem klibs" ;;
+                *)       img="stock" ;;
+              esac
+              echo "| \`$l\` | $img | **$v** | ${d:-–} |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -221,21 +246,30 @@ jobs:
             [ "$v" = OK ] || { echo "::error::${l} did not complete the workload — regression, see gc-${l}.log"; fail=1; }
           done
 
+          # Stock image: ZGC is expected NOT to start, and specifically because
+          # the backing file could not be created. Anything else means the story
+          # in this file's header is wrong and needs re-reading.
           zv=$(verdict gc-z.log)
-          echo "zgc: $zv  reason: $(reason gc-z.log)"
+          zr=$(reason gc-z.log)
+          echo "zgc (stock): $zv  reason: $zr"
           if [ "$zv" = OK ]; then
-            echo "ZGC STARTED and completed the workload."
-          else
-            r=$(reason gc-z.log)
-            if printf '%s' "$r" | grep -qiE 'memfd|tmpfs|hugetlbfs|AllocateHeapAt|backing'; then
-              echo "::warning::ZGC does not start — expected backing-store gap: $r"
-            else
-              echo "::warning::ZGC does not start for an UNEXPECTED reason (not the memfd/tmpfs gap): ${r:-<no reason line found>} — inspect gc-z.log"
-            fi
+            echo "::warning::ZGC started WITHOUT the shmem klib — memfd_create is available in the base kernel now; update this workflow's premise"
+          elif ! printf '%s' "$zr" | grep -qiE 'memfd|tmpfs|hugetlbfs|AllocateHeapAt|backing'; then
+            echo "::warning::ZGC failed for an UNEXPECTED reason (not the backing-file gap): ${zr:-<none found>} — inspect gc-z.log"
+          fi
+
+          # With the klib the JVM must actually run: this is the claim.
+          kv=$(verdict gc-z-shmem.log)
+          echo "zgc (+klib): $kv  $(grep -o 'collector=[^ ]*' gc-z-shmem.log | head -1)"
+          if [ "$kv" != OK ]; then
+            msg="ZGC still does not complete with the tmpfs/shmem klibs loaded: $(reason gc-z-shmem.log)"
             if [ "$ZGC_EXPECT" = "must-start" ]; then
-              echo "::error::zgc_expect=must-start but ZGC did not start"
-              fail=1
+              echo "::error::$msg"; fail=1
+            else
+              echo "::warning::$msg"
             fi
+          else
+            echo "PASS: ZGC runs on nanos once the shmem klib provides memfd_create"
           fi
 
           sv=$(verdict gc-shenandoah.log)
@@ -436,6 +470,23 @@ jobs:
                   ok("punch_hole_reads_zero", (unsigned char)a[0] == 0x00,
                      "a[0]=0x%02x (Linux re-faults holes as zero)", (unsigned char)a[0]);
 
+              /* 7b. If the hole did not give the memory back, find out whether
+                     anything does: drop every mapping, then the file itself.
+                     Distinguishes "punch-hole is a no-op" from "the pages are
+                     pinned by the mappings" from "MemFree just does not account
+                     for pagecache". Without a working uncommit ZGC's heap can
+                     only ever grow. */
+              if (a != MAP_FAILED) munmap(a, flen);
+              if (b != MAP_FAILED) munmap(b, flen);
+              if (biggest != MAP_FAILED) munmap(biggest, biggest_len);  /* also drops the MAP_FIXED view */
+              long free_unmapped = meminfo_free_kb();
+              close(fd);
+              if (mfd < 0) unlink(path);
+              long free_closed = meminfo_free_kb();
+              ok("memory_returned", free_closed > free_touched,
+                 "MemFree kB: touched=%ld afterPunch=%ld afterUnmap=%ld afterClose=%ld",
+                 free_touched, free_after, free_unmapped, free_closed);
+
               /* 8. Anonymous shared memory, the other shape of the same need. */
               void *s = mmap(NULL, 2 * MB, PROT_READ | PROT_WRITE,
                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -470,45 +521,68 @@ jobs:
           cp /tmp/kernel-candidate.img "$OPSK"
           echo "OPSK=$OPSK" >> "$GITHUB_ENV"
 
-      - name: Run the probe inside nanos
+      - name: Run the probe inside nanos, stock and with the klibs
         run: |
           set -o pipefail
-          cat > probe-config.json <<'EOF'
+          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          cat > probe-stock.json <<'EOF'
           {
             "RunConfig": { "Memory": "2G" }
           }
           EOF
-          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
-          timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
-            -c probe-config.json 2>&1 | strip_ansi | tee probe.log || true
-          if ! grep -q '^PROBE ' probe.log; then
-            echo "--- retry without --show-debug/--verbose (ops flag differences) ---"
-            timeout 420 ops run ./zgcprobe --nightly -c probe-config.json 2>&1 \
-              | strip_ansi | tee probe.log || true
-          fi
+          cat > probe-klib.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "RunConfig": { "Memory": "2G" }
+          }
+          EOF
+          for v in stock klib; do
+            echo "=== probe (${v}) ==="
+            timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
+              -c "probe-${v}.json" 2>&1 | strip_ansi | tee "probe-${v}.log" || true
+            if ! grep -q '^PROBE ' "probe-${v}.log"; then
+              echo "--- retry without --show-debug/--verbose (ops flag differences) ---"
+              timeout 420 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
+                | strip_ansi | tee "probe-${v}.log" || true
+            fi
+          done
 
-      - name: Report what a memfd patch would have to provide
+      - name: Report the stock-vs-klib capability matrix
         run: |
-          echo "--- probe output ---"
-          grep '^PROBE' probe.log || true
+          res() { # $1=variant $2=check -> "VERDICT detail"
+            grep "^PROBE $2 " "probe-$1.log" 2>/dev/null | head -1 | sed -E 's/^PROBE +[^ ]+ +//'
+          }
+          checks=$(cat probe-stock.log probe-klib.log 2>/dev/null \
+                   | grep '^PROBE ' | grep -v '^PROBE DONE' | awk '{print $2}' | awk '!seen[$0]++')
+          echo "--- stock ---"; grep '^PROBE' probe-stock.log || true
+          echo "--- klib  ---"; grep '^PROBE' probe-klib.log  || true
           {
             echo "## ZGC backing-store primitives, measured inside nanos"
             echo ""
-            echo "| check | result | detail |"
+            echo "| check | stock image | + tmpfs/shmem klibs |"
             echo "|---|---|---|"
-            grep '^PROBE ' probe.log | grep -vE '^PROBE DONE' | while read -r _ name verdict detail; do
-              echo "| \`$name\` | **$verdict** | ${detail:-–} |"
+            for c in $checks; do
+              echo "| \`$c\` | $(res stock "$c" | cut -c1-90) | $(res klib "$c" | cut -c1-90) |"
             done
             echo ""
-            echo "\`memfd_create\` FAIL + \`statfs_f_type\` FAIL = the two ways ZGC can obtain a heap backing file, both closed."
-            echo "\`mmap_shared_coherent\` is the one that sizes the patch: PASS means a memfd can be a thin wrapper over machinery nanos already has."
+            echo "With the klibs, \`memfd_create\` succeeds and the remaining checks run against the memfd itself"
+            echo "(the tmpfs klib's pages) instead of a file on the root filesystem — which is the path ZGC takes."
+            echo "\`memory_returned\` says whether an uncommit actually gives the pages back to the host."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if ! grep -q '^PROBE DONE' probe.log; then
-            echo "::error::probe did not reach the end — it crashed or the guest never booted; see probe.log"
-            exit 1
+          fail=0
+          for v in stock klib; do
+            grep -q '^PROBE DONE' "probe-${v}.log" || {
+              echo "::error::probe (${v}) did not reach the end — it crashed or never booted; see probe-${v}.log"; fail=1; }
+          done
+          # The claim under test: the klib actually delivers the syscall.
+          if grep -q '^PROBE memfd_create *PASS' probe-klib.log; then
+            echo "PASS: memfd_create works once the shmem klib is loaded"
+          else
+            echo "::error::memfd_create still fails with the klibs loaded: $(res klib memfd_create)"
+            fail=1
           fi
-          echo "PASS: probe completed; see the summary table for the capability matrix"
+          exit $fail
 
       - name: Upload logs
         if: always()
@@ -517,4 +591,6 @@ jobs:
           name: zgc-backing-store-probe
           path: |
             zgcprobe.c
-            probe.log
+            probe-stock.log
+            probe-klib.log
+            probe-*.json
