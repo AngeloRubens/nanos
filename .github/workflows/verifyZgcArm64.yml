@@ -6,9 +6,15 @@ name: ZGC on nanos — GC matrix + backing-store probe (arm64)
 # swap_syscall_handler) rather than in the base kernel. An image built without
 # that klib gets ENOSYS, and ZGC's only fallback -- a file on a filesystem whose
 # statfs f_type is TMPFS_MAGIC -- is closed too, because statfs_internal() never
-# fills f_type in. So the fix is a manifest one, not a patch: ask ops for the
-# klib. Everything else ZGC needs already works (huge PROT_NONE reservations,
-# MAP_FIXED commit, MADV_DONTNEED, fallocate PUNCH_HOLE).
+# fills f_type in.
+#
+# Loading the klib is necessary but was not sufficient: ZGC then obtained its
+# heap backing file and died committing memory into it, because fallocate() was
+# implemented by tfs alone and returned EINVAL on a tmpfs file. That is fixed on
+# this ref ("fs: dispatch fallocate() through the filesystem"), part of it in
+# the tmpfs klib -- which is why the steps below install the klibs built here
+# over the prebuilt ones ops ships. Everything else ZGC needs already worked
+# (huge PROT_NONE reservations, MAP_FIXED commit, MADV_DONTNEED, punch-hole).
 #
 # Both jobs therefore run stock-vs-klib on the kernel built from THIS ref:
 #   * job "gc-matrix"      - boots a real allocation workload under every GC the
@@ -159,6 +165,17 @@ jobs:
           echo "ops kernel slot: $OPSK"
           cp /tmp/kernel-candidate.img "$OPSK"
           echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+          # Part of the fix lives in the tmpfs klib, so the image has to load the
+          # klibs built from this ref: leaving ops's prebuilt ones in place would
+          # quietly test stock nanos and make a green run meaningless.
+          KLIBDIR="$(dirname "$OPSK")/klibs"
+          [ -d "$KLIBDIR" ] || { echo "::error::no klibs dir beside $OPSK"; exit 1; }
+          for k in tmpfs shmem; do
+            built="$(find output -type f -path '*/bin/*' -name "$k" | head -1)"
+            [ -n "$built" ] || { echo "::error::klib '$k' was not built under output/"; exit 1; }
+            cp "$built" "$KLIBDIR/$k"
+            echo "klib $k <- $built"
+          done
 
       - name: Boot the workload once per GC
         run: |
@@ -525,6 +542,16 @@ jobs:
           [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
           cp /tmp/kernel-candidate.img "$OPSK"
           echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+          # Same reason as in the gc-matrix job: the klibs must come from this
+          # ref, not from the ones ops ships prebuilt.
+          KLIBDIR="$(dirname "$OPSK")/klibs"
+          [ -d "$KLIBDIR" ] || { echo "::error::no klibs dir beside $OPSK"; exit 1; }
+          for k in tmpfs shmem; do
+            built="$(find output -type f -path '*/bin/*' -name "$k" | head -1)"
+            [ -n "$built" ] || { echo "::error::klib '$k' was not built under output/"; exit 1; }
+            cp "$built" "$KLIBDIR/$k"
+            echo "klib $k <- $built"
+          done
 
       - name: Run the probe inside nanos, stock and with the klibs
         run: |
