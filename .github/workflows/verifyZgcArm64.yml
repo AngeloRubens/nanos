@@ -16,7 +16,7 @@ name: ZGC on nanos — GC matrix + backing-store probe (arm64)
 # over the prebuilt ones ops ships. Everything else ZGC needs already worked
 # (huge PROT_NONE reservations, MAP_FIXED commit, MADV_DONTNEED, punch-hole).
 #
-# Both jobs therefore run stock-vs-klib on the kernel built from THIS ref:
+# The first two jobs run stock-vs-klib on the kernel built from THIS ref:
 #   * job "gc-matrix"      - boots a real allocation workload under every GC the
 #                            JRE ships. G1/Serial/Parallel are the control and
 #                            are gated; ZGC runs twice, without the klib (must
@@ -29,9 +29,16 @@ name: ZGC on nanos — GC matrix + backing-store probe (arm64)
 #                            and whether the memory ever comes back), once
 #                            without the klib and once with it.
 #
-# The klibs are the ones ops already ships (~/.ops/<ver>/klibs/{tmpfs,shmem});
-# nanos's own test/runtime/shmem.c covers the same multi-mapping pattern ZGC
-# relies on, so this is exercising a supported path, not a hack.
+#   * job "runtime-test-shmem" - nanos's own memfd runtime test, which the same
+#                            change extends with the fallocate and sealing
+#                            cases, run through the upstream `make run-noaccel`
+#                            harness so the assertions are checked against nanos
+#                            rather than against Linux.
+#
+# The klib names are the ones ops ships (~/.ops/<ver>/klibs/{tmpfs,shmem}), but
+# the binaries installed here are built from this ref; nanos's own
+# test/runtime/shmem.c covers the same multi-mapping pattern ZGC relies on, so
+# this is exercising a supported path, not a hack.
 #
 # TCG on the free hosted arm64 runner is enough — nothing here needs KVM.
 # (GitHub-hosted arm64 runners do NOT expose /dev/kvm.)
@@ -41,6 +48,8 @@ on:
     branches: [ci/zgc-probe]
     paths:
       - 'src/**'
+      - 'klib/**'
+      - 'test/runtime/shmem.c'
       - '.github/workflows/verifyZgcArm64.yml'
   workflow_dispatch:
     inputs:
@@ -626,3 +635,51 @@ jobs:
             probe-stock.log
             probe-klib.log
             probe-*.json
+
+  # ====================================================================
+  # nanos's own runtime test for memfd, extended with the fallocate cases the
+  # dispatch change makes reachable (allocate and keep-size on a memfd, and the
+  # seals they have to honour). Running it through `make run-noaccel` builds the
+  # image the way the upstream suite does -- its manifest already loads the
+  # tmpfs and shmem klibs, and both are built from this ref -- so this is the
+  # patch under nanos, not under Linux.
+  # ====================================================================
+  runtime-test-shmem:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
+          which qemu-system-aarch64
+
+      - name: Run the upstream shmem runtime test under TCG
+        run: |
+          set -o pipefail
+          timeout 900 make -j"$(nproc)" run-noaccel TARGET=shmem PLATFORM=virt 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g' | tee shmem-test.log || true
+
+      - name: Assert the test passed inside the guest
+        run: |
+          if grep -qE 'failed at|Error: ' shmem-test.log; then
+            echo "::error::shmem runtime test failed inside nanos:"
+            grep -E 'failed at|Error: ' shmem-test.log | head -5
+            exit 1
+          fi
+          grep -q 'Shared memory tests OK' shmem-test.log || {
+            echo "::error::shmem runtime test did not report success — see shmem-test.log"
+            tail -20 shmem-test.log
+            exit 1; }
+          echo "PASS: $(grep 'Shared memory tests OK' shmem-test.log | head -1)"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shmem-runtime-test
+          path: shmem-test.log
