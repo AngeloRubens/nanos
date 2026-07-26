@@ -472,8 +472,100 @@ jobs:
               return v;
           }
 
-          int main(void)
+          /* MemFree counts the physical heap; Cached is what the page cache
+             holds. A punched hole that only zeroes its pages shows up as
+             neither being given back — the point of the pressure test is to
+             find out whether they come back when someone else needs them. */
+          static void meminfo2(long *freekb, long *cachedkb)
           {
+              FILE *f = fopen("/proc/meminfo", "r");
+              char line[256];
+              *freekb = *cachedkb = -1;
+              if (!f)
+                  return;
+              while (fgets(line, sizeof(line), f)) {
+                  sscanf(line, "MemFree: %ld kB", freekb);
+                  sscanf(line, "Cached: %ld kB", cachedkb);
+              }
+              fclose(f);
+          }
+
+          #define PRESS_FILL  (200 * MB)
+          #define PRESS_CHUNK (8 * MB)
+
+          static void pressure_test(void)
+          {
+              long f0, c0, f1, c1, f2, c2, f3, c3;
+              meminfo2(&f0, &c0);
+              printf("PRESSURE baseline           MemFree=%ldkB Cached=%ldkB\n", f0, c0);
+              fflush(stdout);
+
+              long fd = syscall(SYS_memfd_create, "pressure", 0);
+              if (fd < 0) {
+                  ok("pressure_setup", 0, "memfd_create errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              if ((ftruncate((int)fd, PRESS_FILL) != 0)) {
+                  ok("pressure_setup", 0, "ftruncate errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              char *m = mmap(NULL, PRESS_FILL, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              if (m == MAP_FAILED) {
+                  ok("pressure_setup", 0, "mmap errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              memset(m, 0x5a, PRESS_FILL);          /* materialise every page */
+              meminfo2(&f1, &c1);
+              printf("PRESSURE filled %luM         MemFree=%ldkB Cached=%ldkB\n",
+                     (unsigned long)(PRESS_FILL / MB), f1, c1);
+              fflush(stdout);
+
+              int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, PRESS_FILL);
+              munmap(m, PRESS_FILL);
+              meminfo2(&f2, &c2);
+              printf("PRESSURE punched+unmapped   MemFree=%ldkB Cached=%ldkB (punch rv=%d)\n",
+                     f2, c2, pr);
+              fflush(stdout);
+
+              /* Ask for more memory than is free, without ever releasing it: if
+                 the punched pages are reclaimable, these allocations succeed and
+                 Cached falls; if they are lost, the allocations start failing
+                 around the amount that was free before. */
+              unsigned long got = 0;
+              while (got < 2 * PRESS_FILL) {
+                  char *a = mmap(NULL, PRESS_CHUNK, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                  if (a == MAP_FAILED) {
+                      printf("PRESSURE mmap failed after %luM errno=%d (%s)\n",
+                             got / MB, errno, strerror(errno));
+                      break;
+                  }
+                  memset(a, 0xa5, PRESS_CHUNK);
+                  got += PRESS_CHUNK;
+                  if ((got % (40 * MB)) == 0) {
+                      long f, c;
+                      meminfo2(&f, &c);
+                      printf("PRESSURE touched %3luM       MemFree=%ldkB Cached=%ldkB\n",
+                             got / MB, f, c);
+                      fflush(stdout);
+                  }
+              }
+              meminfo2(&f3, &c3);
+              ok("pressure_alloc", got >= PRESS_FILL, "allocated %luM after punching %luM (free before: %ldkB)",
+                 got / MB, (unsigned long)(PRESS_FILL / MB), f2);
+              ok("pagecache_reclaimed", c3 < c2 - (long)(PRESS_FILL / 1024 / 2),
+                 "Cached %ldkB -> %ldkB under pressure (MemFree %ldkB -> %ldkB)", c2, c3, f2, f3);
+              close((int)fd);
+          }
+
+          int main(int argc, char **argv)
+          {
+              if ((argc > 1) && !strcmp(argv[1], "pressure")) {
+                  pressure_test();
+                  printf("PROBE DONE\n");
+                  fflush(stdout);
+                  return 0;
+              }
               /* 1. memfd_create: ZGC's primary heap backing file. Raw syscall so
                     a missing kernel entry shows up as ENOSYS, unambiguously. */
               long mfd = syscall(SYS_memfd_create, "zgc-probe", (unsigned)MFD_CLOEXEC);
@@ -652,7 +744,17 @@ jobs:
             "RunConfig": { "Memory": "2G" }
           }
           EOF
-          for v in stock klib; do
+          # Small guest on purpose: 200M punched out of 512M is only reclaimable
+          # if the page cache gives it back, so the allocations that follow
+          # answer the question instead of the guest simply having room.
+          cat > probe-pressure.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["pressure"],
+            "RunConfig": { "Memory": "512M" }
+          }
+          EOF
+          for v in stock klib pressure; do
             echo "=== probe (${v}) ==="
             timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
               -c "probe-${v}.json" 2>&1 | strip_ansi | tee "probe-${v}.log" || true
@@ -684,6 +786,13 @@ jobs:
             echo "With the klibs, \`memfd_create\` succeeds and the remaining checks run against the memfd itself"
             echo "(the tmpfs klib's pages) instead of a file on the root filesystem — which is the path ZGC takes."
             echo "\`memory_returned\` says whether an uncommit actually gives the pages back to the host."
+            echo ""
+            echo "### Under memory pressure (512M guest, 200M punched out of a memfd)"
+            echo ""
+            echo "Does a punched hole give its pages back when something else needs them, or only when the file is closed?"
+            echo '```'
+            grep -E '^(PRESSURE|PROBE (pressure_alloc|pagecache_reclaimed|pressure_setup))' probe-pressure.log 2>/dev/null || echo "(no output)"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
           fail=0
@@ -698,6 +807,15 @@ jobs:
             echo "::error::memfd_create still fails with the klibs loaded: $(res klib memfd_create)"
             fail=1
           fi
+
+          # The pressure run is a measurement, not a gate: running the guest out
+          # of memory is one of its possible answers, and it would leave the log
+          # truncated rather than wrong. Only a run that never started is a
+          # failure here.
+          echo "--- pressure ---"; grep -E '^(PRESSURE|PROBE p)' probe-pressure.log || true
+          if ! grep -q '^PRESSURE baseline' probe-pressure.log; then
+            echo "::warning::the pressure run produced no measurement — see probe-pressure.log"
+          fi
           exit $fail
 
       - name: Upload logs
@@ -709,6 +827,7 @@ jobs:
             zgcprobe.c
             probe-stock.log
             probe-klib.log
+            probe-pressure.log
             probe-*.json
 
   # ====================================================================
