@@ -115,6 +115,16 @@ jobs:
               public static void main(String[] args) throws Exception {
                   final int liveCount = 64, liveSize = 512 * 1024;
                   final int rounds = Integer.getInteger("rounds", 12);
+                  /* Objects above ZObjectSizeLimitMedium go into ZGC "large"
+                     pages, committed as granule multiples of an arbitrary
+                     size — a different allocation path from the medium pages
+                     the 512K arrays of the live set land in. */
+                  final int humongous = Integer.getInteger("humongous", 0);
+                  final int humongousMB = Integer.getInteger("humongousMB", 32);
+                  /* Seconds to idle at the end, after dropping the live set, so
+                     ZGC's uncommitter has something to give back and the time
+                     to do it (needs -Xms < -Xmx and a short ZUncommitDelay). */
+                  final int settle = Integer.getInteger("settle", 0);
                   List<byte[]> live = new ArrayList<>(liveCount);
                   long expect = 0;
                   for (int i = 0; i < liveCount; i++) {
@@ -122,6 +132,16 @@ jobs:
                       for (int j = 0; j < a.length; j += 997) a[j] = (byte) (i + j);
                       live.add(a);
                       expect ^= fnv(a);
+                  }
+                  /* Checked by sentinels rather than by hashing: under TCG,
+                     walking hundreds of MB byte by byte is the slow part. */
+                  List<byte[]> big = new ArrayList<>(humongous);
+                  for (int i = 0; i < humongous; i++) {
+                      byte[] a = new byte[humongousMB * 1024 * 1024];
+                      a[0] = (byte) (i + 1);
+                      a[a.length / 2] = (byte) (i + 2);
+                      a[a.length - 1] = (byte) (i + 3);
+                      big.add(a);
                   }
                   long sink = 0;
                   for (int r = 0; r < rounds; r++) {
@@ -136,6 +156,19 @@ jobs:
                   for (byte[] a : live) actual ^= fnv(a);
                   boolean ok = (actual == expect);
                   if (!ok) System.out.println("LIVE SET MISMATCH");
+                  for (int i = 0; i < big.size(); i++) {
+                      byte[] a = big.get(i);
+                      if ((a[0] != (byte) (i + 1)) || (a[a.length / 2] != (byte) (i + 2))
+                              || (a[a.length - 1] != (byte) (i + 3))) {
+                          ok = false;
+                          System.out.println("HUMONGOUS MISMATCH at " + i);
+                      }
+                  }
+                  if (settle > 0) {
+                      live.clear();
+                      big.clear();
+                      for (int i = 0; i < settle; i++) { System.gc(); Thread.sleep(1000); }
+                  }
                   System.out.println("GC " + (ok ? "OK" : "FAIL")
                           + " collector=" + gcNames()
                           + " maxHeap=" + (Runtime.getRuntime().maxMemory() >> 20) + "m"
@@ -197,24 +230,32 @@ jobs:
           # that provide it (tmpfs is listed explicitly because shmem's
           # tmpfs_new() resolves against it, exactly as test/runtime/shmem.manifest
           # does upstream).
+          # label|flag|klibs|extra args (appended last, so they override the
+          # defaults). The last two entries exist because heap size alone only
+          # repeats the same code: what changes the path taken is the object
+          # size (large pages) and -Xms < -Xmx (uncommit, i.e. the JVM punching
+          # holes in the memfd rather than only committing).
           MATRIX=(
-            "g1|UseG1GC|"
-            "serial|UseSerialGC|"
-            "parallel|UseParallelGC|"
-            "shenandoah|UseShenandoahGC|"
-            "z|UseZGC|"
-            "z-shmem|UseZGC|\"tmpfs\", \"shmem\""
+            "g1|UseG1GC||"
+            "serial|UseSerialGC||"
+            "parallel|UseParallelGC||"
+            "shenandoah|UseShenandoahGC||"
+            "z|UseZGC||"
+            "z-shmem|UseZGC|\"tmpfs\", \"shmem\"|"
+            "z-large|UseZGC|\"tmpfs\", \"shmem\"|\"-Xmx512m\", \"-Dhumongous=4\", \"-DhumongousMB=32\", \"-Drounds=6\","
+            "z-uncommit|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=8\", \"-Dsettle=8\","
           )
           for entry in "${MATRIX[@]}"; do
             label="$(echo "$entry" | cut -d'|' -f1)"
             flag="$(echo "$entry" | cut -d'|' -f2)"
             klibs="$(echo "$entry" | cut -d'|' -f3)"
+            extra="$(echo "$entry" | cut -d'|' -f4)"
             [ -n "$klibs" ] && klibline="  \"Klibs\": [${klibs}]," || klibline=""
             cat > "cfg-${label}.json" <<EOF
           {
           ${klibline}
             "Args": ["-XX:+${flag}", "-Xlog:gc+init=debug", "-Xlog:gc", "-Xms192m", "-Xmx192m",
-                     "-Drounds=12", "-cp", "/", "GcChurn"],
+                     "-Drounds=12", ${extra} "-cp", "/", "GcChurn"],
             "Files": ["GcChurn.class"],
             "RunConfig": { "Memory": "2G" }
           }
@@ -255,7 +296,7 @@ jobs:
             echo ""
             echo "| GC | image | result | collectors / reason |"
             echo "|---|---|---|---|"
-            for l in g1 serial parallel shenandoah z z-shmem; do
+            for l in g1 serial parallel shenandoah z z-shmem z-large z-uncommit; do
               v=$(verdict "gc-${l}.log")
               if [ "$v" = OK ]; then
                 d=$(grep -o 'collector=[^ ]*' "gc-${l}.log" | head -1)
@@ -263,11 +304,19 @@ jobs:
                 d=$(reason "gc-${l}.log")
               fi
               case "$l" in
-                z-shmem) img="+ tmpfs/shmem klibs" ;;
-                *)       img="stock" ;;
+                z-shmem)    img="+ klibs" ;;
+                z-large)    img="+ klibs, 32M objects (large pages)" ;;
+                z-uncommit) img="+ klibs, -Xms64m/-Xmx512m (uncommit on)" ;;
+                *)          img="stock" ;;
               esac
               echo "| \`$l\` | $img | **$v** | ${d:-–} |"
             done
+            echo ""
+            echo "ZGC uncommit evidence (\`zUncommitter.cpp\` logs this only when it actually gives memory back):"
+            echo '```'
+            ev=$(grep -E 'Uncommitter|Uncommit:' gc-z-uncommit.log 2>/dev/null | head -5 || true)
+            echo "${ev:-(none reported)}"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
           fail=0
@@ -301,6 +350,32 @@ jobs:
             fi
           else
             echo "PASS: ZGC runs on nanos once the shmem klib provides memfd_create"
+          fi
+
+          # Large pages: objects above ZObjectSizeLimitMedium are committed as
+          # whole granule multiples, a different size class from the medium
+          # pages the base workload uses.
+          lv=$(verdict gc-z-large.log)
+          echo "zgc (+klib, large pages): $lv"
+          if [ "$lv" != OK ]; then
+            echo "::error::ZGC fails with humongous objects: $(reason gc-z-large.log)"
+            fail=1
+          fi
+
+          # Uncommit: the only configuration where the JVM punches holes in the
+          # memfd instead of only committing. Gated on the workload completing;
+          # whether the uncommitter fired is reported, since it depends on
+          # timing rather than on correctness.
+          uv=$(verdict gc-z-uncommit.log)
+          echo "zgc (+klib, uncommit): $uv"
+          if [ "$uv" != OK ]; then
+            echo "::error::ZGC fails with an elastic heap: $(reason gc-z-uncommit.log)"
+            fail=1
+          fi
+          if grep -qE 'Uncommitter.*Uncommitted:' gc-z-uncommit.log 2>/dev/null; then
+            echo "PASS: ZGC uncommitted memory through the memfd: $(grep -oE 'Uncommitter.*' gc-z-uncommit.log | head -1)"
+          else
+            echo "::warning::the uncommitter never reported giving memory back — the path stayed untested in this run (delay too long, or nothing was uncommittable)"
           fi
 
           sv=$(verdict gc-shenandoah.log)
