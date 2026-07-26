@@ -661,13 +661,15 @@ jobs:
       - name: Run the upstream shmem runtime test under TCG
         run: |
           set -o pipefail
-          # `image` only assembles the image from the manifest; the test program
-          # the manifest points at (output/test/runtime/bin/shmem) is built by
-          # the `target` rule, which the run targets do not depend on.
-          make -j"$(nproc)" target TARGET=shmem PLATFORM=virt 2>&1 | tail -5
-          ls -l output/test/runtime/bin/shmem
-          timeout 900 make -j"$(nproc)" run-noaccel TARGET=shmem PLATFORM=virt 2>&1 \
+          # Build the image separately from booting it: a build error has to
+          # fail this step loudly, while the qemu exit status must be tolerated
+          # (the guest exits through the debug-exit device, not with 0).
+          make -j"$(nproc)" image TARGET=shmem PLATFORM=virt 2>&1 | tail -30
+          ls -l output/test/runtime/bin/shmem output/image/disk.raw
+          timeout 900 make run-noaccel TARGET=shmem PLATFORM=virt 2>&1 \
             | sed 's/\x1b\[[0-9;]*m//g' | tee shmem-test.log || true
+          echo "--- output del guest, ultime righe ---"
+          tail -5 shmem-test.log
 
       - name: Assert the test passed inside the guest
         run: |
