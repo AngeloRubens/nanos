@@ -211,11 +211,16 @@ jobs:
             # failed" banner only as a last resort — HotSpot prints the banner
             # BEFORE the detail, so a plain head -1 would always report the
             # useless line and misclassify a known gap as unexpected.
+            # ops dumps the image manifest before booting, and that dump now
+            # contains the klib names ("tmpfs", "shmem") and the whole java
+            # command line, so it has to be dropped or it matches every pattern.
+            local src
+            src=$(grep -vE '^\s*&\{root:|^Manifest:' "$1" 2>/dev/null)
             for pat in 'memfd|tmpfs|hugetlbfs|AllocateHeapAt|backing file' \
                        'Unrecognized VM option' \
                        'Failed to|Could not|Not enough space|out of memory' \
                        'Error occurred during initialization'; do
-              m=$(grep -iE "$pat" "$1" 2>/dev/null | head -1 | cut -c1-160)
+              m=$(printf '%s\n' "$src" | grep -iE "$pat" | head -1 | cut -c1-160)
               [ -n "$m" ] && { echo "$m"; return; }
             done
           }
