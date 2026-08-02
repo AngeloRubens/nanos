@@ -392,6 +392,34 @@ void filesystem_alloc(fsfile f, long offset, long len, boolean keep_size,
         apply(completion, -EOPNOTSUPP);
 }
 
+#ifdef KERNEL
+closure_function(1, 1, void, filesystem_op_complete,
+                 fs_status_handler, sh,
+                 status s)
+{
+    apply(bound(sh), is_ok(s) ? 0 : -EIO);
+    closure_finish();
+}
+
+/* A write with !sg indicates that the pagecache should zero the range. The null sg is propagated
+   to the storage write for extent removal. */
+void fsfile_zero_range(fsfile f, range q, status_handler sh)
+{
+    apply(pagecache_node_get_writer(fsfile_get_cachenode(f)), 0, q, sh);
+}
+
+void filesystem_dealloc(fsfile f, long offset, long len, fs_status_handler completion)
+{
+    assert(f);
+    filesystem fs = f->fs;
+    if (fs->dealloc)
+        fs->dealloc(fs, f, offset, len, completion);
+    else
+        fsfile_zero_range(f, irangel(offset, len),
+                          contextual_closure(filesystem_op_complete, completion));
+}
+#endif
+
 int filesystem_truncate(filesystem fs, fsfile f, u64 len)
 {
     filesystem_lock(fs);

@@ -1902,6 +1902,107 @@ void *pagecache_get_page_if_filled(pagecache_node pn, u64 node_offset, boolean p
     return kvirt;
 }
 
+struct pagecache_unmap_range {
+    range v;                    /* virtual */
+    u64 node_offset;
+};
+
+/* Collects the mappings intersecting a node range, resuming from the virtual address in cursor;
+   the mappings lock cannot be held while unmapping, hence the batching. */
+static int pagecache_node_collect_maps(pagecache_node pn, range q /* node offsets */, u64 *cursor,
+                                       struct pagecache_unmap_range *maps, int max)
+{
+    int count = 0;
+    pagecache_lock_mappings();
+    rmnode n = rangemap_lookup_at_or_next(&pn->mappings, *cursor);
+    while ((n != INVALID_ADDRESS) && (count < max)) {
+        pagecache_map pcm = (pagecache_map)n;
+        range nr = irangel(pcm->node_offset, range_span(n->r));
+        range ri = range_intersection(q, nr);
+        *cursor = n->r.end;
+        if (range_span(ri) != 0) {
+            maps[count].v = irangel(n->r.start + (ri.start - pcm->node_offset), range_span(ri));
+            maps[count].node_offset = ri.start;
+            count++;
+        }
+        n = rangemap_next_node(&pn->mappings, n);
+    }
+    if (n == INVALID_ADDRESS)
+        *cursor = infinity;
+    pagecache_unlock_mappings();
+    return count;
+}
+
+static void pagecache_node_unmap_pages_sync(pagecache_node pn, range v, u64 node_offset,
+                                            boolean shared_mappings);
+
+/* Drops the pages within a node range, after unmapping them from any mapping of the node. A page
+   that is still referenced when the range is punched (because a fault is racing with us, or
+   because a private copy is mapped elsewhere) cannot be freed: it is zeroed instead, so that the
+   range always reads back as a hole. The range must be page-aligned; the caller is expected to
+   have released any reference of its own (e.g. a pin) beforehand. */
+void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */)
+{
+    pagecache pc = pn->pv->pc;
+    int page_order = pc->page_order;
+    assert((q.start & MASK(page_order)) == 0);
+    assert((q.end & MASK(page_order)) == 0);
+    pagecache_debug("%s: pn %p, q %R\n", func_ss, pn, q);
+
+    struct pagecache_unmap_range maps[16];
+    u64 cursor = 0;
+    while (cursor != infinity) {
+        int count = pagecache_node_collect_maps(pn, q, &cursor, maps, _countof(maps));
+        for (int i = 0; i < count; i++)
+            /* The unmapping must be synchronous: the asynchronous variant releases the reference
+               each mapping holds on a page from a completion that runs after this returns, and it
+               dereferences the page to do so, while the loop below is already freeing it. */
+            pagecache_node_unmap_pages_sync(pn, maps[i].v, maps[i].node_offset, false);
+    }
+
+    range pages = range_rshift(q, page_order);
+    u64 page_size = U64_FROM_BIT(page_order);
+    for (u64 pi = pages.start; pi < pages.end; pi++) {
+        pagecache_lock_node(pn);
+        pagecache_page pp = page_lookup_nodelocked(pn, pi);
+        if (pp == INVALID_ADDRESS) {  /* never faulted in: already a hole */
+            pagecache_unlock_node(pn);
+            continue;
+        }
+        pagecache_lock_state(pc);
+        if (page_state(pp) == PAGECACHE_PAGESTATE_FREE) {
+            /* An evicted page whose last reference has already been dropped: it holds no memory
+               to give back, and taking a reference on it would have us release it a second
+               time. */
+            pagecache_unlock_state(pc);
+            pagecache_unlock_node(pn);
+            continue;
+        }
+        pp->refcount++; /* our own reference, so that the page cannot go away below */
+        pagecache_unlock_state(pc);
+
+        pagecache_unlock_node(pn);
+        pagecache_lock_state(pc);
+        if (!pp->evicted) {
+            pp->evicted = true;
+            pagecache_page_release_locked(pc, pp, false);    /* cache reference */
+        }
+        boolean referenced = (pp->refcount > 1);
+        void *kvirt = pp->kvirt;
+        pagecache_unlock_state(pc);
+        if (referenced && (kvirt != INVALID_ADDRESS))
+            zero(kvirt, page_size);
+        pagecache_lock_state(pc);
+        /* The page keeps its place in the node, in the state an eviction leaves behind: only the
+           memory it holds is given back. Removing it would pull it out from under whoever is
+           walking the node's pages by pointer -- a write-back completion iterates them with
+           rbnode_get_next() long after the write itself is done -- and it is not ours to remove
+           anyway: a refault takes it back with its refault data intact. */
+        pagecache_page_release_locked(pc, pp, false);
+        pagecache_unlock_state(pc);
+    }
+}
+
 void pagecache_release_page(pagecache_node pn, u64 node_offset)
 {
     pagecache pc = pn->pv->pc;

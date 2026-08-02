@@ -872,15 +872,6 @@ static int add_extents(tfs fs, range i, rangemap rm)
     return 0;
 }
 
-closure_function(1, 1, void, filesystem_op_complete,
-                 fs_status_handler, sh,
-                 status s)
-{
-    tfs_debug("%s: status %v\n", func_ss, s);
-    apply(bound(sh), is_ok(s) ? 0 : -EIO);
-    closure_finish();
-}
-
 closure_function(1, 1, boolean, destroy_extent_node,
                  tfs, fs,
                  rmnode n)
@@ -959,17 +950,6 @@ done:
     apply(completion, status);
 }
 
-void filesystem_dealloc(fsfile f, long offset, long len,
-                        fs_status_handler completion)
-{
-    assert(f);
-    /* A write with !sg indicates that the pagecache should zero the
-       range. The null sg is propagated to the storage write for
-       extent removal. */
-    status_handler sh;
-    sh = contextual_closure(filesystem_op_complete, completion);
-    apply(pagecache_node_get_writer(fsfile_get_cachenode(f)), 0, irangel(offset, len), sh);
-}
 #endif
 
 closure_func_basic(binding_handler, boolean, cleanup_directory_each,

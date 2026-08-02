@@ -190,6 +190,118 @@ static void tmpfs_alloc(filesystem fs, fsfile f, long offset, long len, boolean 
     apply(completion, fss);
 }
 
+/* Removes a range of whole pages from the dirty range map and drops the pin taken when the range
+   was first written, so that the only references left on those pages are the cache reference and
+   any mapping of them. Ranges that cannot be split (which takes an allocation) are left alone and
+   their pages are zeroed by the caller, as before. */
+static void tmpfs_dirty_punch(tmpfs_file fsf, range pages)
+{
+    rangemap dirty = &fsf->dirty;
+    pagecache_node pn = fsf->f.cache_node;
+    rmnode n = rangemap_lookup_at_or_next(dirty, pages.start);
+    while ((n != INVALID_ADDRESS) && (n->r.start < pages.end)) {
+        range r = n->r;
+        rmnode next = rangemap_next_node(dirty, n);
+        boolean head = r.start < pages.start;
+        boolean tail = r.end > pages.end;
+        if (head && tail) {
+            /* The hole falls inside this range, so no other range intersects it: return rather
+               than resume from a successor looked up before the insertion below, which is the one
+               mutation here that can merge ranges and free one. */
+            assert(rangemap_reinsert(dirty, n, irange(r.start, pages.start)));
+            if (!rangemap_insert_range(dirty, irange(pages.end, r.end))) {
+                assert(rangemap_reinsert(dirty, n, r));  /* out of memory: keep the range whole */
+                return;
+            }
+            pagecache_node_unpin(pn, pages);
+            return;
+        } else if (head) {
+            assert(rangemap_reinsert(dirty, n, irange(r.start, pages.start)));
+        } else if (tail) {
+            assert(rangemap_reinsert(dirty, n, irange(pages.end, r.end)));
+        } else {
+            rangemap_remove_range(dirty, n);    /* deallocates the node */
+        }
+        pagecache_node_unpin(pn, range_intersection(r, pages));
+        n = next;
+    }
+}
+
+static void tmpfs_drop_pages(tmpfs_file fsf, range inner)
+{
+    filesystem fs = fsf->f.fs;
+    filesystem_lock(fs);
+    tmpfs_dirty_punch(fsf, range_rshift(inner, ((tmpfs)fs)->page_order));
+    filesystem_unlock(fs);
+    pagecache_node_free_pages(fsf->f.cache_node, inner);
+}
+
+closure_function(1, 1, void, tmpfs_zero_complete,
+                 fs_status_handler, completion,
+                 status s)
+{
+    int fss = 0;
+    if (!is_ok(s)) {
+        timm_dealloc(s);
+        fss = -EIO;
+    }
+    apply(bound(completion), fss);
+    closure_finish();
+}
+
+closure_function(3, 1, void, tmpfs_dealloc_complete,
+                 tmpfs_file, fsf, range, inner, fs_status_handler, completion,
+                 status s)
+{
+    int fss = 0;
+    if (is_ok(s)) {
+        tmpfs_drop_pages(bound(fsf), bound(inner));
+    } else {
+        timm_dealloc(s);
+        fss = -EIO;
+    }
+    apply(bound(completion), fss);
+    closure_finish();
+}
+
+static void tmpfs_dealloc(filesystem fs, fsfile f, long offset, long len,
+                          fs_status_handler completion)
+{
+    u64 page_size = U64_FROM_BIT(((tmpfs)fs)->page_order);
+    range q = irangel(offset, len);
+
+    /* Only whole pages can be given back: any partial page at either edge of the hole is zeroed
+       in place, and the pages in between are dropped once that is done. */
+    range inner = irange(pad(q.start, page_size), q.end & ~(page_size - 1));
+    if (inner.start >= inner.end) {
+        status_handler sh = closure(fs->h, tmpfs_zero_complete, completion);
+        if (sh == INVALID_ADDRESS) {
+            apply(completion, -ENOMEM);
+            return;
+        }
+        fsfile_zero_range(f, q, sh);
+        return;
+    }
+    if ((q.start == inner.start) && (q.end == inner.end)) {
+        tmpfs_drop_pages((tmpfs_file)f, inner);
+        apply(completion, 0);
+        return;
+    }
+    heap h = fs->h;
+    status_handler sh = closure(h, tmpfs_dealloc_complete, (tmpfs_file)f, inner, completion);
+    if (sh == INVALID_ADDRESS) {
+        apply(completion, -ENOMEM);
+        return;
+    }
+    merge m = allocate_merge(h, sh);
+    status_handler ms = apply_merge(m);
+    if (q.start < inner.start)
+        fsfile_zero_range(f, irange(q.start, inner.start), apply_merge(m));
+    if (q.end > inner.end)
+        fsfile_zero_range(f, irange(inner.end, q.end), apply_merge(m));
+    apply(ms, STATUS_OK);
+}
+
 static int tmpfs_set_seals(filesystem fs, fsfile f, u64 seals)
 {
     tmpfs_file fsf = (tmpfs_file)f;
@@ -248,6 +360,7 @@ filesystem tmpfs_new(void)
     fs->fs.rename = tmpfs_rename;
     fs->fs.truncate = tmpfs_truncate;
     fs->fs.alloc = tmpfs_alloc;
+    fs->fs.dealloc = tmpfs_dealloc;
     fs->fs.get_freeblocks = tmpfs_freeblocks;
     fs->fs.get_sync_handler = tmpfs_get_sync_handler;
     return &fs->fs;

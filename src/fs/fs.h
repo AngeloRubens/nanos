@@ -56,6 +56,9 @@ void filesystem_alloc(fsfile f, long offset, long len,
         boolean keep_size, fs_status_handler completion);
 void filesystem_dealloc(fsfile f, long offset, long len,
         fs_status_handler completion);
+#ifdef KERNEL
+void fsfile_zero_range(fsfile f, range q, status_handler sh);
+#endif
 int filesystem_truncate(filesystem fs, fsfile f, u64 len);
 int filesystem_truncate_locked(filesystem fs, fsfile f, u64 len);
 
@@ -81,6 +84,7 @@ struct filesystem {
     int (*truncate)(filesystem fs, fsfile f, u64 len);
     void (*alloc)(filesystem fs, fsfile f, long offset, long len, boolean keep_size,
                   fs_status_handler completion);
+    void (*dealloc)(filesystem fs, fsfile f, long offset, long len, fs_status_handler completion);
     int (*get_fsfile)(filesystem fs, tuple md, fsfile *f);
     fs_io file_read;
     fs_io file_write;
