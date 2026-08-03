@@ -10,11 +10,15 @@ name: ZGC on nanos — GC matrix + backing-store probe (arm64)
 #
 # Loading the klib is necessary but was not sufficient: ZGC then obtained its
 # heap backing file and died committing memory into it, because fallocate() was
-# implemented by tfs alone and returned EINVAL on a tmpfs file. That is fixed on
-# this ref ("fs: dispatch fallocate() through the filesystem"), part of it in
-# the tmpfs klib -- which is why the steps below install the klibs built here
-# over the prebuilt ones ops ships. Everything else ZGC needs already worked
-# (huge PROT_NONE reservations, MAP_FIXED commit, MADV_DONTNEED, punch-hole).
+# implemented by tfs alone and returned EINVAL on a tmpfs file. That is fixed
+# upstream ("fs: dispatch fallocate() through the filesystem"), and the other
+# half of the pair is on this ref: punching a hole zeroed the pages and kept
+# them, so the memory only came back when the file was closed and a process
+# could be killed for memory it had already released ("fs: give back the pages
+# of a punched hole on tmpfs"). Both live partly in the tmpfs klib -- which is
+# why the steps below install the klibs built here over the prebuilt ones ops
+# ships. Everything else ZGC needs already worked (huge PROT_NONE reservations,
+# MAP_FIXED commit, MADV_DONTNEED, punch-hole).
 #
 # The first two jobs run stock-vs-klib on the kernel built from THIS ref:
 #   * job "gc-matrix"      - boots a real allocation workload under every GC the
@@ -25,9 +29,12 @@ name: ZGC on nanos — GC matrix + backing-store probe (arm64)
 #                            exact primitives ZGC's backing store is built from
 #                            (memfd, statfs magic, huge PROT_NONE reservation,
 #                            MAP_SHARED multi-mapping + coherency, MAP_FIXED
-#                            commit into the reservation, punch-hole uncommit,
-#                            and whether the memory ever comes back), once
-#                            without the klib and once with it.
+#                            commit into the reservation, and punch-hole
+#                            uncommit: whether the pages come back at the punch
+#                            with the file still mapped, whether the hole still
+#                            reads and re-faults as a hole, and what an
+#                            unaligned hole does to the pages at its edges),
+#                            once without the klib and once with it.
 #
 #   * job "runtime-test-shmem" - nanos's own memfd runtime test, which the same
 #                            change extends with the fallocate and sealing
@@ -527,10 +534,10 @@ jobs:
                      f2, c2, pr);
               fflush(stdout);
 
-              /* Ask for more memory than is free, without ever releasing it: if
-                 the punched pages are reclaimable, these allocations succeed and
-                 Cached falls; if they are lost, the allocations start failing
-                 around the amount that was free before. */
+              /* Ask for more memory than was free before the punch, without ever
+                 releasing it: if the hole really gave its pages back these
+                 allocations all succeed, and if they were lost they start
+                 failing around the amount that was free beforehand. */
               unsigned long got = 0;
               while (got < 2 * PRESS_FILL) {
                   char *a = mmap(NULL, PRESS_CHUNK, PROT_READ | PROT_WRITE,
@@ -553,8 +560,67 @@ jobs:
               meminfo2(&f3, &c3);
               ok("pressure_alloc", got >= PRESS_FILL, "allocated %luM after punching %luM (free before: %ldkB)",
                  got / MB, (unsigned long)(PRESS_FILL / MB), f2);
-              ok("pagecache_reclaimed", c3 < c2 - (long)(PRESS_FILL / 1024 / 2),
-                 "Cached %ldkB -> %ldkB under pressure (MemFree %ldkB -> %ldkB)", c2, c3, f2, f3);
+              /* The page cache has to shrink at the punch itself. Before this
+                 patch it did not shrink at all: the pages stayed dirty and
+                 pinned, and no amount of pressure could take them back. */
+              ok("punch_frees_pagecache", c2 < c1 - (long)(PRESS_FILL / 1024 / 2),
+                 "Cached %ldkB -> %ldkB at the punch (MemFree %ldkB -> %ldkB), then %ldkB under pressure",
+                 c1, c2, f1, f2, c3);
+              close((int)fd);
+          }
+
+          /* An unaligned hole. Only whole pages can be handed back, so the pages
+             the hole starts and ends in are zeroed in place instead; nothing
+             outside the hole may change, and the file's own account of the pages
+             it holds (st_blocks) has to follow. */
+          static void punch_partial_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              unsigned long len = 16 * ps;
+              long fd = syscall(SYS_memfd_create, "partial", 0);
+              if (fd < 0) {
+                  ok("punch_partial", 0, "memfd_create errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              if (ftruncate((int)fd, len) != 0) {
+                  ok("punch_partial", 0, "ftruncate errno=%d (%s)", errno, strerror(errno));
+                  close((int)fd);
+                  return;
+              }
+              char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              if (m == MAP_FAILED) {
+                  ok("punch_partial", 0, "mmap errno=%d (%s)", errno, strerror(errno));
+                  close((int)fd);
+                  return;
+              }
+              memset(m, 0xee, len);
+              struct stat before, after;
+              fstat((int)fd, &before);
+
+              /* Half a page in, half a page short of the end: pages 2 and 13 are
+                 partial, pages 3..12 are whole and can be freed. */
+              unsigned long hs = 2 * ps + ps / 2, he = 14 * ps - ps / 2;
+              int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                 (long)hs, (long)(he - hs));
+              fstat((int)fd, &after);
+              int outside_intact = ((unsigned char)m[hs - 1] == 0xee) &&
+                                   ((unsigned char)m[0] == 0xee) &&
+                                   ((unsigned char)m[he] == 0xee) &&
+                                   ((unsigned char)m[len - 1] == 0xee);
+              int inside_zero = ((unsigned char)m[hs] == 0x00) &&
+                                ((unsigned char)m[3 * ps] == 0x00) &&
+                                ((unsigned char)m[he - 1] == 0x00);
+              ok("punch_partial", (pr == 0) && outside_intact && inside_zero,
+                 "rv=%d errno=%d hole=[0x%lx,0x%lx) outside_intact=%d inside_zero=%d "
+                 "(m[hs-1]=0x%02x m[hs]=0x%02x m[he-1]=0x%02x m[he]=0x%02x)",
+                 pr, pr ? errno : 0, hs, he, outside_intact, inside_zero,
+                 (unsigned char)m[hs - 1], (unsigned char)m[hs],
+                 (unsigned char)m[he - 1], (unsigned char)m[he]);
+              ok("punch_partial_blocks", after.st_blocks < before.st_blocks,
+                 "st_blocks %ld -> %ld for a %lu-page hole in a %lu-page file",
+                 (long)before.st_blocks, (long)after.st_blocks,
+                 (he - hs) / ps, len / ps);
+              munmap(m, len);
               close((int)fd);
           }
 
@@ -653,8 +719,11 @@ jobs:
                   ok("mapfixed_into_reserve", 0, "no reservation to commit into");
               }
 
-              /* 7. Punch-hole uncommit: how ZGC returns memory. Check both that
-                    the call is accepted and that the pages really came back. */
+              /* 7. Punch-hole uncommit: how ZGC returns memory. The mappings are
+                    deliberately left in place while the hole is punched, because
+                    that is ZGC's own shape -- it keeps roughly three mappings per
+                    granule alive -- so a hole that only gives its pages back once
+                    the last mapping is gone would be of no use to it. */
               long free_before = meminfo_free_kb();
               if (a != MAP_FAILED)
                   memset(a, 0x77, flen);            /* fault the whole file in */
@@ -664,16 +733,43 @@ jobs:
               ok("punch_hole", pr == 0, "rv=%d errno=%d (%s) MemFree kB: start=%ld touched=%ld punched=%ld (reclaimed=%ld)",
                  pr, pr ? errno : 0, pr ? strerror(errno) : "-",
                  free_before, free_touched, free_after, free_after - free_touched);
-              if (pr == 0 && a != MAP_FAILED)
+
+              /* 7a. The claim under test, measured two ways. st_blocks is the
+                     filesystem's own account of the pages it holds, exact and
+                     free of noise; MemFree says the physical heap really got them
+                     back, and at the punch rather than at the close. (On a Linux
+                     host MemFree moves for other reasons and this second one is
+                     not meaningful -- inside nanos there is one process and the
+                     number is exact.) */
+              struct stat stb;
+              long blocks_punched = (fstat(fd, &stb) == 0) ? (long)stb.st_blocks : -1;
+              ok("punch_hole_frees_blocks", (pr == 0) && (blocks_punched == 0),
+                 "st_blocks=%ld after punching the whole %luKB file", blocks_punched,
+                 (unsigned long)(flen / 1024));
+              long reclaimed = free_after - free_touched;
+              ok("punch_hole_reclaims", (pr == 0) && (reclaimed >= (long)(flen / 1024 / 2)),
+                 "reclaimed=%ldkB of the %luKB punched, with the file still mapped",
+                 reclaimed, (unsigned long)(flen / 1024));
+
+              /* 7b. The file must still behave like a file: the hole reads back as
+                     zeroes, and writing into it again has to fault in fresh pages
+                     that both mappings agree on -- the pages that were just freed
+                     were freed from under a live mapping. */
+              if (pr == 0 && a != MAP_FAILED) {
                   ok("punch_hole_reads_zero", (unsigned char)a[0] == 0x00,
                      "a[0]=0x%02x (Linux re-faults holes as zero)", (unsigned char)a[0]);
+                  a[0] = 0x33;
+                  a[flen - 1] = 0x44;
+                  int refaulted = (b == MAP_FAILED) ||
+                      (((unsigned char)b[0] == 0x33) && ((unsigned char)b[flen - 1] == 0x44));
+                  ok("punch_hole_refault", refaulted, "b[0]=0x%02x b[end]=0x%02x",
+                     (b == MAP_FAILED) ? 0 : (unsigned char)b[0],
+                     (b == MAP_FAILED) ? 0 : (unsigned char)b[flen - 1]);
+              }
 
-              /* 7b. If the hole did not give the memory back, find out whether
-                     anything does: drop every mapping, then the file itself.
-                     Distinguishes "punch-hole is a no-op" from "the pages are
-                     pinned by the mappings" from "MemFree just does not account
-                     for pagecache". Without a working uncommit ZGC's heap can
-                     only ever grow. */
+              /* 7c. Where the memory comes back tells the failure apart: a punch
+                     that is a no-op, pages pinned by the mappings, or MemFree not
+                     accounting for the page cache at all. */
               if (a != MAP_FAILED) munmap(a, flen);
               if (b != MAP_FAILED) munmap(b, flen);
               if (biggest != MAP_FAILED) munmap(biggest, biggest_len);  /* also drops the MAP_FIXED view */
@@ -682,8 +778,14 @@ jobs:
               if (mfd < 0) unlink(path);
               long free_closed = meminfo_free_kb();
               ok("memory_returned", free_closed > free_touched,
-                 "MemFree kB: touched=%ld afterPunch=%ld afterUnmap=%ld afterClose=%ld",
-                 free_touched, free_after, free_unmapped, free_closed);
+                 "MemFree kB: touched=%ld afterPunch=%ld afterUnmap=%ld afterClose=%ld; st_blocks after the punch=%ld",
+                 free_touched, free_after, free_unmapped, free_closed, blocks_punched);
+
+              /* 7d. An unaligned hole, which ZGC never punches but the patch must
+                     still get right: only whole pages can be given back, so the
+                     partial pages at the edges are zeroed in place and nothing
+                     outside the hole may be touched. */
+              punch_partial_test();
 
               /* 8. Anonymous shared memory, the other shape of the same need. */
               void *s = mmap(NULL, 2 * MB, PROT_READ | PROT_WRITE,
@@ -785,13 +887,16 @@ jobs:
             echo ""
             echo "With the klibs, \`memfd_create\` succeeds and the remaining checks run against the memfd itself"
             echo "(the tmpfs klib's pages) instead of a file on the root filesystem — which is the path ZGC takes."
-            echo "\`memory_returned\` says whether an uncommit actually gives the pages back to the host."
+            echo "\`punch_hole_reclaims\` is the claim of the uncommit change: the pages come back at the punch,"
+            echo "with the file still mapped, rather than only when it is closed (\`memory_returned\`)."
+            echo "It is expected to fail on the stock column, where the root filesystem has no dealloc method"
+            echo "and keeps the previous zero-in-place behaviour."
             echo ""
             echo "### Under memory pressure (512M guest, 200M punched out of a memfd)"
             echo ""
-            echo "Does a punched hole give its pages back when something else needs them, or only when the file is closed?"
+            echo "Does a punched hole give its pages back, and can the guest then use them for something else?"
             echo '```'
-            grep -E '^(PRESSURE|PROBE (pressure_alloc|pagecache_reclaimed|pressure_setup))' probe-pressure.log 2>/dev/null || echo "(no output)"
+            grep -E '^(PRESSURE|PROBE (pressure_alloc|punch_frees_pagecache|pressure_setup))' probe-pressure.log 2>/dev/null || echo "(no output)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -808,13 +913,33 @@ jobs:
             fail=1
           fi
 
-          # The pressure run is a measurement, not a gate: running the guest out
-          # of memory is one of its possible answers, and it would leave the log
-          # truncated rather than wrong. Only a run that never started is a
-          # failure here.
+          # What the uncommit change has to deliver, on the memfd path only: the
+          # root filesystem has no dealloc method and is expected to keep zeroing
+          # its pages in place, so the stock column is left as the contrast.
+          for c in punch_hole_frees_blocks punch_hole_reclaims punch_hole_refault punch_partial punch_partial_blocks; do
+            if grep -q "^PROBE ${c} *PASS" probe-klib.log; then
+              echo "PASS: ${c}"
+            else
+              echo "::error::${c} failed on the memfd: $(res klib "$c")"
+              fail=1
+            fi
+          done
+
           echo "--- pressure ---"; grep -E '^(PRESSURE|PROBE p)' probe-pressure.log || true
           if ! grep -q '^PRESSURE baseline' probe-pressure.log; then
-            echo "::warning::the pressure run produced no measurement — see probe-pressure.log"
+            echo "::error::the pressure run produced no measurement — see probe-pressure.log"
+            fail=1
+          else
+            # A guest that runs out of memory here truncates its own log, so a
+            # missing result counts as a failure just like an explicit one.
+            for c in punch_frees_pagecache pressure_alloc; do
+              if grep -q "^PROBE ${c} *PASS" probe-pressure.log; then
+                echo "PASS: ${c}"
+              else
+                echo "::error::${c} did not pass under pressure: $(res pressure "$c")"
+                fail=1
+              fi
+            done
           fi
           exit $fail
 
