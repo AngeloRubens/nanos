@@ -465,6 +465,31 @@ jobs:
               va_end(ap);
           }
 
+          /* Makes the file account for the pages it holds. Writing through a
+             mapping is not enough on aarch64: nanos never sees a mapping's pages
+             as dirty there (pte_is_dirty() is a stub -- src/aarch64/page_machine.h,
+             "hardware management of dirty pages" unavailable under qemu), so an
+             msync writes nothing back, tmpfs is never asked to record the range,
+             and the file reports zero blocks however much has been written into
+             it. The write(2) path marks the pages dirty without going through the
+             PTE bit, and the fsync makes tmpfs account for the range and pin it --
+             which is the state a punched hole has to undo. */
+          static int write_through_fd(int fd, unsigned long len, unsigned char v)
+          {
+              static char buf[64 * 1024];
+              memset(buf, v, sizeof(buf));
+              for (unsigned long off = 0; off < len; ) {
+                  unsigned long n = len - off;
+                  if (n > sizeof(buf))
+                      n = sizeof(buf);
+                  ssize_t w = pwrite(fd, buf, n, (off_t)off);
+                  if (w <= 0)
+                      return -1;
+                  off += (unsigned long)w;
+              }
+              return fsync(fd);
+          }
+
           static long meminfo_free_kb(void)
           {
               FILE *f = fopen("/proc/meminfo", "r");
@@ -608,8 +633,8 @@ jobs:
                   return;
               }
               memset(m, 0xee, len);
-              msync(m, len, MS_SYNC);   /* see punch_hole_frees_blocks: st_blocks
-                                           follows write-back, not the mapping */
+              int wb = write_through_fd((int)fd, len, 0xee);   /* so that the file
+                                           has blocks to lose; see write_through_fd */
               struct stat before, after;
               fstat((int)fd, &before);
 
@@ -632,10 +657,11 @@ jobs:
                  pr, pr ? errno : 0, hs, he, outside_intact, inside_zero,
                  (unsigned char)m[hs - 1], (unsigned char)m[hs],
                  (unsigned char)m[he - 1], (unsigned char)m[he]);
-              ok("punch_partial_blocks", after.st_blocks < before.st_blocks,
-                 "st_blocks %ld -> %ld for a %lu-page hole in a %lu-page file",
+              ok("punch_partial_blocks",
+                 (wb == 0) && (before.st_blocks > 0) && (after.st_blocks < before.st_blocks),
+                 "st_blocks %ld -> %ld for a %lu-page hole in a %lu-page file (write+fsync rv=%d)",
                  (long)before.st_blocks, (long)after.st_blocks,
-                 (he - hs) / ps, len / ps);
+                 (he - hs) / ps, len / ps, wb);
               munmap(m, len);
               close((int)fd);
           }
@@ -741,17 +767,11 @@ jobs:
                     granule alive -- so a hole that only gives its pages back once
                     the last mapping is gone would be of no use to it. */
               long free_before = meminfo_free_kb();
-              if (a != MAP_FAILED) {
+              if (a != MAP_FAILED)
                   memset(a, 0x77, flen);            /* fault the whole file in */
-                  /* st_blocks counts only what has been written back: tmpfs records
-                     a range when the page cache flushes it (klib/tmpfs.c,
-                     tmpfsfile_write), not when a mapping of it is dirtied. Without
-                     this sync the file reports zero blocks throughout and the block
-                     checks compare nothing against nothing -- and, worse, the pin
-                     taken at write-back is never taken, so the punch never has to
-                     release one. */
-                  msync(a, flen, MS_SYNC);
-              }
+              /* ...and have the file itself account for those pages, so that the
+                 punch has blocks to free and a pin to release (write_through_fd). */
+              int wb = write_through_fd(fd, flen, 0x77);
               long free_touched = meminfo_free_kb();
               struct stat stb;
               long blocks_touched = (fstat(fd, &stb) == 0) ? (long)stb.st_blocks : -1;
@@ -770,9 +790,9 @@ jobs:
                      number is exact.) */
               long blocks_punched = (fstat(fd, &stb) == 0) ? (long)stb.st_blocks : -1;
               ok("punch_hole_frees_blocks",
-                 (pr == 0) && (blocks_touched > 0) && (blocks_punched == 0),
-                 "st_blocks %ld -> %ld across the punch of the whole %luKB file",
-                 blocks_touched, blocks_punched, (unsigned long)(flen / 1024));
+                 (pr == 0) && (wb == 0) && (blocks_touched > 0) && (blocks_punched == 0),
+                 "st_blocks %ld -> %ld across the punch of the whole %luKB file (write+fsync rv=%d)",
+                 blocks_touched, blocks_punched, (unsigned long)(flen / 1024), wb);
               long reclaimed = free_after - free_touched;
               ok("punch_hole_reclaims", (pr == 0) && (reclaimed >= (long)(flen / 1024 / 2)),
                  "reclaimed=%ldkB of the %luKB punched, with the file still mapped",
