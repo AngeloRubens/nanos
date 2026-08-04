@@ -229,7 +229,9 @@ jobs:
       - name: Boot the workload once per GC
         run: |
           set -o pipefail
-          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          # -u, or sed block-buffers on a pipe and a guest that hangs shows an
+          # empty section instead of the line it stopped on.
+          strip_ansi() { sed -u 's/\x1b\[[0-9;]*m//g'; }
           # label|flag|klibs — Shenandoah may simply not be in this build, which
           # the log will say ("Unrecognized VM option"); that is a JRE fact, not
           # a nanos one, and is reported as such. ZGC runs twice: the stock
@@ -882,7 +884,9 @@ jobs:
       - name: Run the probe inside nanos, stock and with the klibs
         run: |
           set -o pipefail
-          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          # -u, or sed block-buffers on a pipe and a guest that hangs shows an
+          # empty section instead of the line it stopped on.
+          strip_ansi() { sed -u 's/\x1b\[[0-9;]*m//g'; }
           cat > probe-stock.json <<'EOF'
           {
             "RunConfig": { "Memory": "2G" }
