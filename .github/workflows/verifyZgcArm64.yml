@@ -594,6 +594,8 @@ jobs:
                   return;
               }
               memset(m, 0xee, len);
+              msync(m, len, MS_SYNC);   /* see punch_hole_frees_blocks: st_blocks
+                                           follows write-back, not the mapping */
               struct stat before, after;
               fstat((int)fd, &before);
 
@@ -725,9 +727,20 @@ jobs:
                     granule alive -- so a hole that only gives its pages back once
                     the last mapping is gone would be of no use to it. */
               long free_before = meminfo_free_kb();
-              if (a != MAP_FAILED)
+              if (a != MAP_FAILED) {
                   memset(a, 0x77, flen);            /* fault the whole file in */
+                  /* st_blocks counts only what has been written back: tmpfs records
+                     a range when the page cache flushes it (klib/tmpfs.c,
+                     tmpfsfile_write), not when a mapping of it is dirtied. Without
+                     this sync the file reports zero blocks throughout and the block
+                     checks compare nothing against nothing -- and, worse, the pin
+                     taken at write-back is never taken, so the punch never has to
+                     release one. */
+                  msync(a, flen, MS_SYNC);
+              }
               long free_touched = meminfo_free_kb();
+              struct stat stb;
+              long blocks_touched = (fstat(fd, &stb) == 0) ? (long)stb.st_blocks : -1;
               int pr = fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, flen);
               long free_after = meminfo_free_kb();
               ok("punch_hole", pr == 0, "rv=%d errno=%d (%s) MemFree kB: start=%ld touched=%ld punched=%ld (reclaimed=%ld)",
@@ -741,11 +754,11 @@ jobs:
                      host MemFree moves for other reasons and this second one is
                      not meaningful -- inside nanos there is one process and the
                      number is exact.) */
-              struct stat stb;
               long blocks_punched = (fstat(fd, &stb) == 0) ? (long)stb.st_blocks : -1;
-              ok("punch_hole_frees_blocks", (pr == 0) && (blocks_punched == 0),
-                 "st_blocks=%ld after punching the whole %luKB file", blocks_punched,
-                 (unsigned long)(flen / 1024));
+              ok("punch_hole_frees_blocks",
+                 (pr == 0) && (blocks_touched > 0) && (blocks_punched == 0),
+                 "st_blocks %ld -> %ld across the punch of the whole %luKB file",
+                 blocks_touched, blocks_punched, (unsigned long)(flen / 1024));
               long reclaimed = free_after - free_touched;
               ok("punch_hole_reclaims", (pr == 0) && (reclaimed >= (long)(flen / 1024 / 2)),
                  "reclaimed=%ldkB of the %luKB punched, with the file still mapped",
