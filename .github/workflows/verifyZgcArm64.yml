@@ -484,10 +484,10 @@ jobs:
                       n = sizeof(buf);
                   ssize_t w = pwrite(fd, buf, n, (off_t)off);
                   if (w <= 0)
-                      return -1;
+                      return errno;   /* 0 on success, the errno otherwise */
                   off += (unsigned long)w;
               }
-              return fsync(fd);
+              return (fsync(fd) == 0) ? 0 : errno;
           }
 
           static long meminfo_free_kb(void)
@@ -659,9 +659,9 @@ jobs:
                  (unsigned char)m[he - 1], (unsigned char)m[he]);
               ok("punch_partial_blocks",
                  (wb == 0) && (before.st_blocks > 0) && (after.st_blocks < before.st_blocks),
-                 "st_blocks %ld -> %ld for a %lu-page hole in a %lu-page file (write+fsync rv=%d)",
+                 "st_blocks %ld -> %ld for a %lu-page hole in a %lu-page file (write+fsync %s)",
                  (long)before.st_blocks, (long)after.st_blocks,
-                 (he - hs) / ps, len / ps, wb);
+                 (he - hs) / ps, len / ps, wb ? strerror(wb) : "ok");
               munmap(m, len);
               close((int)fd);
           }
@@ -791,8 +791,9 @@ jobs:
               long blocks_punched = (fstat(fd, &stb) == 0) ? (long)stb.st_blocks : -1;
               ok("punch_hole_frees_blocks",
                  (pr == 0) && (wb == 0) && (blocks_touched > 0) && (blocks_punched == 0),
-                 "st_blocks %ld -> %ld across the punch of the whole %luKB file (write+fsync rv=%d)",
-                 blocks_touched, blocks_punched, (unsigned long)(flen / 1024), wb);
+                 "st_blocks %ld -> %ld across the punch of the whole %luKB file (write+fsync %s)",
+                 blocks_touched, blocks_punched, (unsigned long)(flen / 1024),
+                 wb ? strerror(wb) : "ok");
               long reclaimed = free_after - free_touched;
               ok("punch_hole_reclaims", (pr == 0) && (reclaimed >= (long)(flen / 1024 / 2)),
                  "reclaimed=%ldkB of the %luKB punched, with the file still mapped",
