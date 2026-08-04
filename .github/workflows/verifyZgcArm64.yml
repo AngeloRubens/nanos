@@ -499,6 +499,7 @@ jobs:
 
           #define PRESS_FILL  (200 * MB)
           #define PRESS_CHUNK (8 * MB)
+          #define PRESS_FLOOR (64 * MB)   /* stop asking for memory here */
 
           static void pressure_test(void)
           {
@@ -535,11 +536,17 @@ jobs:
               fflush(stdout);
 
               /* Ask for more memory than was free before the punch, without ever
-                 releasing it: if the hole really gave its pages back these
-                 allocations all succeed, and if they were lost they start
-                 failing around the amount that was free beforehand. */
+                 releasing it: anything allocated beyond that can only come from
+                 the pages the hole gave back. Stop at a floor rather than at
+                 exhaustion -- a guest that runs out does not get ENOMEM from
+                 mmap, it dies in allocate_table_page() (src/kernel/page.c), which
+                 wants a contiguous 1M chunk and cannot find one once the physical
+                 heap is chopped up by 4K anonymous pages -- and a dead guest
+                 takes the verdict down with it. */
+              unsigned long target = (unsigned long)f1 * 1024 + PRESS_FILL / 4;
               unsigned long got = 0;
-              while (got < 2 * PRESS_FILL) {
+              long f = f2, c;
+              while ((got < target) && (f > (long)(PRESS_FLOOR / 1024))) {
                   char *a = mmap(NULL, PRESS_CHUNK, PROT_READ | PROT_WRITE,
                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                   if (a == MAP_FAILED) {
@@ -549,17 +556,24 @@ jobs:
                   }
                   memset(a, 0xa5, PRESS_CHUNK);
                   got += PRESS_CHUNK;
+                  meminfo2(&f, &c);
                   if ((got % (40 * MB)) == 0) {
-                      long f, c;
-                      meminfo2(&f, &c);
                       printf("PRESSURE touched %3luM       MemFree=%ldkB Cached=%ldkB\n",
                              got / MB, f, c);
                       fflush(stdout);
                   }
               }
               meminfo2(&f3, &c3);
-              ok("pressure_alloc", got >= PRESS_FILL, "allocated %luM after punching %luM (free before: %ldkB)",
-                 got / MB, (unsigned long)(PRESS_FILL / MB), f2);
+              printf("PRESSURE stopped at %luM     MemFree=%ldkB (target %luM, floor %luM)\n",
+                     got / MB, f3, target / MB, (unsigned long)(PRESS_FLOOR / MB));
+              fflush(stdout);
+              /* The gate is the memory that was free before the punch, not the
+                 size of the hole: 200M would have been allocatable out of the
+                 274M that were free anyway, so it would pass without the pages
+                 ever coming back. */
+              ok("pressure_alloc", got > (unsigned long)f1 * 1024,
+                 "allocated %luM after punching %luM (free before the punch: %ldkB, after: %ldkB)",
+                 got / MB, (unsigned long)(PRESS_FILL / MB), f1, f2);
               /* The page cache has to shrink at the punch itself. Before this
                  patch it did not shrink at all: the pages stayed dirty and
                  pinned, and no amount of pressure could take them back. */
