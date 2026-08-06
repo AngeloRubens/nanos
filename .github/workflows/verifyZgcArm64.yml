@@ -920,6 +920,81 @@ jobs:
               close((int)fd);
           }
 
+          /* More mappings of one file than the punch can unmap in one go. The lock over a node's
+             mappings cannot be held while unmapping, so they are collected in batches and the walk
+             resumes from a cursor -- a loop nothing exercises with the two or three mappings the
+             checks above open, and one ZGC saturates by design: it keeps roughly three mappings
+             per granule of the heap. A mapping the walk skipped keeps a page table entry for a
+             page that has just been freed, so reading through it returns the bytes that were
+             there rather than the hole, which is what every mapping is asked for here. */
+          #define MANY_MAPS 40
+          #define MANY_LEN  (4 * MB)
+
+          static void many_maps_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              long fd = syscall(SYS_memfd_create, "manymaps", 0);
+              if ((fd < 0) || (ftruncate((int)fd, MANY_LEN) != 0)) {
+                  ok("many_maps_setup", 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+                  return;
+              }
+              char *m[MANY_MAPS];
+              int n = 0;
+              for (int i = 0; i < MANY_MAPS; i++) {
+                  m[n] = mmap(NULL, MANY_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+                  if (m[n] == MAP_FAILED)
+                      break;
+                  n++;
+              }
+              int wb = write_through_fd((int)fd, MANY_LEN, 0x7e);
+              /* Faulted in through every mapping, so each one holds entries of its own. */
+              unsigned long live = 0;
+              for (int i = 0; i < n; i++)
+                  for (unsigned long off = 0; off < MANY_LEN; off += ps)
+                      live += (unsigned char)m[i][off];
+              ok("many_maps_setup", (n > 16) && (wb == 0) && (live > 0),
+                 "%d mappings of a %luM file (write+fsync %s)",
+                 n, (unsigned long)(MANY_LEN / MB), wb ? strerror(wb) : "ok");
+              if (n == 0) {
+                  close((int)fd);
+                  return;
+              }
+
+              struct stat before, after;
+              fstat((int)fd, &before);
+              long f0 = meminfo_free_kb();
+              int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, MANY_LEN);
+              long f1 = meminfo_free_kb();
+              fstat((int)fd, &after);
+
+              int stale = -1;
+              unsigned long stale_pages = 0;
+              for (int i = 0; i < n; i++)
+                  for (unsigned long off = 0; off < MANY_LEN; off += ps)
+                      if (m[i][off] != 0) {
+                          stale_pages++;
+                          if (stale < 0)
+                              stale = i;
+                      }
+              ok("many_maps_punch", (pr == 0) && (stale_pages == 0),
+                 "rv=%d %lu pages still readable after the punch (first through mapping #%d),"
+                 " st_blocks %ld -> %ld, MemFree %ldkB -> %ldkB",
+                 pr, stale_pages, stale,
+                 (long)before.st_blocks, (long)after.st_blocks, f0, f1);
+
+              /* And they must all still be the same file: written through the last mapping, read
+                 back through the first, across the batch boundary in both directions. */
+              m[n - 1][0] = 0x21;
+              m[n - 1][MANY_LEN - ps] = 0x22;
+              ok("many_maps_refault",
+                 (m[0][0] == 0x21) && (m[0][MANY_LEN - ps] == 0x22),
+                 "wrote through mapping #%d, read 0x%02x/0x%02x through #0",
+                 n - 1, (unsigned char)m[0][0], (unsigned char)m[0][MANY_LEN - ps]);
+              for (int i = 0; i < n; i++)
+                  munmap(m[i], MANY_LEN);
+              close((int)fd);
+          }
+
           int main(int argc, char **argv)
           {
               printf("PROBE cpus_online            %s %ld processor(s) reported by sysconf\n",
@@ -934,6 +1009,12 @@ jobs:
               }
               if ((argc > 1) && !strcmp(argv[1], "cycles")) {
                   cycles_test();
+                  printf("PROBE DONE\n");
+                  fflush(stdout);
+                  return 0;
+              }
+              if ((argc > 1) && !strcmp(argv[1], "maps")) {
+                  many_maps_test();
                   printf("PROBE DONE\n");
                   fflush(stdout);
                   return 0;
@@ -1190,6 +1271,13 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          cat > probe-maps.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["maps"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
           # Small guest on purpose: 200M punched out of 512M is only reclaimable
           # if the page cache gives it back, so the allocations that follow
           # answer the question instead of the guest simply having room.
@@ -1200,7 +1288,7 @@ jobs:
             "RunConfig": { "Memory": "512M", "CPUs": 4 }
           }
           EOF
-          for v in stock klib concurrent cycles pressure; do
+          for v in stock klib concurrent cycles maps pressure; do
             echo "=== probe (${v}) ==="
             timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
               -c "probe-${v}.json" 2>&1 | strip_ansi | tee "probe-${v}.log" || true
@@ -1243,6 +1331,16 @@ jobs:
             grep -E '^(CYCLE|PROBE cycles)' probe-cycles.log 2>/dev/null || echo "(no output)"
             echo '```'
             echo ""
+            echo "### With more mappings of the file than the punch unmaps in one batch"
+            echo ""
+            echo "ZGC keeps roughly three mappings per granule of its heap, which saturates the"
+            echo "batched walk the punch has to resume through a cursor. A mapping the walk skipped"
+            echo "keeps an entry for a page that has just been freed, so it would read back the old"
+            echo "bytes instead of the hole."
+            echo '```'
+            grep -E '^PROBE many_maps' probe-maps.log 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo ""
             echo "### Under memory pressure (512M guest, 200M punched out of a memfd)"
             echo ""
             echo "Does a punched hole give its pages back, and can the guest then use them for something else?"
@@ -1252,7 +1350,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           fail=0
-          for v in stock klib concurrent cycles; do
+          for v in stock klib concurrent cycles maps; do
             grep -q '^PROBE DONE' "probe-${v}.log" || {
               echo "::error::probe (${v}) did not reach the end — it crashed or never booted; see probe-${v}.log"; fail=1; }
           done
@@ -1305,6 +1403,18 @@ jobs:
             echo "::error::cycles_reclaim failed: $(res cycles cycles_reclaim)"
             fail=1
           fi
+
+          # More mappings than one batch of the punch's walk, so that the cursor it
+          # resumes from is exercised at all.
+          echo "--- maps ---"; grep -E '^PROBE many_maps' probe-maps.log || true
+          for c in many_maps_setup many_maps_punch many_maps_refault; do
+            if grep -q "^PROBE ${c} *PASS" probe-maps.log; then
+              echo "PASS: ${c}"
+            else
+              echo "::error::${c} failed: $(res maps "$c")"
+              fail=1
+            fi
+          done
 
           echo "--- pressure ---"; grep -E '^(PRESSURE|PROBE p)' probe-pressure.log || true
           if ! grep -q '^PRESSURE baseline' probe-pressure.log; then
