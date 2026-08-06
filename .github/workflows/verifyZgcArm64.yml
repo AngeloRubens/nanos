@@ -266,7 +266,7 @@ jobs:
             "Args": ["-XX:+${flag}", "-Xlog:gc+init=debug", "-Xlog:gc", "-Xms192m", "-Xmx192m",
                      "-Drounds=12", ${extra} "-cp", "/", "GcChurn"],
             "Files": ["GcChurn.class"],
-            "RunConfig": { "Memory": "2G" }
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
             echo "=== ${label} (-XX:+${flag}) ==="
@@ -670,6 +670,10 @@ jobs:
 
           int main(int argc, char **argv)
           {
+              printf("PROBE cpus_online            %s %ld processor(s) reported by sysconf\n",
+                     (sysconf(_SC_NPROCESSORS_ONLN) > 1) ? "PASS" : "FAIL",
+                     sysconf(_SC_NPROCESSORS_ONLN));
+              fflush(stdout);
               if ((argc > 1) && !strcmp(argv[1], "pressure")) {
                   pressure_test();
                   printf("PROBE DONE\n");
@@ -887,15 +891,19 @@ jobs:
           # -u, or sed block-buffers on a pipe and a guest that hangs shows an
           # empty section instead of the line it stopped on.
           strip_ansi() { sed -u 's/\x1b\[[0-9;]*m//g'; }
+          # Four processors, not one: every bug this probe has caught so far was a
+          # page whose owner changed under someone else, and a uniprocessor guest
+          # reaches only the interleavings preemption happens to produce -- the
+          # rendezvous in page_invalidate_sync() waits for nobody at all there.
           cat > probe-stock.json <<'EOF'
           {
-            "RunConfig": { "Memory": "2G" }
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
           cat > probe-klib.json <<'EOF'
           {
             "Klibs": ["tmpfs", "shmem"],
-            "RunConfig": { "Memory": "2G" }
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
           # Small guest on purpose: 200M punched out of 512M is only reclaimable
@@ -905,7 +913,7 @@ jobs:
           {
             "Klibs": ["tmpfs", "shmem"],
             "Args": ["pressure"],
-            "RunConfig": { "Memory": "512M" }
+            "RunConfig": { "Memory": "512M", "CPUs": 4 }
           }
           EOF
           for v in stock klib pressure; do
@@ -957,6 +965,15 @@ jobs:
             grep -q '^PROBE DONE' "probe-${v}.log" || {
               echo "::error::probe (${v}) did not reach the end — it crashed or never booted; see probe-${v}.log"; fail=1; }
           done
+
+          # Not a gate: ops may not honour the CPUs setting, and a uniprocessor run
+          # still checks everything else -- but it must not pass for a multiprocessor one.
+          cpus=$(grep -h '^PROBE cpus_online' probe-klib.log 2>/dev/null | awk '{print $4}')
+          if [ "${cpus:-1}" -le 1 ]; then
+            echo "::warning::the guest reported ${cpus:-?} processor, so nothing here ran with real parallelism"
+          else
+            echo "PASS: guest is multiprocessor (${cpus})"
+          fi
           # The claim under test: the klib actually delivers the syscall.
           if grep -q '^PROBE memfd_create *PASS' probe-klib.log; then
             echo "PASS: memfd_create works once the shmem klib is loaded"
