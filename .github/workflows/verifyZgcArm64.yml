@@ -684,6 +684,8 @@ jobs:
           static unsigned long conc_ps, conc_pages;
           static volatile int conc_stop;
           static volatile unsigned long conc_bad, conc_touches, conc_punches;
+          static volatile unsigned long conc_writes, conc_werr;
+          static volatile long conc_blocks_max;
 
           static unsigned char marker_of(unsigned long pi)
           {
@@ -708,6 +710,39 @@ jobs:
                   if ((got != want) && (got != 0))
                       conc_bad++;
                   conc_touches++;
+              }
+              return 0;
+          }
+
+          /* Writing through the fd as well, because the touchers above cannot reach the half of
+             the punch that maintains the file's own account of its pages: on aarch64 a page
+             dirtied through a mapping is never seen as dirty (see write_through_fd), so tmpfs is
+             never asked to record the range, the range map the punch has to split stays empty,
+             and nothing is ever pinned. This thread writes each page's own marker, so the
+             invariant checked at the end is the same one the touchers keep, and fsyncs to make
+             tmpfs account for the range -- which is what the punch then has to undo. */
+          static void *conc_writer(void *arg)
+          {
+              int fd = (int)(long)arg;
+              unsigned long seed = 104729;
+              while (!conc_stop) {
+                  unsigned long pi = conc_rand(&seed) % conc_pages;
+                  unsigned long n = 1 + (conc_rand(&seed) % 64);
+                  if (pi + n > conc_pages)
+                      n = conc_pages - pi;
+                  for (unsigned long i = 0; i < n; i++) {
+                      unsigned char v = marker_of(pi + i);
+                      if (pwrite(fd, &v, 1, (off_t)((pi + i) * conc_ps)) != 1)
+                          conc_werr++;
+                  }
+                  if (fsync(fd) != 0)
+                      conc_werr++;
+                  conc_writes += n;
+                  struct stat st;
+                  /* Sampled during the race: if the file never accounts for a block, the range
+                     map is empty and the split path was never reached, whatever else passed. */
+                  if ((fstat(fd, &st) == 0) && (st.st_blocks > conc_blocks_max))
+                      conc_blocks_max = st.st_blocks;
               }
               return 0;
           }
@@ -744,22 +779,28 @@ jobs:
                   ok("concurrent_setup", 0, "mmap errno=%d (%s)", errno, strerror(errno));
                   return;
               }
-              pthread_t t[CONC_TOUCHERS + 1];
+              pthread_t t[CONC_TOUCHERS + 2];
               int started = 0;
               for (long i = 0; i < CONC_TOUCHERS; i++)
                   if (pthread_create(&t[started], 0, conc_toucher, (void *)i) == 0)
                       started++;
               if ((started == 0) ||
-                  (pthread_create(&t[started], 0, conc_puncher, (void *)fd) != 0)) {
+                  (pthread_create(&t[started], 0, conc_writer, (void *)fd) != 0) ||
+                  (pthread_create(&t[started + 1], 0, conc_puncher, (void *)fd) != 0)) {
                   conc_stop = 1;
                   ok("concurrent_setup", 0, "pthread_create errno=%d (%s)", errno, strerror(errno));
                   return;
               }
-              started++;
+              started += 2;
               for (int i = 0; i < started; i++)
                   pthread_join(t[i], 0);
-              ok("concurrent_setup", 1, "%d threads, %lu punches, %lu touches",
-                 started, conc_punches, conc_touches);
+              /* The blocks are what says the race reached the range map at all, and the write
+                 errors are here because a write that silently failed would empty it just as
+                 effectively as never writing. */
+              ok("concurrent_setup", (conc_blocks_max > 0) && (conc_werr == 0),
+                 "%d threads, %lu punches, %lu touches, %lu page writes through the fd"
+                 " (%lu errors), file held up to %ld blocks during the race",
+                 started, conc_punches, conc_touches, conc_writes, conc_werr, conc_blocks_max);
 
               /* Nothing is racing any more: every page must read the same through both mappings,
                  and be either its own marker or a hole. */
