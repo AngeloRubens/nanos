@@ -995,6 +995,91 @@ jobs:
               close((int)fd);
           }
 
+          /* An open question rather than a claim, and it is about the data in the file, not about
+             the memory behind it. A tmpfs page dirtied only through a mapping is never seen as
+             dirty on aarch64, so it is never written back and never pinned -- which leaves it
+             looking exactly like a clean page to the eviction that runs when memory gets tight.
+             Evicting it would be silent data loss, because a tmpfs read does not go to storage:
+             it zero-fills. That is the shape of a ZGC heap, whose pages are only ever written
+             through the mapping. Nothing is punched here, so the pages are in the state the
+             question is about, and every page carries its own marker so a page that comes back
+             as a hole can be told from one that comes back as another page. Reported, not gated:
+             if it reproduces it is a bug of its own, older and worse than the punch. */
+          #define EVICT_FILL  (200 * MB)
+          #define EVICT_CHUNK (8 * MB)
+          #define EVICT_FLOOR (64 * MB)
+
+          static void evict_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              long f0, c0, f1, c1, f2, c2;
+              meminfo2(&f0, &c0);
+              long fd = syscall(SYS_memfd_create, "evict", 0);
+              if ((fd < 0) || (ftruncate((int)fd, EVICT_FILL) != 0)) {
+                  ok("evict_setup", 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+                  return;
+              }
+              char *m = mmap(NULL, EVICT_FILL, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              if (m == MAP_FAILED) {
+                  ok("evict_setup", 0, "mmap errno=%d (%s)", errno, strerror(errno));
+                  close((int)fd);
+                  return;
+              }
+              unsigned long pages = EVICT_FILL / ps;
+              for (unsigned long pi = 0; pi < pages; pi++)
+                  m[pi * ps] = marker_of(pi);       /* through the mapping only: no write, no fsync */
+              struct stat st;
+              fstat((int)fd, &st);
+              meminfo2(&f1, &c1);
+              printf("EVICT filled %luM            MemFree=%ldkB Cached=%ldkB st_blocks=%ld\n",
+                     (unsigned long)(EVICT_FILL / MB), f1, c1, (long)st.st_blocks);
+              fflush(stdout);
+              ok("evict_setup", 1, "%lu pages written through the mapping alone, file accounts"
+                 " for %ld blocks", pages, (long)st.st_blocks);
+
+              /* Squeeze, without touching the file again. */
+              #define EVICT_CHUNKS 128
+              char *chunk[EVICT_CHUNKS];
+              int chunks = 0;
+              unsigned long got = 0;
+              long f = f1, c;
+              while ((f > (long)(EVICT_FLOOR / 1024)) && (chunks < EVICT_CHUNKS)) {
+                  char *a = mmap(NULL, EVICT_CHUNK, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                  if (a == MAP_FAILED)
+                      break;
+                  memset(a, 0xa5, EVICT_CHUNK);
+                  chunk[chunks++] = a;
+                  got += EVICT_CHUNK;
+                  meminfo2(&f, &c);
+              }
+              meminfo2(&f2, &c2);
+              printf("EVICT pressure %luM          MemFree=%ldkB Cached=%ldkB\n", got / MB, f2, c2);
+              fflush(stdout);
+
+              /* Give the pressure back before reading the file: a page that was evicted has to
+                 be faulted in again to be read, and doing that with the memory still held would
+                 make the guest die of exhaustion in the middle of the answer. The eviction, if
+                 there was one, has already happened. */
+              for (int i = 0; i < chunks; i++)
+                  munmap(chunk[i], EVICT_CHUNK);
+
+              unsigned long zeroed = 0, foreign = 0;
+              for (unsigned long pi = 0; pi < pages; pi++) {
+                  unsigned char v = m[pi * ps];
+                  if (v == 0)
+                      zeroed++;
+                  else if (v != marker_of(pi))
+                      foreign++;
+              }
+              ok("evict_keeps_data", (zeroed == 0) && (foreign == 0),
+                 "%lu of %lu pages came back as zeroes and %lu held another page's marker after"
+                 " %luM of pressure (Cached %ldkB -> %ldkB)",
+                 zeroed, pages, foreign, got / MB, c1, c2);
+              munmap(m, EVICT_FILL);
+              close((int)fd);
+          }
+
           int main(int argc, char **argv)
           {
               printf("PROBE cpus_online            %s %ld processor(s) reported by sysconf\n",
@@ -1015,6 +1100,12 @@ jobs:
               }
               if ((argc > 1) && !strcmp(argv[1], "maps")) {
                   many_maps_test();
+                  printf("PROBE DONE\n");
+                  fflush(stdout);
+                  return 0;
+              }
+              if ((argc > 1) && !strcmp(argv[1], "evict")) {
+                  evict_test();
                   printf("PROBE DONE\n");
                   fflush(stdout);
                   return 0;
@@ -1278,6 +1369,15 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          # Same small guest as the pressure run, and for the same reason: the
+          # eviction this asks about only happens when the memory is really gone.
+          cat > probe-evict.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["evict"],
+            "RunConfig": { "Memory": "512M", "CPUs": 4 }
+          }
+          EOF
           # Small guest on purpose: 200M punched out of 512M is only reclaimable
           # if the page cache gives it back, so the allocations that follow
           # answer the question instead of the guest simply having room.
@@ -1288,7 +1388,7 @@ jobs:
             "RunConfig": { "Memory": "512M", "CPUs": 4 }
           }
           EOF
-          for v in stock klib concurrent cycles maps pressure; do
+          for v in stock klib concurrent cycles maps evict pressure; do
             echo "=== probe (${v}) ==="
             timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
               -c "probe-${v}.json" 2>&1 | strip_ansi | tee "probe-${v}.log" || true
@@ -1341,6 +1441,16 @@ jobs:
             grep -E '^PROBE many_maps' probe-maps.log 2>/dev/null || echo "(no output)"
             echo '```'
             echo ""
+            echo "### Does a page written only through a mapping survive memory pressure?"
+            echo ""
+            echo "Open question, reported rather than gated, and about the data rather than the memory:"
+            echo "a tmpfs page dirtied through a mapping alone is never seen as dirty on aarch64, so it"
+            echo "is never written back nor pinned — which is what a clean, evictable page looks like,"
+            echo "while a tmpfs read zero-fills. That is the shape of a ZGC heap. Nothing is punched here."
+            echo '```'
+            grep -E '^(EVICT|PROBE evict)' probe-evict.log 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo ""
             echo "### Under memory pressure (512M guest, 200M punched out of a memfd)"
             echo ""
             echo "Does a punched hole give its pages back, and can the guest then use them for something else?"
@@ -1350,7 +1460,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           fail=0
-          for v in stock klib concurrent cycles maps; do
+          for v in stock klib concurrent cycles maps evict; do
             grep -q '^PROBE DONE' "probe-${v}.log" || {
               echo "::error::probe (${v}) did not reach the end — it crashed or never booted; see probe-${v}.log"; fail=1; }
           done
@@ -1415,6 +1525,16 @@ jobs:
               fail=1
             fi
           done
+
+          # Reported, not gated: whether a page written only through a mapping survives
+          # eviction is an older question than this change, and a failure here would say
+          # nothing about the punch. It must be visible rather than buried, though.
+          echo "--- evict ---"; grep -E '^(EVICT|PROBE evict)' probe-evict.log || true
+          if grep -q '^PROBE evict_keeps_data *PASS' probe-evict.log; then
+            echo "PASS: pages written through the mapping alone survived the pressure"
+          else
+            echo "::warning::a page written only through a mapping did not survive memory pressure: $(res evict evict_keeps_data)"
+          fi
 
           echo "--- pressure ---"; grep -E '^(PRESSURE|PROBE p)' probe-pressure.log || true
           if ! grep -q '^PRESSURE baseline' probe-pressure.log; then
