@@ -867,6 +867,59 @@ jobs:
               close((int)fd);
           }
 
+          /* A hole that overhangs the written part of a file at one end only. The map of the pages
+             a tmpfs file holds is split by the punch, and a hole strictly inside one of its ranges
+             (which is what an unaligned punch of a fully written file produces) splits it in two,
+             while a hole that runs off one end only trims it. Those two cases are separate paths;
+             the checks above reach the first one alone. */
+          static void punch_overhang(const char *name, int write_low)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              unsigned long len = 16 * ps;
+              unsigned long wstart = write_low ? 0 : 8 * ps;      /* written half */
+              unsigned long hstart = write_low ? 4 * ps : 0;      /* hole, overhanging it */
+              unsigned long hlen = write_low ? (len - 4 * ps) : 12 * ps;
+              long fd = syscall(SYS_memfd_create, name, 0);
+              if ((fd < 0) || (ftruncate((int)fd, len) != 0)) {
+                  ok(name, 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+                  return;
+              }
+              char buf[16];
+              memset(buf, 0xd7, sizeof(buf));
+              int wb = 0;
+              for (unsigned long off = wstart; off < wstart + 8 * ps; off += ps)
+                  if (pwrite((int)fd, buf, sizeof(buf), (off_t)off) != (ssize_t)sizeof(buf))
+                      wb = errno;
+              if ((wb == 0) && (fsync((int)fd) != 0))
+                  wb = errno;
+              struct stat before, after;
+              fstat((int)fd, &before);
+              int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                 (long)hstart, (long)hlen);
+              fstat((int)fd, &after);
+
+              /* The written pages outside the hole keep their bytes, those inside read as a hole,
+                 and only the pages that were actually held can be given back. */
+              char v;
+              int outside_intact = 1, inside_zero = 1;
+              for (unsigned long off = wstart; off < wstart + 8 * ps; off += ps) {
+                  if (pread((int)fd, &v, 1, (off_t)off) != 1)
+                      continue;
+                  if ((off >= hstart) && (off < hstart + hlen))
+                      inside_zero &= (v == 0);
+                  else
+                      outside_intact &= (v == (char)0xd7);
+              }
+              ok(name, (wb == 0) && (pr == 0) && outside_intact && inside_zero &&
+                 (before.st_blocks > 0) && (after.st_blocks < before.st_blocks),
+                 "wrote pages %lu-%lu, punched [%lu,%lu): outside_intact=%d inside_zero=%d"
+                 " st_blocks %ld -> %ld (write+fsync %s, punch rv=%d)",
+                 wstart / ps, wstart / ps + 7, hstart / ps, (hstart + hlen) / ps,
+                 outside_intact, inside_zero, (long)before.st_blocks, (long)after.st_blocks,
+                 wb ? strerror(wb) : "ok", pr);
+              close((int)fd);
+          }
+
           int main(int argc, char **argv)
           {
               printf("PROBE cpus_online            %s %ld processor(s) reported by sysconf\n",
@@ -1051,6 +1104,12 @@ jobs:
                      partial pages at the edges are zeroed in place and nothing
                      outside the hole may be touched. */
               punch_partial_test();
+
+              /* 7e. A hole overhanging the written part of the file at one end, which trims the
+                     file's map of the pages it holds rather than splitting it in two the way 7d
+                     does -- separate paths, and 7d reaches only the second. */
+              punch_overhang("punch_overhang_tail", 1);
+              punch_overhang("punch_overhang_head", 0);
 
               /* 8. Anonymous shared memory, the other shape of the same need. */
               void *s = mmap(NULL, 2 * MB, PROT_READ | PROT_WRITE,
