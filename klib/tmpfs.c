@@ -193,13 +193,20 @@ static void tmpfs_alloc(filesystem fs, fsfile f, long offset, long len, boolean 
 /* Removes a range of whole pages from the dirty range map and drops the pin taken when the range
    was first written, so that the only references left on those pages are the cache reference and
    any mapping of them. Ranges that cannot be split (which takes an allocation) are left alone and
-   their pages are zeroed by the caller, as before. */
-static void tmpfs_dirty_punch(tmpfs_file fsf, range pages)
+   their pages are zeroed by the caller, as before.
+
+   The ranges whose pins have to be released are collected rather than released here, because the
+   pages of a node are locked with a spin lock while this holds the filesystem's mutex, and the
+   write-back takes those two the other way around: pagecache_commit_dirty_ranges() calls
+   fs_write() with the node locked, which is where tmpfsfile_write() asks for the mutex. Releasing
+   a pin from under the mutex closes that cycle, and the processor holding the node lock can never
+   let go of it. */
+static int tmpfs_dirty_punch(tmpfs_file fsf, range pages, range *unpin, int max)
 {
     rangemap dirty = &fsf->dirty;
-    pagecache_node pn = fsf->f.cache_node;
+    int count = 0;
     rmnode n = rangemap_lookup_at_or_next(dirty, pages.start);
-    while ((n != INVALID_ADDRESS) && (n->r.start < pages.end)) {
+    while ((n != INVALID_ADDRESS) && (n->r.start < pages.end) && (count < max)) {
         range r = n->r;
         rmnode next = rangemap_next_node(dirty, n);
         boolean head = r.start < pages.start;
@@ -211,10 +218,10 @@ static void tmpfs_dirty_punch(tmpfs_file fsf, range pages)
             assert(rangemap_reinsert(dirty, n, irange(r.start, pages.start)));
             if (!rangemap_insert_range(dirty, irange(pages.end, r.end))) {
                 assert(rangemap_reinsert(dirty, n, r));  /* out of memory: keep the range whole */
-                return;
+                return count;
             }
-            pagecache_node_unpin(pn, pages);
-            return;
+            unpin[count++] = pages;
+            return count;
         } else if (head) {
             assert(rangemap_reinsert(dirty, n, irange(r.start, pages.start)));
         } else if (tail) {
@@ -222,18 +229,31 @@ static void tmpfs_dirty_punch(tmpfs_file fsf, range pages)
         } else {
             rangemap_remove_range(dirty, n);    /* deallocates the node */
         }
-        pagecache_node_unpin(pn, range_intersection(r, pages));
+        unpin[count++] = range_intersection(r, pages);
         n = next;
     }
+    return count;
 }
 
 static void tmpfs_drop_pages(tmpfs_file fsf, range inner)
 {
     filesystem fs = fsf->f.fs;
-    filesystem_lock(fs);
-    tmpfs_dirty_punch(fsf, range_rshift(inner, ((tmpfs)fs)->page_order));
-    filesystem_unlock(fs);
-    pagecache_node_free_pages(fsf->f.cache_node, inner);
+    pagecache_node pn = fsf->f.cache_node;
+    range pages = range_rshift(inner, ((tmpfs)fs)->page_order);
+    range unpin[16];
+    int count;
+
+    /* Batched for the same reason the mappings are: the ranges are taken from the map under the
+       filesystem's mutex and their pins released without it. Each pass removes what it collects,
+       so the next one resumes on what is left. */
+    do {
+        filesystem_lock(fs);
+        count = tmpfs_dirty_punch(fsf, pages, unpin, _countof(unpin));
+        filesystem_unlock(fs);
+        for (int i = 0; i < count; i++)
+            pagecache_node_unpin(pn, unpin[i]);
+    } while (count == _countof(unpin));
+    pagecache_node_free_pages(pn, inner);
 }
 
 closure_function(1, 1, void, tmpfs_zero_complete,
