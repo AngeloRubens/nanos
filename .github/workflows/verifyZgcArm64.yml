@@ -1231,9 +1231,7 @@ jobs:
           name: zgc-backing-store-probe
           path: |
             zgcprobe.c
-            probe-stock.log
-            probe-klib.log
-            probe-pressure.log
+            probe-*.log
             probe-*.json
 
   # ====================================================================
