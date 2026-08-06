@@ -469,6 +469,22 @@ jobs:
               va_end(ap);
           }
 
+          /* A check that could not run is not a check that failed. The stock image has no
+             memfd_create at all, and its root filesystem is smaller than some of the files these
+             want, so without this the column reads as a row of failures that measured nothing and
+             the two that are the actual contrast get lost among them. A skip is not a pass
+             either: the gates ask for PASS, so a prerequisite going missing where it is supposed
+             to be there still fails. */
+          static void skip(const char *name, const char *fmt, ...)
+          {
+              va_list ap; va_start(ap, fmt);
+              printf("PROBE %-22s SKIP ", name);
+              vprintf(fmt, ap);
+              printf("\n");
+              fflush(stdout);
+              va_end(ap);
+          }
+
           /* Makes the file account for the pages it holds. Writing through a
              mapping is not enough on aarch64: nanos never sees a mapping's pages
              as dirty there (pte_is_dirty() is a stub -- src/aarch64/page_machine.h,
@@ -622,7 +638,8 @@ jobs:
               unsigned long len = 16 * ps;
               long fd = syscall(SYS_memfd_create, "partial", 0);
               if (fd < 0) {
-                  ok("punch_partial", 0, "memfd_create errno=%d (%s)", errno, strerror(errno));
+                  skip("punch_partial", "no memfd_create: errno=%d (%s)", errno, strerror(errno));
+                  skip("punch_partial_blocks", "no memfd_create");
                   return;
               }
               if (ftruncate((int)fd, len) != 0) {
@@ -661,11 +678,15 @@ jobs:
                  pr, pr ? errno : 0, hs, he, outside_intact, inside_zero,
                  (unsigned char)m[hs - 1], (unsigned char)m[hs],
                  (unsigned char)m[he - 1], (unsigned char)m[he]);
-              ok("punch_partial_blocks",
-                 (wb == 0) && (before.st_blocks > 0) && (after.st_blocks < before.st_blocks),
-                 "st_blocks %ld -> %ld for a %lu-page hole in a %lu-page file (write+fsync %s)",
-                 (long)before.st_blocks, (long)after.st_blocks,
-                 (he - hs) / ps, len / ps, wb ? strerror(wb) : "ok");
+              if (wb != 0)
+                  /* Nothing was accounted for, so there is nothing to watch being given back. */
+                  skip("punch_partial_blocks", "the file could not be written through the fd: %s",
+                       strerror(wb));
+              else
+                  ok("punch_partial_blocks",
+                     (before.st_blocks > 0) && (after.st_blocks < before.st_blocks),
+                     "st_blocks %ld -> %ld for a %lu-page hole in a %lu-page file",
+                     (long)before.st_blocks, (long)after.st_blocks, (he - hs) / ps, len / ps);
               munmap(m, len);
               close((int)fd);
           }
@@ -904,8 +925,13 @@ jobs:
               unsigned long hstart = write_low ? 4 * ps : 0;      /* hole, overhanging it */
               unsigned long hlen = write_low ? (len - 4 * ps) : 12 * ps;
               long fd = syscall(SYS_memfd_create, name, 0);
-              if ((fd < 0) || (ftruncate((int)fd, len) != 0)) {
-                  ok(name, 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+              if (fd < 0) {
+                  skip(name, "no memfd_create: errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              if (ftruncate((int)fd, len) != 0) {
+                  ok(name, 0, "ftruncate errno=%d (%s)", errno, strerror(errno));
+                  close((int)fd);
                   return;
               }
               char buf[16];
@@ -1255,11 +1281,18 @@ jobs:
                      not meaningful -- inside nanos there is one process and the
                      number is exact.) */
               long blocks_punched = (fstat(fd, &stb) == 0) ? (long)stb.st_blocks : -1;
-              ok("punch_hole_frees_blocks",
-                 (pr == 0) && (wb == 0) && (blocks_touched > 0) && (blocks_punched == 0),
-                 "st_blocks %ld -> %ld across the punch of the whole %luKB file (write+fsync %s)",
-                 blocks_touched, blocks_punched, (unsigned long)(flen / 1024),
-                 wb ? strerror(wb) : "ok");
+              if (wb != 0)
+                  /* The stock image reaches here on a file of its small root filesystem, where
+                     the write runs out of space: the file never accounted for the pages, so this
+                     has nothing to measure. Its contrast with the klib column is punch_hole_
+                     reclaims, which does not need the write. */
+                  skip("punch_hole_frees_blocks", "the file could not be written through the fd:"
+                       " %s", strerror(wb));
+              else
+                  ok("punch_hole_frees_blocks",
+                     (pr == 0) && (blocks_touched > 0) && (blocks_punched == 0),
+                     "st_blocks %ld -> %ld across the punch of the whole %luKB file",
+                     blocks_touched, blocks_punched, (unsigned long)(flen / 1024));
               long reclaimed = free_after - free_touched;
               ok("punch_hole_reclaims", (pr == 0) && (reclaimed >= (long)(flen / 1024 / 2)),
                  "reclaimed=%ldkB of the %luKB punched, with the file still mapped",
@@ -1529,7 +1562,8 @@ jobs:
           # What the uncommit change has to deliver, on the memfd path only: the
           # root filesystem has no dealloc method and is expected to keep zeroing
           # its pages in place, so the stock column is left as the contrast.
-          for c in punch_hole_frees_blocks punch_hole_reclaims punch_hole_refault punch_partial punch_partial_blocks; do
+          for c in punch_hole_frees_blocks punch_hole_reclaims punch_hole_refault punch_partial \
+                   punch_partial_blocks punch_overhang_head punch_overhang_tail; do
             if grep -q "^PROBE ${c} *PASS" probe-klib.log; then
               echo "PASS: ${c}"
             else
