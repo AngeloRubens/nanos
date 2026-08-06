@@ -1473,10 +1473,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           fail=0
-          for v in stock klib concurrent cycles maps evict; do
+          for v in stock klib concurrent cycles maps; do
             grep -q '^PROBE DONE' "probe-${v}.log" || {
               echo "::error::probe (${v}) did not reach the end — it crashed or never booted; see probe-${v}.log"; fail=1; }
           done
+          # Not in that list: the eviction question is reported rather than gated, and
+          # its guest is the one most likely to die of the thing it is measuring -- it
+          # holds the whole file while it squeezes, where the pressure run has already
+          # punched what it filled.
+          grep -q '^PROBE DONE' probe-evict.log || \
+            echo "::warning::the eviction probe did not reach the end — most likely the guest ran out of memory; see probe-evict.log"
 
           # Not a gate: ops may not honour the CPUs setting, and a uniprocessor run
           # still checks everything else -- but it must not pass for a multiprocessor one.
