@@ -1388,8 +1388,14 @@ jobs:
             "RunConfig": { "Memory": "512M", "CPUs": 4 }
           }
           EOF
+          # Each variant is timed. They are emulated, so they are not fast, but a
+          # variant that suddenly costs minutes is saying something -- either the
+          # guest is doing far more work per operation than the same code does on
+          # the host, or it is stuck retrying something -- and without a number per
+          # variant the only visible symptom is a job that got slower.
           for v in stock klib concurrent cycles maps evict pressure; do
             echo "=== probe (${v}) ==="
+            t0=$SECONDS
             timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
               -c "probe-${v}.json" 2>&1 | strip_ansi | tee "probe-${v}.log" || true
             if ! grep -q '^PROBE ' "probe-${v}.log"; then
@@ -1397,6 +1403,7 @@ jobs:
               timeout 420 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
                 | strip_ansi | tee "probe-${v}.log" || true
             fi
+            echo "TIMING ${v} $((SECONDS - t0))s" | tee -a probe-timing.log
           done
 
       - name: Report the stock-vs-klib capability matrix
@@ -1429,6 +1436,12 @@ jobs:
             echo '```'
             grep -E '^PROBE (concurrent|cpus)' probe-concurrent.log 2>/dev/null || echo "(no output)"
             grep -E '^(CYCLE|PROBE cycles)' probe-cycles.log 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo ""
+            echo "### What each variant cost"
+            echo ""
+            echo '```'
+            cat probe-timing.log 2>/dev/null || echo "(no output)"
             echo '```'
             echo ""
             echo "### With more mappings of the file than the punch unmaps in one batch"
