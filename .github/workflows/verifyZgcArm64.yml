@@ -433,6 +433,7 @@ jobs:
           #define _GNU_SOURCE
           #include <errno.h>
           #include <fcntl.h>
+          #include <pthread.h>
           #include <stdarg.h>
           #include <stdio.h>
           #include <string.h>
@@ -668,12 +669,181 @@ jobs:
               close((int)fd);
           }
 
+          /* Punching while the pages are being faulted in, which is the shape of ZGC's own
+             uncommitter running beside the mutator threads, and the one case the punch cannot test
+             sequentially: a page still referenced when the hole reaches it must be zeroed instead
+             of freed. Each page carries a marker byte derived from its index, so a page can only
+             ever read back as its own marker (someone wrote it) or as zero (the hole took it) --
+             any other value is a page that ended up somewhere it does not belong. A byte is used
+             on purpose: a wider marker could be caught half-zeroed by a racing punch. */
+          #define CONC_LEN      (16 * MB)
+          #define CONC_TOUCHERS 3
+          #define CONC_PUNCHES  150
+
+          static char *conc_a, *conc_b;
+          static unsigned long conc_ps, conc_pages;
+          static volatile int conc_stop;
+          static volatile unsigned long conc_bad, conc_touches, conc_punches;
+
+          static unsigned char marker_of(unsigned long pi)
+          {
+              return (unsigned char)(pi % 251) + 1;   /* never zero */
+          }
+
+          static unsigned long conc_rand(unsigned long *seed)
+          {
+              *seed = (*seed * 6364136223846793005UL) + 1442695040888963407UL;
+              return *seed >> 17;
+          }
+
+          static void *conc_toucher(void *arg)
+          {
+              unsigned long seed = ((unsigned long)(long)arg + 1) * 7919;
+              char *m = ((long)arg == 0) ? conc_b : conc_a;   /* both mappings stay in use */
+              while (!conc_stop) {
+                  unsigned long pi = conc_rand(&seed) % conc_pages;
+                  unsigned char want = marker_of(pi);
+                  m[pi * conc_ps] = want;
+                  unsigned char got = m[pi * conc_ps];
+                  if ((got != want) && (got != 0))
+                      conc_bad++;
+                  conc_touches++;
+              }
+              return 0;
+          }
+
+          static void *conc_puncher(void *arg)
+          {
+              unsigned long seed = 4919;
+              for (unsigned long i = 0; i < CONC_PUNCHES; i++) {
+                  unsigned long off = conc_rand(&seed) % (CONC_LEN - conc_ps);
+                  unsigned long len = conc_ps + (conc_rand(&seed) % (CONC_LEN / 4));
+                  if (off + len > CONC_LEN)
+                      len = CONC_LEN - off;
+                  /* deliberately unaligned: the edges have to be zeroed rather than freed */
+                  if (fallocate((int)(long)arg, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                (long)off, (long)len) == 0)
+                      conc_punches++;
+              }
+              conc_stop = 1;
+              return 0;
+          }
+
+          static void concurrent_test(void)
+          {
+              conc_ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              conc_pages = CONC_LEN / conc_ps;
+              long fd = syscall(SYS_memfd_create, "concurrent", 0);
+              if ((fd < 0) || (ftruncate((int)fd, CONC_LEN) != 0)) {
+                  ok("concurrent_setup", 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+                  return;
+              }
+              conc_a = mmap(NULL, CONC_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              conc_b = mmap(NULL, CONC_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              if ((conc_a == MAP_FAILED) || (conc_b == MAP_FAILED)) {
+                  ok("concurrent_setup", 0, "mmap errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              pthread_t t[CONC_TOUCHERS + 1];
+              int started = 0;
+              for (long i = 0; i < CONC_TOUCHERS; i++)
+                  if (pthread_create(&t[started], 0, conc_toucher, (void *)i) == 0)
+                      started++;
+              if ((started == 0) ||
+                  (pthread_create(&t[started], 0, conc_puncher, (void *)fd) != 0)) {
+                  conc_stop = 1;
+                  ok("concurrent_setup", 0, "pthread_create errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              started++;
+              for (int i = 0; i < started; i++)
+                  pthread_join(t[i], 0);
+              ok("concurrent_setup", 1, "%d threads, %lu punches, %lu touches",
+                 started, conc_punches, conc_touches);
+
+              /* Nothing is racing any more: every page must read the same through both mappings,
+                 and be either its own marker or a hole. */
+              unsigned long mismatched = 0, foreign = 0;
+              for (unsigned long pi = 0; pi < conc_pages; pi++) {
+                  unsigned char a = conc_a[pi * conc_ps], b = conc_b[pi * conc_ps];
+                  if (a != b)
+                      mismatched++;
+                  if ((a != 0) && (a != marker_of(pi)))
+                      foreign++;
+              }
+              ok("concurrent_no_corruption", (conc_bad == 0) && (foreign == 0) && (mismatched == 0),
+                 "%lu pages holding another page's marker, %lu incoherent between the two mappings,"
+                 " %lu bad reads during the race", foreign, mismatched, conc_bad);
+              munmap(conc_a, CONC_LEN);
+              munmap(conc_b, CONC_LEN);
+              close((int)fd);
+          }
+
+          /* Committing and uncommitting the same file over and over, which is what a JVM heap that
+             grows and shrinks does for hours. The page struct is deliberately left behind by the
+             punch, so the first cycle keeps a little memory for good; what must not happen is that
+             each further cycle keeps a little more. Like the other MemFree checks this one only
+             means anything inside nanos, where the number is the physical heap of the only process
+             running; on a Linux host it is noise and the check fails there. */
+          #define CYC_LEN    (32 * MB)
+          #define CYC_ROUNDS 6
+
+          static void cycles_test(void)
+          {
+              long fd = syscall(SYS_memfd_create, "cycles", 0);
+              if ((fd < 0) || (ftruncate((int)fd, CYC_LEN) != 0)) {
+                  ok("cycles_setup", 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+                  return;
+              }
+              long pristine = meminfo_free_kb(), settled = 0, worst = 0;
+              for (int i = 0; i < CYC_ROUNDS; i++) {
+                  char *m = mmap(NULL, CYC_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+                  if (m == MAP_FAILED) {
+                      ok("cycles_reclaim", 0, "mmap failed at cycle %d errno=%d (%s)",
+                         i, errno, strerror(errno));
+                      close((int)fd);
+                      return;
+                  }
+                  memset(m, 0xc3, CYC_LEN);
+                  int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                     0, CYC_LEN);
+                  munmap(m, CYC_LEN);
+                  long now = meminfo_free_kb();
+                  if (i == 0)
+                      settled = now;          /* what the first cycle keeps is the one-time cost */
+                  else if (settled - now > worst)
+                      worst = settled - now;
+                  printf("CYCLE %d punch=%d MemFree=%ldkB (pristine %ldkB, after cycle 0 %ldkB)\n",
+                         i, pr, now, pristine, settled);
+                  fflush(stdout);
+              }
+              /* One page struct per page of the file is retained by design; a leak would show up
+                 as a further loss on every cycle, which this bounds at a quarter of one. */
+              ok("cycles_reclaim", worst <= (long)(CYC_LEN / 1024 / 8),
+                 "worst further loss after the first cycle: %ldkB over %d cycles of %luM"
+                 " (one-time cost %ldkB)",
+                 worst, CYC_ROUNDS, (unsigned long)(CYC_LEN / MB), pristine - settled);
+              close((int)fd);
+          }
+
           int main(int argc, char **argv)
           {
               printf("PROBE cpus_online            %s %ld processor(s) reported by sysconf\n",
                      (sysconf(_SC_NPROCESSORS_ONLN) > 1) ? "PASS" : "FAIL",
                      sysconf(_SC_NPROCESSORS_ONLN));
               fflush(stdout);
+              if ((argc > 1) && !strcmp(argv[1], "concurrent")) {
+                  concurrent_test();
+                  printf("PROBE DONE\n");
+                  fflush(stdout);
+                  return 0;
+              }
+              if ((argc > 1) && !strcmp(argv[1], "cycles")) {
+                  cycles_test();
+                  printf("PROBE DONE\n");
+                  fflush(stdout);
+                  return 0;
+              }
               if ((argc > 1) && !strcmp(argv[1], "pressure")) {
                   pressure_test();
                   printf("PROBE DONE\n");
@@ -852,7 +1022,7 @@ jobs:
               return 0;
           }
           EOF
-          gcc -O2 -static -Wall -o zgcprobe zgcprobe.c
+          gcc -O2 -static -Wall -pthread -o zgcprobe zgcprobe.c
           file zgcprobe
 
       - name: Install ops
@@ -906,6 +1076,20 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          cat > probe-concurrent.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
+          cat > probe-cycles.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["cycles"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
           # Small guest on purpose: 200M punched out of 512M is only reclaimable
           # if the page cache gives it back, so the allocations that follow
           # answer the question instead of the guest simply having room.
@@ -916,7 +1100,7 @@ jobs:
             "RunConfig": { "Memory": "512M", "CPUs": 4 }
           }
           EOF
-          for v in stock klib pressure; do
+          for v in stock klib concurrent cycles pressure; do
             echo "=== probe (${v}) ==="
             timeout 420 ops run ./zgcprobe --nightly --show-debug --verbose \
               -c "probe-${v}.json" 2>&1 | strip_ansi | tee "probe-${v}.log" || true
@@ -952,6 +1136,13 @@ jobs:
             echo "It is expected to fail on the stock column, where the root filesystem has no dealloc method"
             echo "and keeps the previous zero-in-place behaviour."
             echo ""
+            echo "### Punching while the pages are in use, and over and over"
+            echo ""
+            echo '```'
+            grep -E '^PROBE (concurrent|cpus)' probe-concurrent.log 2>/dev/null || echo "(no output)"
+            grep -E '^(CYCLE|PROBE cycles)' probe-cycles.log 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo ""
             echo "### Under memory pressure (512M guest, 200M punched out of a memfd)"
             echo ""
             echo "Does a punched hole give its pages back, and can the guest then use them for something else?"
@@ -961,7 +1152,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           fail=0
-          for v in stock klib; do
+          for v in stock klib concurrent cycles; do
             grep -q '^PROBE DONE' "probe-${v}.log" || {
               echo "::error::probe (${v}) did not reach the end — it crashed or never booted; see probe-${v}.log"; fail=1; }
           done
@@ -993,6 +1184,27 @@ jobs:
               fail=1
             fi
           done
+
+          # Punching while other threads fault the same pages, and doing it over and
+          # over: the first covers the "still referenced, zero it instead of freeing
+          # it" branch, which no sequential check reaches, and the second bounds what
+          # a commit/uncommit cycle keeps.
+          echo "--- concurrent ---"; grep -E '^PROBE (concurrent|cpus)' probe-concurrent.log || true
+          echo "--- cycles ---"; grep -E '^(CYCLE|PROBE cycles)' probe-cycles.log || true
+          for c in concurrent_setup concurrent_no_corruption; do
+            if grep -q "^PROBE ${c} *PASS" probe-concurrent.log; then
+              echo "PASS: ${c}"
+            else
+              echo "::error::${c} failed: $(res concurrent "$c")"
+              fail=1
+            fi
+          done
+          if grep -q '^PROBE cycles_reclaim *PASS' probe-cycles.log; then
+            echo "PASS: cycles_reclaim"
+          else
+            echo "::error::cycles_reclaim failed: $(res cycles cycles_reclaim)"
+            fail=1
+          fi
 
           echo "--- pressure ---"; grep -E '^(PRESSURE|PROBE p)' probe-pressure.log || true
           if ! grep -q '^PRESSURE baseline' probe-pressure.log; then
