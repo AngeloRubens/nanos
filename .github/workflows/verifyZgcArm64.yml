@@ -1004,6 +1004,66 @@ jobs:
               close((int)fd);
           }
 
+          /* No threads at all: write the file through the fd, flush it, punch a hole in it, and
+             again. Serialising the race made it stop every time instead of one time in ten,
+             which says the two do not need to overlap -- so this is the same thing with the
+             concurrency taken away entirely. If it breaks here, the reproducer is a sequence
+             rather than a race, and nothing about it needs a second processor to explain.
+             The mappings are kept because the punch has to unmap through them, and the pages
+             are touched through one so they are mapped when the hole arrives. */
+          #define SEQ_LEN    (8 * MB)
+          #define SEQ_ROUNDS 40
+
+          static void sequence_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              long fd = syscall(SYS_memfd_create, "sequence", 0);
+              if ((fd < 0) || (ftruncate((int)fd, SEQ_LEN) != 0)) {
+                  ok("sequence_setup", 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+                  return;
+              }
+              char *a = mmap(NULL, SEQ_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              char *b = mmap(NULL, SEQ_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              if ((a == MAP_FAILED) || (b == MAP_FAILED)) {
+                  ok("sequence_setup", 0, "mmap errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              ok("sequence_setup", 1, "%luM file, two mappings, %d rounds of write+flush+punch",
+                 (unsigned long)(SEQ_LEN / MB), SEQ_ROUNDS);
+              unsigned long seed = 20260808;
+              int wb = 0, pr = 0, bad = 0;
+              int round;
+              for (round = 0; round < SEQ_ROUNDS; round++) {
+                  for (unsigned long off = 0; off < SEQ_LEN; off += ps)
+                      a[off] = marker_of(off / ps);
+                  wb = write_through_fd((int)fd, SEQ_LEN, 0xa1);
+                  if (wb != 0)
+                      break;
+                  /* Unaligned, the way the race punches, and never the whole file. */
+                  unsigned long o = conc_rand(&seed) % (SEQ_LEN - ps);
+                  unsigned long n = ps + (conc_rand(&seed) % (SEQ_LEN / 4));
+                  if (o + n > SEQ_LEN)
+                      n = SEQ_LEN - o;
+                  printf("SEQ round %d punch [0x%lx,0x%lx)\n", round, o, o + n);
+                  fflush(stdout);
+                  pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                 (long)o, (long)n);
+                  if (pr != 0)
+                      break;
+                  /* Whole pages inside the hole read as a hole, through both mappings. */
+                  unsigned long first = ((o + ps - 1) / ps) * ps;   /* first whole page in it */
+                  for (unsigned long off = first; off + ps <= o + n; off += ps)
+                      if ((a[off] != 0) || (b[off] != 0))
+                          bad++;
+              }
+              ok("sequence_no_corruption", (wb == 0) && (pr == 0) && (bad == 0),
+                 "%d of %d rounds done: write+fsync %s, punch rv=%d, %d pages did not read as a"
+                 " hole", round, SEQ_ROUNDS, wb ? strerror(wb) : "ok", pr, bad);
+              munmap(a, SEQ_LEN);
+              munmap(b, SEQ_LEN);
+              close((int)fd);
+          }
+
           /* Committing and uncommitting the same file over and over, which is what a JVM heap that
              grows and shrinks does for hours. The page struct is deliberately left behind by the
              punch, so the first cycle keeps a little memory for good; what must not happen is that
@@ -1523,6 +1583,12 @@ jobs:
                          conc_punchers, conc_writers, conc_serialize, conc_fsync);
                   fflush(stdout);
                   concurrent_test();
+                  printf("PROBE DONE\n");
+                  fflush(stdout);
+                  return 0;
+              }
+              if ((argc > 1) && !strcmp(argv[1], "sequence")) {
+                  sequence_test();
                   printf("PROBE DONE\n");
                   fflush(stdout);
                   return 0;
@@ -2100,6 +2166,14 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          # And the same thing with no concurrency left in it at all.
+          cat > probe-sequence.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["sequence"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
 
           # The race is the one variant that has ever stopped a guest, and it did not stop the
           # next one: that makes it a frequency, not a fact, and a single run that finishes says
@@ -2118,7 +2192,7 @@ jobs:
 
           # And the same number of rounds of each cut, since one round proves nothing about a
           # fault that shows up in one run out of ten.
-          for v in race1p racenw race1pnw raceser racenofs; do
+          for v in race1p racenw race1pnw raceser racenofs sequence; do
             for i in $(seq 1 10); do
               t0=$SECONDS
               timeout 90 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
@@ -2358,7 +2432,7 @@ jobs:
             echo "| race | rounds that ran | finished | faulted | never started |"
             echo "|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for v in race race1p racenw race1pnw raceser racenofs; do
+          for v in race race1p racenw race1pnw raceser racenofs sequence; do
             case "$v" in
               race)     files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
               race1p)   files="probe-race1p-*.log";   what="one puncher, writer" ;;
@@ -2366,6 +2440,7 @@ jobs:
               race1pnw) files="probe-race1pnw-*.log"; what="one puncher, no writer" ;;
               raceser)  files="probe-raceser-*.log";  what="one puncher, writer, serialised" ;;
               racenofs) files="probe-racenofs-*.log"; what="one puncher, writer, no flush" ;;
+              sequence) files="probe-sequence-*.log"; what="no threads: write, flush, punch" ;;
             esac
             n=0; ok=0; flt=0; nr=0
             for f in $files; do
