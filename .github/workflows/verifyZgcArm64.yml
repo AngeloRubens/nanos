@@ -451,7 +451,7 @@ jobs:
           sudo apt-get update
           # nasm is the pc platform's assembler (rules.mk: AS = nasm), so the
           # x86_64 kernel does not build without it.
-          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+          sudo apt-get install -y build-essential binutils wget git python3 nasm gdb \
             qemu-system qemu-user qemu-user-static qemu-system-arm \
             qemu-system-aarch64 binfmt-support qemu-utils
           which qemu-system-x86_64 qemu-system-aarch64
@@ -1872,6 +1872,78 @@ jobs:
             echo "TIMING race-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
           done
 
+      # A guest that has stopped cannot be asked anything from inside it: the watchdog thread
+      # says whether it is the guest or a thread that stopped, and it has said the guest, which
+      # is where a probe running in that guest runs out of things it can find out. qemu's gdb
+      # stub is outside it, so it still answers -- and what each processor is executing, with
+      # the symbols of the kernel built here, is what says which lock is held by whom.
+      - name: Catch the race where it stops, and ask every processor where it is
+        if: matrix.arch == 'x64'
+        run: |
+          set -o pipefail
+          KELF="$(find output -name kernel.elf | head -1)"
+          IMG="$HOME/.ops/images/zgcprobe"
+          [ -f "$KELF" ] || { echo "::warning::no kernel.elf to symbolise with"; exit 0; }
+          [ -f "$IMG" ] || { echo "::warning::no image left by the race to boot"; exit 0; }
+          # The command line ops uses for this image, with the accelerator forced off (the
+          # runner has no /dev/kvm anyway) and the gdb stub added.
+          run_qemu() {
+            qemu-system-x86_64 -machine q35,accel=tcg -cpu max -smp 4 -m 2G \
+              -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x3 \
+              -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x3.0x6 \
+              -device virtio-scsi-pci,bus=pci.2,addr=0x0,id=scsi0 \
+              -device scsi-hd,bus=scsi0.0,drive=hd0 \
+              -drive file="$IMG",format=raw,if=none,id=hd0 \
+              -vga none -device isa-debug-exit -display none -serial stdio -s
+          }
+          caught=0
+          for attempt in $(seq 1 6); do
+            echo "=== attempt ${attempt} ==="
+            : > race-hang.serial
+            run_qemu > race-hang.serial 2>&1 &
+            qpid=$!
+            stalls=0; last=0
+            for _ in $(seq 1 60); do
+              sleep 2
+              now=$(wc -c < race-hang.serial)
+              if grep -q '^PROBE DONE' race-hang.serial; then break; fi
+              if [ "$now" = "$last" ]; then stalls=$((stalls + 1)); else stalls=0; fi
+              last=$now
+              # The whole race takes about a second of guest time, so nothing new for twenty
+              # is not a slow guest.
+              [ "$stalls" -ge 10 ] && break
+            done
+            if grep -q '^PROBE DONE' race-hang.serial; then
+              echo "the race finished this time"
+              kill "$qpid" 2>/dev/null || true
+              wait "$qpid" 2>/dev/null || true
+              continue
+            fi
+            echo "--- it stopped here ---"
+            tail -3 race-hang.serial
+            gdb -batch -n "$KELF" \
+              -ex 'target remote :1234' \
+              -ex 'info threads' \
+              -ex 'thread apply all bt' \
+              -ex 'thread apply all info registers rip rsp' 2>&1 | tee race-hang.bt
+            kill "$qpid" 2>/dev/null || true
+            wait "$qpid" 2>/dev/null || true
+            caught=1
+            break
+          done
+          if [ "$caught" = 1 ]; then
+            {
+              echo "### Where every processor was when the race stopped"
+              echo ""
+              echo '```'
+              sed -n '1,120p' race-hang.bt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::the race stopped the guest again; the backtrace of each processor is in race-hang.bt"
+          else
+            echo "the race finished in all six attempts under the gdb stub"
+          fi
+
       - name: Report the stock-vs-klib capability matrix
         run: |
           res() { # $1=variant $2=check -> "VERDICT detail"
@@ -2117,6 +2189,8 @@ jobs:
             zgcprobe.c
             probe-*.log
             probe-*.json
+            race-hang.serial
+            race-hang.bt
 
   # ====================================================================
   # nanos's own runtime test for memfd, extended with the fallocate cases the
