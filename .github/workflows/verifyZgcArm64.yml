@@ -1083,6 +1083,75 @@ jobs:
               close((int)fd);
           }
 
+          /* The route a collector can take to the same state without ever writing to the
+             descriptor, which is what makes it the question rather than a curiosity: dirty the
+             pages through the mapping, have them written back, punch. Nothing here calls write()
+             or fsync(); msync(MS_SYNC) only asks for what the page cache's own scan timer does
+             on its own schedule anyway (mmap.c: msync_vmap -> pagecache_node_scan), and that
+             scan is what turns a mapping's dirty bits into ranges the filesystem is asked to
+             write -- which is where it pins them.
+             On aarch64 this can dirty nothing at all, pte_is_dirty() being a stub there, so the
+             file accounting for no blocks is the expected answer and the contrast. */
+          #define MSYNC_LEN    (8 * MB)
+          #define MSYNC_ROUNDS 30
+
+          static void mapsync_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              long fd = syscall(SYS_memfd_create, "mapsync", 0);
+              if ((fd < 0) || (ftruncate((int)fd, MSYNC_LEN) != 0)) {
+                  ok("mapsync_setup", 0, "fd=%ld errno=%d (%s)", fd, errno, strerror(errno));
+                  return;
+              }
+              char *a = mmap(NULL, MSYNC_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              char *b = mmap(NULL, MSYNC_LEN, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              if ((a == MAP_FAILED) || (b == MAP_FAILED)) {
+                  ok("mapsync_setup", 0, "mmap errno=%d (%s)", errno, strerror(errno));
+                  return;
+              }
+              unsigned long seed = 8080808;
+              long blocks_max = 0;
+              int ms = 0, pr = 0, bad = 0, round;
+              for (round = 0; round < MSYNC_ROUNDS; round++) {
+                  for (unsigned long off = 0; off < MSYNC_LEN; off += ps)
+                      a[off] = marker_of(off / ps);
+                  if (msync(a, MSYNC_LEN, MS_SYNC) != 0) {
+                      ms = errno;
+                      break;
+                  }
+                  struct stat st;
+                  if ((fstat((int)fd, &st) == 0) && (st.st_blocks > blocks_max))
+                      blocks_max = st.st_blocks;
+                  unsigned long o = conc_rand(&seed) % (MSYNC_LEN - ps);
+                  unsigned long n = ps + (conc_rand(&seed) % (MSYNC_LEN / 4));
+                  if (o + n > MSYNC_LEN)
+                      n = MSYNC_LEN - o;
+                  printf("MAPSYNC round %d blocks %ld punch [0x%lx,0x%lx)\n",
+                         round, blocks_max, o, o + n);
+                  fflush(stdout);
+                  pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                 (long)o, (long)n);
+                  if (pr != 0)
+                      break;
+                  unsigned long first = ((o + ps - 1) / ps) * ps;
+                  for (unsigned long off = first; off + ps <= o + n; off += ps)
+                      if ((a[off] != 0) || (b[off] != 0))
+                          bad++;
+              }
+              /* Whether the route gets there at all is the whole point, so it is reported as its
+                 own answer rather than folded into the check below. */
+              ok("mapsync_accounted", blocks_max > 0,
+                 "the file accounted for up to %ld blocks from writes through the mapping alone,"
+                 " so the range map %s reached this way", blocks_max,
+                 blocks_max > 0 ? "is" : "is not");
+              ok("mapsync_no_corruption", (ms == 0) && (pr == 0) && (bad == 0),
+                 "%d of %d rounds: msync %s, punch rv=%d, %d pages did not read as a hole",
+                 round, MSYNC_ROUNDS, ms ? strerror(ms) : "ok", pr, bad);
+              munmap(a, MSYNC_LEN);
+              munmap(b, MSYNC_LEN);
+              close((int)fd);
+          }
+
           /* Committing and uncommitting the same file over and over, which is what a JVM heap that
              grows and shrinks does for hours. The page struct is deliberately left behind by the
              punch, so the first cycle keeps a little memory for good; what must not happen is that
@@ -1602,6 +1671,12 @@ jobs:
                          conc_punchers, conc_writers, conc_serialize, conc_fsync);
                   fflush(stdout);
                   concurrent_test();
+                  printf("PROBE DONE\n");
+                  fflush(stdout);
+                  return 0;
+              }
+              if ((argc > 1) && !strcmp(argv[1], "mapsync")) {
+                  mapsync_test();
                   printf("PROBE DONE\n");
                   fflush(stdout);
                   return 0;
@@ -2193,6 +2268,14 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          # And the collector's own route: through the mapping, never through the descriptor.
+          cat > probe-mapsync.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["mapsync"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
 
           # The race is the one variant that has ever stopped a guest, and it did not stop the
           # next one: that makes it a frequency, not a fact, and a single run that finishes says
@@ -2211,7 +2294,7 @@ jobs:
 
           # And the same number of rounds of each cut, since one round proves nothing about a
           # fault that shows up in one run out of ten.
-          for v in race1p racenw race1pnw raceser racenofs sequence; do
+          for v in race1p racenw race1pnw raceser racenofs sequence mapsync; do
             for i in $(seq 1 10); do
               t0=$SECONDS
               timeout 90 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
@@ -2451,7 +2534,7 @@ jobs:
             echo "| race | rounds that ran | finished | faulted | never started |"
             echo "|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for v in race race1p racenw race1pnw raceser racenofs sequence; do
+          for v in race race1p racenw race1pnw raceser racenofs sequence mapsync; do
             case "$v" in
               race)     files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
               race1p)   files="probe-race1p-*.log";   what="one puncher, writer" ;;
@@ -2460,6 +2543,7 @@ jobs:
               raceser)  files="probe-raceser-*.log";  what="one puncher, writer, serialised" ;;
               racenofs) files="probe-racenofs-*.log"; what="one puncher, writer, no flush" ;;
               sequence) files="probe-sequence-*.log"; what="no threads: write, flush, punch" ;;
+              mapsync)  files="probe-mapsync-*.log";  what="through the mapping only: msync, punch" ;;
             esac
             n=0; ok=0; flt=0; nr=0
             for f in $files; do
