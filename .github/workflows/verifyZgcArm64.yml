@@ -747,6 +747,10 @@ jobs:
              threads incrementing the same one would lose counts and make it fail for a reason
              that has nothing to do with the punch. */
           static volatile unsigned long conc_done[CONC_PUNCHERS];
+          /* Which punch each puncher is inside, one-based so that zero means "between two", and
+             when it entered it. Read by the watchdog below. */
+          static volatile unsigned long conc_inpunch[CONC_PUNCHERS];
+          static volatile long conc_since[CONC_PUNCHERS];
 
           static unsigned long conc_punched(void)
           {
@@ -754,6 +758,35 @@ jobs:
               for (int i = 0; i < CONC_PUNCHERS; i++)
                   n += conc_done[i];
               return n;
+          }
+
+          /* A run that stops in the middle of the race says almost nothing on its own: the last
+             line is a punch that was announced and never came back, which looks the same whether
+             one thread is stuck in that punch or the whole guest has stopped. This thread does
+             nothing but say, once a second, who is still moving -- so silence from it means the
+             guest itself is gone, while a beat that keeps coming while the touch count stands
+             still means the threads faulting pages are blocked on something a punch holds. */
+          static void *conc_watchdog(void *arg)
+          {
+              time_t start = time(0);
+              (void)arg;
+              while (!conc_stop) {
+                  struct timespec ts = { 1, 0 };
+                  nanosleep(&ts, 0);
+                  long secs = (long)(time(0) - start);
+                  printf("RACE alive %lds: %lu punches, %lu touches, %lu writes (%lu errors)",
+                         secs, conc_punched(), conc_touches, conc_writes, conc_werr);
+                  for (int i = 0; i < CONC_PUNCHERS; i++) {
+                      if (conc_inpunch[i])
+                          printf(", t%d inside punch %lu for %lds", i, conc_inpunch[i] - 1,
+                                 secs - conc_since[i]);
+                      else
+                          printf(", t%d between punches", i);
+                  }
+                  printf("\n");
+                  fflush(stdout);
+              }
+              return 0;
           }
 
           static unsigned char marker_of(unsigned long pi)
@@ -852,8 +885,12 @@ jobs:
                          conc_punched(), conc_touches, conc_writes, conc_blocks_max);
                   fflush(stdout);
                   /* deliberately unaligned: the edges have to be zeroed rather than freed */
-                  if (fallocate(conc_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                                (long)off, (long)len) == 0)
+                  conc_since[id] = secs;
+                  conc_inpunch[id] = i + 1;
+                  int rv = fallocate(conc_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                     (long)off, (long)len);
+                  conc_inpunch[id] = 0;
+                  if (rv == 0)
                       conc_done[id]++;
               }
               /* The touchers and the writer stop when the LAST puncher is done, not the first. */
@@ -879,12 +916,17 @@ jobs:
               }
               conc_fd = (int)fd;
               conc_punchers_left = CONC_PUNCHERS;
-              pthread_t t[CONC_TOUCHERS + 1 + CONC_PUNCHERS];
-              int started = 0, failed;
+              pthread_t t[CONC_TOUCHERS + 2 + CONC_PUNCHERS];
+              int started = 0, touchers = 0, failed;
+              /* First, so that it is already beating if anything below gets stuck. */
+              if (pthread_create(&t[started], 0, conc_watchdog, 0) == 0)
+                  started++;
               for (long i = 0; i < CONC_TOUCHERS; i++)
-                  if (pthread_create(&t[started], 0, conc_toucher, (void *)i) == 0)
+                  if (pthread_create(&t[started], 0, conc_toucher, (void *)i) == 0) {
                       started++;
-              failed = (started == 0);
+                      touchers++;
+                  }
+              failed = (touchers == 0);
               if (!failed) {
                   if (pthread_create(&t[started], 0, conc_writer, (void *)fd) == 0)
                       started++;
