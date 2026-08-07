@@ -1981,9 +1981,12 @@ jobs:
           # next one: that makes it a frequency, not a fact, and a single run that finishes says
           # nothing about how often one does not. A boot of it costs a couple of seconds, so it
           # is run again and again and the count of those that finished is what gets reported.
+          # The timeout is short for the same reason: a round that stops is not going to say
+          # anything more, and two of ten stopping at five minutes each is ten minutes of the
+          # job spent waiting for a guest that is already gone.
           for i in $(seq 2 10); do
             t0=$SECONDS
-            timeout 300 ops run ./zgcprobe --nightly -c probe-concurrent.json 2>&1 \
+            timeout 90 ops run ./zgcprobe --nightly -c probe-concurrent.json 2>&1 \
               | strip_ansi | tee "probe-race-${i}.log" || true
             echo "TIMING race-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
           done
@@ -2251,8 +2254,8 @@ jobs:
             zgcprobe.c
             probe-*.log
             probe-*.json
-            race-hang.serial
-            race-hang.bt
+            *-hang.serial
+            *-hang.bt
 
   # ====================================================================
   # nanos's own runtime test for memfd, extended with the fallocate cases the
