@@ -2029,6 +2029,14 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          # And the fourth corner, so the table is a table: neither of the two.
+          cat > probe-race1pnw.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent", "1", "0"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
 
           # The race is the one variant that has ever stopped a guest, and it did not stop the
           # next one: that makes it a frequency, not a fact, and a single run that finishes says
@@ -2046,7 +2054,7 @@ jobs:
 
           # And the same number of rounds of each cut, since one round proves nothing about a
           # fault that shows up in one run out of ten.
-          for v in race1p racenw; do
+          for v in race1p racenw race1pnw; do
             for i in $(seq 1 10); do
               t0=$SECONDS
               timeout 90 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
@@ -2272,11 +2280,12 @@ jobs:
             echo "| race | rounds | finished | faulted |"
             echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for v in race race1p racenw; do
+          for v in race race1p racenw race1pnw; do
             case "$v" in
-              race)   files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
-              race1p) files="probe-race1p-*.log";  what="one puncher, writer" ;;
-              racenw) files="probe-racenw-*.log";  what="two punchers, no writer" ;;
+              race)     files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
+              race1p)   files="probe-race1p-*.log";   what="one puncher, writer" ;;
+              racenw)   files="probe-racenw-*.log";   what="two punchers, no writer" ;;
+              race1pnw) files="probe-race1pnw-*.log"; what="one puncher, no writer" ;;
             esac
             n=0; ok=0; flt=0
             for f in $files; do
