@@ -1943,6 +1943,56 @@ static int pagecache_node_collect_maps(pagecache_node pn, range q /* node offset
 static void pagecache_node_unmap_pages_sync(pagecache_node pn, range v, u64 node_offset,
                                             boolean shared_mappings);
 
+/* Takes a range out of the node's dirty set, the way purge_range_handler() does with all of
+   them: the pages of a punched hole have nothing left to write back, and a range left there is
+   committed later on -- which is where the filesystem is asked to write it and puts it back in
+   its own account of the pages it holds, pinning pages whose memory has been given back in the
+   meantime. Such a pin is released again when the next hole reaches that range, and a release
+   that takes the reference count of an empty page to zero frees an address that is already
+   free. Called with the node and the page state locked. */
+static void pagecache_node_discard_dirty_locked(pagecache_node pn, range q /* bytes */)
+{
+    pagecache pc = pn->pv->pc;
+    int page_order = pc->page_order;
+    u64 page_size = U64_FROM_BIT(page_order);
+    rmnode n = rangemap_lookup_at_or_next(&pn->dirty, q.start);
+    while ((n != INVALID_ADDRESS) && (n->r.start < q.end)) {
+        rmnode next = rangemap_next_node(&pn->dirty, n);
+        range r = n->r;
+        range ri = range_intersection(r, q);
+        boolean head = r.start < ri.start;
+        boolean tail = r.end > ri.end;
+
+        /* The map is edited before the pages are, so that a range which cannot be split -- the
+           one case here that needs an allocation -- is left alone with its pages still dirty
+           rather than half undone. */
+        if (head && tail) {
+            assert(rangemap_reinsert(&pn->dirty, n, irange(r.start, ri.start)));
+            if (!rangemap_insert_range(&pn->dirty, irange(ri.end, r.end))) {
+                assert(rangemap_reinsert(&pn->dirty, n, r));    /* out of memory */
+                return;
+            }
+        } else if (head) {
+            assert(rangemap_reinsert(&pn->dirty, n, irange(r.start, ri.start)));
+        } else if (tail) {
+            assert(rangemap_reinsert(&pn->dirty, n, irange(ri.end, r.end)));
+        } else {
+            rangemap_remove_range(&pn->dirty, n);
+        }
+        for (u64 off = ri.start; off < ri.end; off += page_size) {
+            pagecache_page pp = page_lookup_nodelocked(pn, off >> page_order);
+            if ((pp != INVALID_ADDRESS) && (page_state(pp) == PAGECACHE_PAGESTATE_DIRTY)) {
+                change_page_state_locked(pc, pp, PAGECACHE_PAGESTATE_ALLOC);
+                pagecache_page_release_locked(pc, pp, false);
+                refcount_release(&pn->refcount);
+            }
+        }
+        if (head && tail)
+            return; /* the hole fell inside this range, so no other one intersects it */
+        n = next;
+    }
+}
+
 /* Drops the pages within a node range, after unmapping them from any mapping of the node. A page
    that is still referenced when the range is punched (because a fault is racing with us, or
    because a private copy is mapped elsewhere) cannot be freed: it is zeroed instead, so that the
@@ -1966,6 +2016,14 @@ void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */)
                dereferences the page to do so, while the loop below is already freeing it. */
             pagecache_node_unmap_pages_sync(pn, maps[i].v, maps[i].node_offset, false);
     }
+
+    /* After the unmapping, so that no entry is left through which a page could be found dirty
+       again, and before the pages are given back, so that nothing is asked to write them. */
+    pagecache_lock_node(pn);
+    pagecache_lock_state(pc);
+    pagecache_node_discard_dirty_locked(pn, q);
+    pagecache_unlock_state(pc);
+    pagecache_unlock_node(pn);
 
     range pages = range_rshift(q, page_order);
     u64 page_size = U64_FROM_BIT(page_order);
