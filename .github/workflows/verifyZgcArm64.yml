@@ -488,6 +488,7 @@ jobs:
           #include <stdarg.h>
           #include <stdio.h>
           #include <stdlib.h>
+          #include <sched.h>
           #include <string.h>
           #include <time.h>
           #include <unistd.h>
@@ -770,6 +771,11 @@ jobs:
              the opposite: the pages are left dirty for the page cache to commit whenever it
              likes, so what reaches the filesystem does so entirely on its own schedule. */
           static int conc_serialize = 0, conc_fsync = 1;
+          /* Whether the faulting and the punching are kept to halves of the file that do not
+             meet. A collector punches granules it has stopped using, so it never faults inside
+             the hole it is making; the threads here do it constantly, which is a harsher thing
+             than the case that has to be decided. */
+          static int conc_disjoint = 0;
           static pthread_mutex_t conc_gate = PTHREAD_MUTEX_INITIALIZER;
 
           static void conc_gate_lock(void)
@@ -847,8 +853,9 @@ jobs:
           {
               unsigned long seed = ((unsigned long)(long)arg + 1) * 7919;
               char *m = ((long)arg == 0) ? conc_b : conc_a;   /* both mappings stay in use */
+              unsigned long span = conc_disjoint ? (conc_pages / 2) : conc_pages;
               while (!conc_stop) {
-                  unsigned long pi = conc_rand(&seed) % conc_pages;
+                  unsigned long pi = conc_rand(&seed) % span;
                   unsigned char want = marker_of(pi);
                   m[pi * conc_ps] = want;
                   unsigned char got = m[pi * conc_ps];
@@ -871,7 +878,8 @@ jobs:
               int fd = (int)(long)arg;
               unsigned long seed = 104729;
               while (!conc_stop) {
-                  unsigned long pi = conc_rand(&seed) % conc_pages;
+                  unsigned long wlo = conc_disjoint ? (conc_pages / 2) : 0;
+                  unsigned long pi = wlo + (conc_rand(&seed) % (conc_pages - wlo));
                   unsigned long n = 1 + (conc_rand(&seed) % 64);
                   if (pi + n > conc_pages)
                       n = conc_pages - pi;
@@ -911,9 +919,17 @@ jobs:
               long id = (long)arg;
               unsigned long seed = 4919 + (unsigned long)id * 7717;
               time_t start = time(0);
+              /* Not before the file holds something. Punching a range nothing has written is
+                 nearly free, so without this the punches are all spent before the writer has
+                 finished a single batch, and the run measures a file with no pinned ranges in
+                 it -- which is a different cell of the table from the one it is in. */
+              while (conc_writers && (conc_writes == 0) && !conc_stop &&
+                     ((long)(time(0) - start) <= CONC_SECONDS))
+                  sched_yield();
               unsigned long rounds = CONC_PUNCHES / (unsigned)conc_punchers;
               for (unsigned long i = 0; i < rounds; i++) {
-                  unsigned long off = conc_rand(&seed) % (CONC_LEN - conc_ps);
+                  unsigned long lo = conc_disjoint ? (CONC_LEN / 2) : 0;
+                  unsigned long off = lo + (conc_rand(&seed) % (CONC_LEN - lo - conc_ps));
                   unsigned long len = conc_ps + (conc_rand(&seed) % (CONC_LEN / 4));
                   if (off + len > CONC_LEN)
                       len = CONC_LEN - off;
@@ -1009,6 +1025,10 @@ jobs:
                  and be either its own marker or a hole. */
               unsigned long mismatched = 0, foreign = 0;
               for (unsigned long pi = 0; pi < conc_pages; pi++) {
+                  /* Nothing writes the upper half through a mapping when the two are kept
+                     apart, so it holds whatever the punches left rather than a marker. */
+                  if (conc_disjoint && (pi >= conc_pages / 2))
+                      continue;
                   unsigned char a = conc_a[pi * conc_ps], b = conc_b[pi * conc_ps];
                   if (a != b)
                       mismatched++;
@@ -1664,11 +1684,13 @@ jobs:
                       conc_serialize = atoi(argv[4]);
                   if (argc > 5)
                       conc_fsync = atoi(argv[5]);
+                  if (argc > 6)
+                      conc_disjoint = atoi(argv[6]);
                   if ((conc_punchers < 1) || (conc_punchers > CONC_PUNCHERS))
                       conc_punchers = CONC_PUNCHERS;
                   printf("PROBE conc_config           PASS %d puncher(s), %d writer(s),"
-                         " serialised=%d, flushing=%d\n",
-                         conc_punchers, conc_writers, conc_serialize, conc_fsync);
+                         " serialised=%d, flushing=%d, disjoint=%d\n",
+                         conc_punchers, conc_writers, conc_serialize, conc_fsync, conc_disjoint);
                   fflush(stdout);
                   concurrent_test();
                   printf("PROBE DONE\n");
@@ -2268,6 +2290,18 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          # The last thing that separates this from what a collector does: it punches granules it
+          # has stopped using, so it never faults inside the hole it is making, while the threads
+          # here fault all over the file the punches fall on. Kept apart -- faulting in the lower
+          # half, writing and punching in the upper -- the pins are still there and the faults
+          # are still concurrent, but the two no longer meet on a page.
+          cat > probe-racedisj.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent", "1", "1", "0", "1", "1"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
           # And the collector's own route: through the mapping, never through the descriptor.
           cat > probe-mapsync.json <<'EOF'
           {
@@ -2294,7 +2328,7 @@ jobs:
 
           # And the same number of rounds of each cut, since one round proves nothing about a
           # fault that shows up in one run out of ten.
-          for v in race1p racenw race1pnw raceser racenofs sequence mapsync; do
+          for v in race1p racenw race1pnw raceser racenofs racedisj sequence mapsync; do
             for i in $(seq 1 10); do
               t0=$SECONDS
               timeout 90 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
@@ -2534,7 +2568,7 @@ jobs:
             echo "| race | rounds that ran | finished | faulted | never started |"
             echo "|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for v in race race1p racenw race1pnw raceser racenofs sequence mapsync; do
+          for v in race race1p racenw race1pnw raceser racenofs racedisj sequence mapsync; do
             case "$v" in
               race)     files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
               race1p)   files="probe-race1p-*.log";   what="one puncher, writer" ;;
@@ -2542,6 +2576,7 @@ jobs:
               race1pnw) files="probe-race1pnw-*.log"; what="one puncher, no writer" ;;
               raceser)  files="probe-raceser-*.log";  what="one puncher, writer, serialised" ;;
               racenofs) files="probe-racenofs-*.log"; what="one puncher, writer, no flush" ;;
+              racedisj) files="probe-racedisj-*.log"; what="faults and punches kept apart" ;;
               sequence) files="probe-sequence-*.log"; what="no threads: write, flush, punch" ;;
               mapsync)  files="probe-mapsync-*.log";  what="through the mapping only: msync, punch" ;;
             esac
