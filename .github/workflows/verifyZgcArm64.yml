@@ -1861,6 +1861,17 @@ jobs:
             echo "TIMING ${v} $((SECONDS - t0))s" | tee -a probe-timing.log
           done
 
+          # The race is the one variant that has ever stopped a guest, and it did not stop the
+          # next one: that makes it a frequency, not a fact, and a single run that finishes says
+          # nothing about how often one does not. A boot of it costs a couple of seconds, so it
+          # is run again and again and the count of those that finished is what gets reported.
+          for i in $(seq 2 10); do
+            t0=$SECONDS
+            timeout 300 ops run ./zgcprobe --nightly -c probe-concurrent.json 2>&1 \
+              | strip_ansi | tee "probe-race-${i}.log" || true
+            echo "TIMING race-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
+          done
+
       - name: Report the stock-vs-klib capability matrix
         run: |
           res() { # $1=variant $2=check -> "VERDICT detail"
@@ -2032,6 +2043,24 @@ jobs:
               fail=1
             fi
           done
+          # And every repetition of it, counted: one round that finishes is not evidence about
+          # a stop that happens some of the time.
+          rounds=0; finished=0
+          for f in probe-concurrent.log probe-race-*.log; do
+            [ -f "$f" ] || continue
+            rounds=$((rounds + 1))
+            if grep -q '^PROBE DONE' "$f" &&
+               grep -q '^PROBE concurrent_no_corruption *PASS' "$f"; then
+              finished=$((finished + 1))
+            else
+              echo "::error::the race did not finish in ${f}"
+              grep -E '^RACE ' "$f" | tail -4
+              fail=1
+            fi
+          done
+          echo "race: ${finished} of ${rounds} rounds finished"
+          printf '\n**The race was run %d times, and %d of them finished.**\n' \
+            "$rounds" "$finished" >> "$GITHUB_STEP_SUMMARY"
           if grep -q '^PROBE cycles_reclaim *PASS' probe-cycles.log; then
             echo "PASS: cycles_reclaim"
           else
