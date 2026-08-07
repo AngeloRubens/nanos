@@ -732,15 +732,29 @@ jobs:
              on purpose: a wider marker could be caught half-zeroed by a racing punch. */
           #define CONC_LEN      (16 * MB)
           #define CONC_TOUCHERS 3
+          #define CONC_PUNCHERS 2
           #define CONC_PUNCHES  150
           #define CONC_SECONDS  120       /* well inside the step's own timeout */
 
           static char *conc_a, *conc_b;
+          static int conc_fd;
           static unsigned long conc_ps, conc_pages;
-          static volatile int conc_stop;
-          static volatile unsigned long conc_bad, conc_touches, conc_punches;
+          static volatile int conc_stop, conc_punchers_left;
+          static volatile unsigned long conc_bad, conc_touches;
           static volatile unsigned long conc_writes, conc_werr;
           static volatile long conc_blocks_max;
+          /* One counter per puncher rather than one shared: they are read by the gate, and two
+             threads incrementing the same one would lose counts and make it fail for a reason
+             that has nothing to do with the punch. */
+          static volatile unsigned long conc_done[CONC_PUNCHERS];
+
+          static unsigned long conc_punched(void)
+          {
+              unsigned long n = 0;
+              for (int i = 0; i < CONC_PUNCHERS; i++)
+                  n += conc_done[i];
+              return n;
+          }
 
           static unsigned char marker_of(unsigned long pi)
           {
@@ -807,35 +821,44 @@ jobs:
              about whether it was stuck or merely slow unless the log shows which punch it was on
              and how many the ones before it managed per second. The deadline is what keeps a
              stuck run from spending the whole step's timeout in silence: it gives up the
-             remaining punches and lets the test report what it did reach. */
+             remaining punches and lets the test report what it did reach.
+
+             There is more than one of these, and they pick their ranges independently, so two
+             punches overlap sooner or later: the same page is then reached by both, and whichever
+             gets there second must find it already gone from the file's map of its pages and
+             already dropped, rather than release a pin twice or free a page twice. The removal
+             happens under the filesystem's mutex, so this is a check on that claim, not a hope. */
           static void *conc_puncher(void *arg)
           {
-              unsigned long seed = 4919;
+              long id = (long)arg;
+              unsigned long seed = 4919 + (unsigned long)id * 7717;
               time_t start = time(0);
-              for (unsigned long i = 0; i < CONC_PUNCHES; i++) {
+              for (unsigned long i = 0; i < CONC_PUNCHES / CONC_PUNCHERS; i++) {
                   unsigned long off = conc_rand(&seed) % (CONC_LEN - conc_ps);
                   unsigned long len = conc_ps + (conc_rand(&seed) % (CONC_LEN / 4));
                   if (off + len > CONC_LEN)
                       len = CONC_LEN - off;
                   long secs = (long)(time(0) - start);
                   if (secs > CONC_SECONDS) {
-                      printf("RACE gave up at punch %lu after %lds\n", i, secs);
+                      printf("RACE t%ld gave up at punch %lu after %lds\n", id, i, secs);
                       fflush(stdout);
                       break;
                   }
                   /* Every one of them, not every tenth: if the guest stops inside a punch rather
                      than between two, the last line printed is the only thing that says which
                      one, and its offset and length are what makes it reproducible. */
-                  printf("RACE punch %lu at %lds [0x%lx,0x%lx): %lu done, %lu touches,"
-                         " %lu writes, %ld blocks\n", i, secs, off, off + len,
-                         conc_punches, conc_touches, conc_writes, conc_blocks_max);
+                  printf("RACE t%ld punch %lu at %lds [0x%lx,0x%lx): %lu done, %lu touches,"
+                         " %lu writes, %ld blocks\n", id, i, secs, off, off + len,
+                         conc_punched(), conc_touches, conc_writes, conc_blocks_max);
                   fflush(stdout);
                   /* deliberately unaligned: the edges have to be zeroed rather than freed */
-                  if (fallocate((int)(long)arg, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                  if (fallocate(conc_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                                 (long)off, (long)len) == 0)
-                      conc_punches++;
+                      conc_done[id]++;
               }
-              conc_stop = 1;
+              /* The touchers and the writer stop when the LAST puncher is done, not the first. */
+              if (__atomic_sub_fetch(&conc_punchers_left, 1, __ATOMIC_SEQ_CST) == 0)
+                  conc_stop = 1;
               return 0;
           }
 
@@ -854,30 +877,42 @@ jobs:
                   ok("concurrent_setup", 0, "mmap errno=%d (%s)", errno, strerror(errno));
                   return;
               }
-              pthread_t t[CONC_TOUCHERS + 2];
-              int started = 0;
+              conc_fd = (int)fd;
+              conc_punchers_left = CONC_PUNCHERS;
+              pthread_t t[CONC_TOUCHERS + 1 + CONC_PUNCHERS];
+              int started = 0, failed;
               for (long i = 0; i < CONC_TOUCHERS; i++)
                   if (pthread_create(&t[started], 0, conc_toucher, (void *)i) == 0)
                       started++;
-              if ((started == 0) ||
-                  (pthread_create(&t[started], 0, conc_writer, (void *)fd) != 0) ||
-                  (pthread_create(&t[started + 1], 0, conc_puncher, (void *)fd) != 0)) {
+              failed = (started == 0);
+              if (!failed) {
+                  if (pthread_create(&t[started], 0, conc_writer, (void *)fd) == 0)
+                      started++;
+                  else
+                      failed = 1;
+              }
+              for (long i = 0; !failed && (i < CONC_PUNCHERS); i++) {
+                  if (pthread_create(&t[started], 0, conc_puncher, (void *)i) == 0)
+                      started++;
+                  else
+                      failed = 1;
+              }
+              if (failed) {
                   conc_stop = 1;
                   ok("concurrent_setup", 0, "pthread_create errno=%d (%s)", errno, strerror(errno));
                   return;
               }
-              started += 2;
               for (int i = 0; i < started; i++)
                   pthread_join(t[i], 0);
               /* The blocks are what says the race reached the range map at all, and the write
                  errors are here because a write that silently failed would empty it just as
                  effectively as never writing. */
               ok("concurrent_setup",
-                 (conc_blocks_max > 0) && (conc_werr == 0) && (conc_punches == CONC_PUNCHES),
-                 "%d threads, %lu of %d punches, %lu touches, %lu page writes through the fd"
-                 " (%lu errors), file held up to %ld blocks during the race",
-                 started, conc_punches, CONC_PUNCHES, conc_touches, conc_writes, conc_werr,
-                 conc_blocks_max);
+                 (conc_blocks_max > 0) && (conc_werr == 0) && (conc_punched() == CONC_PUNCHES),
+                 "%d threads (%d of them punching), %lu of %d punches, %lu touches, %lu page"
+                 " writes through the fd (%lu errors), file held up to %ld blocks during the race",
+                 started, CONC_PUNCHERS, conc_punched(), CONC_PUNCHES, conc_touches, conc_writes,
+                 conc_werr, conc_blocks_max);
 
               /* Nothing is racing any more: every page must read the same through both mappings,
                  and be either its own marker or a hole. */
