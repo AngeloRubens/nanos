@@ -1920,7 +1920,14 @@ static int pagecache_node_collect_maps(pagecache_node pn, range q /* node offset
         range nr = irangel(pcm->node_offset, range_span(n->r));
         range ri = range_intersection(q, nr);
         *cursor = n->r.end;
-        if (range_span(ri) != 0) {
+        /* Only the shared mappings. Unmapping a private one would take from the process the
+           copy it made of a page, which the unmapping frees as a page of its own
+           (pagecache_node_unmap_pages_complete) because the entry no longer refers to the
+           file's page at all -- and a hole punched in a file is not the end of a mapping of
+           it. A page such a mapping has only read is a different matter: it is the file's own
+           page, and the reference the mapping holds on it keeps it from being freed below, so
+           it is zeroed where it is and reads back as the hole it has become. */
+        if (pcm->shared && (range_span(ri) != 0)) {
             maps[count].v = irangel(n->r.start + (ri.start - pcm->node_offset), range_span(ri));
             maps[count].node_offset = ri.start;
             count++;
