@@ -745,6 +745,25 @@ jobs:
              have one without the other: punches that overlap each other, and write-back putting
              a range back in the file's map while a punch is taking it out. */
           static int conc_punchers = CONC_PUNCHERS, conc_writers = 1;
+          /* And two ways of moving the write-back relative to the punch. Serialising puts every
+             write and the flush that follows it strictly outside any punch, so nothing of the
+             write-back can still be in flight when a hole is punched. Dropping the flush does
+             the opposite: the pages are left dirty for the page cache to commit whenever it
+             likes, so what reaches the filesystem does so entirely on its own schedule. */
+          static int conc_serialize = 0, conc_fsync = 1;
+          static pthread_mutex_t conc_gate = PTHREAD_MUTEX_INITIALIZER;
+
+          static void conc_gate_lock(void)
+          {
+              if (conc_serialize)
+                  pthread_mutex_lock(&conc_gate);
+          }
+
+          static void conc_gate_unlock(void)
+          {
+              if (conc_serialize)
+                  pthread_mutex_unlock(&conc_gate);
+          }
           static volatile unsigned long conc_bad, conc_touches;
           static volatile unsigned long conc_writes, conc_werr;
           static volatile long conc_blocks_max;
@@ -837,13 +856,15 @@ jobs:
                   unsigned long n = 1 + (conc_rand(&seed) % 64);
                   if (pi + n > conc_pages)
                       n = conc_pages - pi;
+                  conc_gate_lock();
                   for (unsigned long i = 0; i < n; i++) {
                       unsigned char v = marker_of(pi + i);
                       if (pwrite(fd, &v, 1, (off_t)((pi + i) * conc_ps)) != 1)
                           conc_werr++;
                   }
-                  if (fsync(fd) != 0)
+                  if (conc_fsync && (fsync(fd) != 0))
                       conc_werr++;
+                  conc_gate_unlock();
                   conc_writes += n;
                   struct stat st;
                   /* Sampled during the race: if the file never accounts for a block, the range
@@ -893,8 +914,10 @@ jobs:
                   /* deliberately unaligned: the edges have to be zeroed rather than freed */
                   conc_since[id] = secs;
                   conc_inpunch[id] = i + 1;
+                  conc_gate_lock();
                   int rv = fallocate(conc_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                                      (long)off, (long)len);
+                  conc_gate_unlock();
                   conc_inpunch[id] = 0;
                   if (rv == 0)
                       conc_done[id]++;
@@ -956,7 +979,7 @@ jobs:
                  errors are here because a write that silently failed would empty it just as
                  effectively as never writing. */
               ok("concurrent_setup",
-                 (!conc_writers || (conc_blocks_max > 0)) && (conc_werr == 0) &&
+                 (!conc_writers || !conc_fsync || (conc_blocks_max > 0)) && (conc_werr == 0) &&
                  (conc_punched() == CONC_PUNCHES),
                  "%d threads (%d of them punching), %lu of %d punches, %lu touches, %lu page"
                  " writes through the fd (%lu errors), file held up to %ld blocks during the race",
@@ -1489,10 +1512,15 @@ jobs:
                       conc_punchers = atoi(argv[2]);
                   if (argc > 3)
                       conc_writers = atoi(argv[3]);
+                  if (argc > 4)
+                      conc_serialize = atoi(argv[4]);
+                  if (argc > 5)
+                      conc_fsync = atoi(argv[5]);
                   if ((conc_punchers < 1) || (conc_punchers > CONC_PUNCHERS))
                       conc_punchers = CONC_PUNCHERS;
-                  printf("PROBE conc_config           PASS %d puncher(s), %d writer(s)\n",
-                         conc_punchers, conc_writers);
+                  printf("PROBE conc_config           PASS %d puncher(s), %d writer(s),"
+                         " serialised=%d, flushing=%d\n",
+                         conc_punchers, conc_writers, conc_serialize, conc_fsync);
                   fflush(stdout);
                   concurrent_test();
                   printf("PROBE DONE\n");
@@ -2037,6 +2065,26 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          # And two that move the write-back rather than remove it, both with the single
+          # puncher that is already known to be enough. Serialised: every write and its flush
+          # happen strictly outside any punch, so nothing of a write-back can still be in
+          # flight when a hole is punched -- if that is what the stop needs, this is the cut
+          # that runs clean. Unflushed: the pages are left for the page cache to commit when
+          # it likes, which is the same window opened as wide as it goes.
+          cat > probe-raceser.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent", "1", "1", "1", "1"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
+          cat > probe-racenofs.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent", "1", "1", "0", "0"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
 
           # The race is the one variant that has ever stopped a guest, and it did not stop the
           # next one: that makes it a frequency, not a fact, and a single run that finishes says
@@ -2054,7 +2102,7 @@ jobs:
 
           # And the same number of rounds of each cut, since one round proves nothing about a
           # fault that shows up in one run out of ten.
-          for v in race1p racenw race1pnw; do
+          for v in race1p racenw race1pnw raceser racenofs; do
             for i in $(seq 1 10); do
               t0=$SECONDS
               timeout 90 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
@@ -2280,12 +2328,14 @@ jobs:
             echo "| race | rounds | finished | faulted |"
             echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for v in race race1p racenw race1pnw; do
+          for v in race race1p racenw race1pnw raceser racenofs; do
             case "$v" in
               race)     files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
               race1p)   files="probe-race1p-*.log";   what="one puncher, writer" ;;
               racenw)   files="probe-racenw-*.log";   what="two punchers, no writer" ;;
               race1pnw) files="probe-race1pnw-*.log"; what="one puncher, no writer" ;;
+              raceser)  files="probe-raceser-*.log";  what="one puncher, writer, serialised" ;;
+              racenofs) files="probe-racenofs-*.log"; what="one puncher, writer, no flush" ;;
             esac
             n=0; ok=0; flt=0
             for f in $files; do
