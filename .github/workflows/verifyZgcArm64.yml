@@ -1756,8 +1756,11 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
+          # Short, because the two ways this ends are both quick: the race takes a couple of
+          # seconds, and a guest that faults stops saying anything at all -- waiting out a long
+          # timeout after that only spends the job's time.
           t0=$SECONDS
-          timeout 240 ops run ./zgcprobe --nightly -c probe-before.json 2>&1 \
+          timeout 120 ops run ./zgcprobe --nightly -c probe-before.json 2>&1 \
             | strip_ansi | tee probe-before.log || true
           echo "TIMING before $((SECONDS - t0))s" | tee -a probe-timing.log
           if grep -q '^PROBE DONE' probe-before.log; then
@@ -1907,6 +1910,10 @@ jobs:
               sleep 2
               now=$(wc -c < race-hang.serial)
               if grep -q '^PROBE DONE' race-hang.serial; then break; fi
+              # A fault is worth stopping for too: nanos prints the faulting instruction and
+              # its registers, but its own frame trace came out empty on the one this race
+              # has already produced, and the stub can walk the stack when it cannot.
+              if grep -q 'no fault handler' race-hang.serial; then break; fi
               if [ "$now" = "$last" ]; then stalls=$((stalls + 1)); else stalls=0; fi
               last=$now
               # The whole race takes about a second of guest time, so nothing new for twenty
