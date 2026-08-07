@@ -25,6 +25,10 @@ name: ZGC on nanos — GC matrix + backing-store probe (arm64 + x86_64)
 #                            JRE ships. G1/Serial/Parallel are the control and
 #                            are gated; ZGC runs twice, without the klib (must
 #                            fail on the backing file) and with it (must start).
+#                            On both architectures: the stress test only ever
+#                            stops the guest on x86_64, and whether a real
+#                            collector reaches that at all is a question about
+#                            the collector, which is what this job runs.
 #   * job "backing-store"  - a C probe running INSIDE nanos that exercises the
 #                            exact primitives ZGC's backing store is built from
 #                            (memfd, statfs magic, huge PROT_NONE reservation,
@@ -71,9 +75,6 @@ on:
       - '.github/workflows/verifyZgcArm64.yml'
   workflow_dispatch:
     inputs:
-      jre_package:
-        description: "HotSpot JRE ops package"
-        default: "AngeloRubens/TemurinJREarm64Linux:25.0.1"
       zgc_expect:
         description: "gate ZGC-with-klib (default) or only measure it"
         default: "must-start"
@@ -81,7 +82,6 @@ on:
         options: [must-start, report]
 
 env:
-  JRE_PACKAGE: ${{ inputs.jre_package || 'AngeloRubens/TemurinJREarm64Linux:25.0.1' }}
   ZGC_EXPECT: ${{ inputs.zgc_expect || 'must-start' }}
 
 jobs:
@@ -91,7 +91,25 @@ jobs:
   # "the GC completed a real collection", not merely "the VM initialized".
   # ====================================================================
   gc-matrix:
-    runs-on: ubuntu-24.04-arm
+    # On both architectures, because the answer that decides whether the punch is a problem
+    # for ZGC is about ZGC and not about a stress test: the race only ever stops the guest on
+    # x86_64, and until now the only job that runs a real collector ran on arm64 alone.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+            ops_arch: arm64
+            package: "AngeloRubens/TemurinJREarm64Linux:25.0.1"
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+            ops_arch: amd64
+            package: "AngeloRubens/AzulJREx64Linux:25.0.1"
+    name: gc-matrix (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout (this ref = the kernel under test)
         uses: actions/checkout@v4
@@ -103,7 +121,7 @@ jobs:
           # to satisfy that check; qemu-system-arm/aarch64 actually boot the
           # arm64 guest. Mirrors the known-good verifyCpuinfoArm64 job.
           sudo apt-get update
-          sudo apt-get install -y build-essential binutils wget git python3 \
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
             qemu-system qemu-user qemu-user-static qemu-system-arm \
             qemu-system-aarch64 binfmt-support qemu-utils
           which qemu-system-x86_64 qemu-system-aarch64
@@ -213,13 +231,14 @@ jobs:
 
       - name: Build kernel from this ref
         run: |
-          make -j"$(nproc)" kernel PLATFORM=virt
-          cp "$(find output/platform/virt -name kernel.img | head -1)" /tmp/kernel-candidate.img
+          make -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
+          cp "$(find output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
+            /tmp/kernel-candidate.img
           ls -l /tmp/kernel-candidate.img
 
       - name: Prime ops nightly cache and swap in our kernel
         run: |
-          ops pkg get "${JRE_PACKAGE}" --arch arm64 --nightly || true
+          ops pkg get "${{ matrix.package }}" --arch ${{ matrix.ops_arch }} --nightly || true
           OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
           [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
           echo "ops kernel slot: $OPSK"
@@ -281,7 +300,7 @@ jobs:
           }
           EOF
             echo "=== ${label} (-XX:+${flag}) ==="
-            timeout 600 ops pkg load "${JRE_PACKAGE}" --arch arm64 --nightly \
+            timeout 600 ops pkg load "${{ matrix.package }}" --arch ${{ matrix.ops_arch }} --nightly \
               --show-debug --verbose -c "cfg-${label}.json" 2>&1 \
               | strip_ansi | tee "gc-${label}.log" || true
           done
@@ -406,7 +425,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gc-matrix-logs
+          name: gc-matrix-logs-${{ matrix.arch }}
           path: |
             GcChurn.java
             gc-*.log
