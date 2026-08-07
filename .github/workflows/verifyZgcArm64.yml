@@ -1,4 +1,4 @@
-name: ZGC on nanos — GC matrix + backing-store probe (arm64)
+name: ZGC on nanos — GC matrix + backing-store probe (arm64 + x86_64)
 
 # ZGC is the one GC that does not start in a stock nanos image: it needs a
 # shared memory FILE to back the heap, and asks for one via memfd_create(2),
@@ -49,6 +49,17 @@ name: ZGC on nanos — GC matrix + backing-store probe (arm64)
 #
 # TCG on the free hosted arm64 runner is enough — nothing here needs KVM.
 # (GitHub-hosted arm64 runners do NOT expose /dev/kvm.)
+#
+# The backing-store job runs on BOTH architectures, and the second one is not a
+# formality. nanos only sees a mapping's pages as dirty on x86_64 -- aarch64's
+# pte_is_dirty() is a stub (src/aarch64/page_machine.h) while x86_64 reads the
+# hardware bit (src/x86_64/page_machine.h) -- so there, and only there, a page
+# written through a mapping is written back on its own: tmpfsfile_write() is
+# called from under the page cache node's spin lock and asks for the
+# filesystem's mutex, which is the half of the lock cycle this change had to
+# close from the other side. On aarch64 that path opens only because the probe
+# writes through the fd on purpose; on x86_64 it opens by itself, and the
+# uncommit had never run there.
 
 on:
   push:
@@ -411,7 +422,26 @@ jobs:
   # patch is small or structural.
   # ====================================================================
   backing-store:
-    runs-on: ubuntu-24.04-arm
+    # Both architectures run the same probe against the same change. The package
+    # is only there to make ops populate its nightly kernel slot, which is then
+    # overwritten with the kernel built here, so any package of the right
+    # architecture would do.
+    strategy:
+      fail-fast: false      # one architecture failing must not hide the other
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+            ops_arch: arm64
+            package: "AngeloRubens/TemurinJREarm64Linux:25.0.1"
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+            ops_arch: amd64
+            package: "AngeloRubens/AzulJREx64Linux:25.0.1"
+    name: backing-store (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout (this ref = the kernel under test)
         uses: actions/checkout@v4
@@ -419,7 +449,9 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential binutils wget git python3 \
+          # nasm is the pc platform's assembler (rules.mk: AS = nasm), so the
+          # x86_64 kernel does not build without it.
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
             qemu-system qemu-user qemu-user-static qemu-system-arm \
             qemu-system-aarch64 binfmt-support qemu-utils
           which qemu-system-x86_64 qemu-system-aarch64
@@ -1361,14 +1393,15 @@ jobs:
 
       - name: Build kernel from this ref
         run: |
-          make -j"$(nproc)" kernel PLATFORM=virt
-          cp "$(find output/platform/virt -name kernel.img | head -1)" /tmp/kernel-candidate.img
+          make -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
+          cp "$(find output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
+            /tmp/kernel-candidate.img
 
       - name: Prime ops nightly cache and swap in our kernel
         run: |
           # ops needs a package pulled once to populate the nightly kernel slot;
           # any package works, the JRE one is already cached across these jobs.
-          ops pkg get "${JRE_PACKAGE}" --arch arm64 --nightly || true
+          ops pkg get "${{ matrix.package }}" --arch ${{ matrix.ops_arch }} --nightly || true
           OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
           [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
           cp /tmp/kernel-candidate.img "$OPSK"
@@ -1637,7 +1670,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zgc-backing-store-probe
+          name: zgc-backing-store-probe-${{ matrix.arch }}
           path: |
             zgcprobe.c
             probe-*.log
