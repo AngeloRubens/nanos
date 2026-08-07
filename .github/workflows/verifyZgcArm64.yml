@@ -1912,7 +1912,20 @@ jobs:
           done
           echo "${label}: it finished in all ${attempts} attempts under the gdb stub"
           EOF
-          chmod +x swap-kernel.sh catch-stop.sh
+          # `timeout` kills ops, not the qemu ops started underneath it, and an orphan keeps the
+          # write lock on the image: every run after it fails in a second with "Failed to get
+          # write lock", which in a log looks exactly like a round that stopped. One run that
+          # overran its timeout poisoned all sixty rounds after it this way.
+          cat > reap-qemu.sh <<'EOF'
+          #!/bin/bash
+          if pkill -f qemu-system >/dev/null 2>&1; then
+            sleep 1
+            pkill -9 -f qemu-system >/dev/null 2>&1 || true
+            echo "(reaped a qemu that outlived its ops)"
+          fi
+          exit 0
+          EOF
+          chmod +x swap-kernel.sh catch-stop.sh reap-qemu.sh
 
       - name: Prime ops nightly cache
         run: |
@@ -1945,6 +1958,7 @@ jobs:
           t0=$SECONDS
           timeout 120 ops run ./zgcprobe --nightly -c probe-before.json 2>&1 \
             | strip_ansi | tee probe-before.log || true
+          ./reap-qemu.sh
           echo "TIMING before $((SECONDS - t0))s" | tee -a probe-timing.log
           if grep -q '^PROBE DONE' probe-before.log; then
             echo "the race runs to the end without this change"
@@ -2036,6 +2050,7 @@ jobs:
               timeout 420 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
                 | strip_ansi | tee "probe-${v}.log" || true
             fi
+            ./reap-qemu.sh
             echo "TIMING ${v} $((SECONDS - t0))s" | tee -a probe-timing.log
           done
 
@@ -2097,6 +2112,7 @@ jobs:
             t0=$SECONDS
             timeout 90 ops run ./zgcprobe --nightly -c probe-concurrent.json 2>&1 \
               | strip_ansi | tee "probe-race-${i}.log" || true
+            ./reap-qemu.sh
             echo "TIMING race-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
           done
 
@@ -2107,6 +2123,7 @@ jobs:
               t0=$SECONDS
               timeout 90 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
                 | strip_ansi | tee "probe-${v}-${i}.log" || true
+              ./reap-qemu.sh
               echo "TIMING ${v}-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
             done
           done
@@ -2127,6 +2144,7 @@ jobs:
           # the one measured above, so the rate at which it stops need not be the same.
           ./swap-kernel.sh /tmp/kernel-diag.img /tmp/diag/output
           timeout 90 ops run ./zgcprobe --nightly -c probe-concurrent.json > /dev/null 2>&1 || true
+          ./reap-qemu.sh
           ./catch-stop.sh race "${DIAG_ELF}" 6
 
       - name: Report the stock-vs-klib capability matrix
@@ -2302,9 +2320,17 @@ jobs:
           done
           # And every repetition of it, counted: one round that finishes is not evidence about
           # a stop that happens some of the time.
-          rounds=0; finished=0
+          # A round that never started is not a round that stopped: ops fails in a second when
+          # something else still holds the image, and counting that as a failure is how a
+          # measurement comes out saying the opposite of what happened.
+          ran() { grep -q '^PROBE ' "$1" && ! grep -q 'Failed to get' "$1"; }
+          rounds=0; finished=0; never=0
           for f in probe-concurrent.log probe-race-*.log; do
             [ -f "$f" ] || continue
+            if ! ran "$f"; then
+              never=$((never + 1))
+              continue
+            fi
             rounds=$((rounds + 1))
             if grep -q '^PROBE DONE' "$f" &&
                grep -q '^PROBE concurrent_no_corruption *PASS' "$f"; then
@@ -2315,7 +2341,11 @@ jobs:
               fail=1
             fi
           done
-          echo "race: ${finished} of ${rounds} rounds finished"
+          if [ "$never" -gt 0 ]; then
+            echo "::error::${never} rounds never started — the guest could not be booted, so nothing here was measured"
+            fail=1
+          fi
+          echo "race: ${finished} of ${rounds} rounds finished (${never} never started)"
           printf '\n**The race was run %d times, and %d of them finished.**\n' \
             "$rounds" "$finished" >> "$GITHUB_STEP_SUMMARY"
 
@@ -2325,8 +2355,8 @@ jobs:
             echo ""
             echo "### Which of the two the fault needs"
             echo ""
-            echo "| race | rounds | finished | faulted |"
-            echo "|---|---|---|---|"
+            echo "| race | rounds that ran | finished | faulted | never started |"
+            echo "|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for v in race race1p racenw race1pnw raceser racenofs; do
             case "$v" in
@@ -2337,15 +2367,19 @@ jobs:
               raceser)  files="probe-raceser-*.log";  what="one puncher, writer, serialised" ;;
               racenofs) files="probe-racenofs-*.log"; what="one puncher, writer, no flush" ;;
             esac
-            n=0; ok=0; flt=0
+            n=0; ok=0; flt=0; nr=0
             for f in $files; do
               [ -f "$f" ] || continue
+              if ! ran "$f"; then
+                nr=$((nr + 1))
+                continue
+              fi
               n=$((n + 1))
               grep -q '^PROBE DONE' "$f" && ok=$((ok + 1))
               grep -q 'no fault handler' "$f" && flt=$((flt + 1))
             done
-            echo "${what}: ${ok} of ${n} finished, ${flt} faulted"
-            echo "| ${what} | ${n} | ${ok} | ${flt} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "${what}: ${ok} of ${n} that ran finished, ${flt} faulted, ${nr} never started"
+            echo "| ${what} | ${n} | ${ok} | ${flt} | ${nr} |" >> "$GITHUB_STEP_SUMMARY"
           done
           if grep -q '^PROBE cycles_reclaim *PASS' probe-cycles.log; then
             echo "PASS: cycles_reclaim"
