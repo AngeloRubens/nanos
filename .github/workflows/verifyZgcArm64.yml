@@ -468,6 +468,7 @@ jobs:
           #include <pthread.h>
           #include <stdarg.h>
           #include <stdio.h>
+          #include <stdlib.h>
           #include <string.h>
           #include <time.h>
           #include <unistd.h>
@@ -732,7 +733,7 @@ jobs:
              on purpose: a wider marker could be caught half-zeroed by a racing punch. */
           #define CONC_LEN      (16 * MB)
           #define CONC_TOUCHERS 3
-          #define CONC_PUNCHERS 2
+          #define CONC_PUNCHERS 2       /* the most there can be; how many there are is an argument */
           #define CONC_PUNCHES  150
           #define CONC_SECONDS  120       /* well inside the step's own timeout */
 
@@ -740,6 +741,10 @@ jobs:
           static int conc_fd;
           static unsigned long conc_ps, conc_pages;
           static volatile int conc_stop, conc_punchers_left;
+          /* Which of the two things that could leave a pin behind is present, so that a run can
+             have one without the other: punches that overlap each other, and write-back putting
+             a range back in the file's map while a punch is taking it out. */
+          static int conc_punchers = CONC_PUNCHERS, conc_writers = 1;
           static volatile unsigned long conc_bad, conc_touches;
           static volatile unsigned long conc_writes, conc_werr;
           static volatile long conc_blocks_max;
@@ -755,7 +760,7 @@ jobs:
           static unsigned long conc_punched(void)
           {
               unsigned long n = 0;
-              for (int i = 0; i < CONC_PUNCHERS; i++)
+              for (int i = 0; i < conc_punchers; i++)
                   n += conc_done[i];
               return n;
           }
@@ -776,7 +781,7 @@ jobs:
                   long secs = (long)(time(0) - start);
                   printf("RACE alive %lds: %lu punches, %lu touches, %lu writes (%lu errors)",
                          secs, conc_punched(), conc_touches, conc_writes, conc_werr);
-                  for (int i = 0; i < CONC_PUNCHERS; i++) {
+                  for (int i = 0; i < conc_punchers; i++) {
                       if (conc_inpunch[i])
                           printf(", t%d inside punch %lu for %lds", i, conc_inpunch[i] - 1,
                                  secs - conc_since[i]);
@@ -866,7 +871,8 @@ jobs:
               long id = (long)arg;
               unsigned long seed = 4919 + (unsigned long)id * 7717;
               time_t start = time(0);
-              for (unsigned long i = 0; i < CONC_PUNCHES / CONC_PUNCHERS; i++) {
+              unsigned long rounds = CONC_PUNCHES / (unsigned)conc_punchers;
+              for (unsigned long i = 0; i < rounds; i++) {
                   unsigned long off = conc_rand(&seed) % (CONC_LEN - conc_ps);
                   unsigned long len = conc_ps + (conc_rand(&seed) % (CONC_LEN / 4));
                   if (off + len > CONC_LEN)
@@ -915,7 +921,7 @@ jobs:
                   return;
               }
               conc_fd = (int)fd;
-              conc_punchers_left = CONC_PUNCHERS;
+              conc_punchers_left = conc_punchers;
               pthread_t t[CONC_TOUCHERS + 2 + CONC_PUNCHERS];
               int started = 0, touchers = 0, failed;
               /* First, so that it is already beating if anything below gets stuck. */
@@ -927,13 +933,13 @@ jobs:
                       touchers++;
                   }
               failed = (touchers == 0);
-              if (!failed) {
+              if (!failed && conc_writers) {
                   if (pthread_create(&t[started], 0, conc_writer, (void *)fd) == 0)
                       started++;
                   else
                       failed = 1;
               }
-              for (long i = 0; !failed && (i < CONC_PUNCHERS); i++) {
+              for (long i = 0; !failed && (i < conc_punchers); i++) {
                   if (pthread_create(&t[started], 0, conc_puncher, (void *)i) == 0)
                       started++;
                   else
@@ -950,10 +956,11 @@ jobs:
                  errors are here because a write that silently failed would empty it just as
                  effectively as never writing. */
               ok("concurrent_setup",
-                 (conc_blocks_max > 0) && (conc_werr == 0) && (conc_punched() == CONC_PUNCHES),
+                 (!conc_writers || (conc_blocks_max > 0)) && (conc_werr == 0) &&
+                 (conc_punched() == CONC_PUNCHES),
                  "%d threads (%d of them punching), %lu of %d punches, %lu touches, %lu page"
                  " writes through the fd (%lu errors), file held up to %ld blocks during the race",
-                 started, CONC_PUNCHERS, conc_punched(), CONC_PUNCHES, conc_touches, conc_writes,
+                 started, conc_punchers, conc_punched(), CONC_PUNCHES, conc_touches, conc_writes,
                  conc_werr, conc_blocks_max);
 
               /* Nothing is racing any more: every page must read the same through both mappings,
@@ -1474,6 +1481,19 @@ jobs:
                      sysconf(_SC_NPROCESSORS_ONLN));
               fflush(stdout);
               if ((argc > 1) && !strcmp(argv[1], "concurrent")) {
+                  /* "concurrent [punchers] [writers]": with one puncher no two punches can
+                     overlap, and with no writer nothing puts a range back in the file's map
+                     while a punch is taking it out. A fault that survives either of those has
+                     been told where it does not come from. */
+                  if (argc > 2)
+                      conc_punchers = atoi(argv[2]);
+                  if (argc > 3)
+                      conc_writers = atoi(argv[3]);
+                  if ((conc_punchers < 1) || (conc_punchers > CONC_PUNCHERS))
+                      conc_punchers = CONC_PUNCHERS;
+                  printf("PROBE conc_config           PASS %d puncher(s), %d writer(s)\n",
+                         conc_punchers, conc_writers);
+                  fflush(stdout);
                   concurrent_test();
                   printf("PROBE DONE\n");
                   fflush(stdout);
@@ -1991,6 +2011,25 @@ jobs:
             echo "TIMING ${v} $((SECONDS - t0))s" | tee -a probe-timing.log
           done
 
+          # Two cuts of the same race, each missing one of the two things that could leave a
+          # pin behind: one puncher, so no two punches can overlap; and no writer, so nothing
+          # puts a range back in the file's map while a punch takes it out. Whichever of them
+          # still faults is not the one to blame.
+          cat > probe-race1p.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent", "1", "1"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
+          cat > probe-racenw.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent", "2", "0"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
+
           # The race is the one variant that has ever stopped a guest, and it did not stop the
           # next one: that makes it a frequency, not a fact, and a single run that finishes says
           # nothing about how often one does not. A boot of it costs a couple of seconds, so it
@@ -2003,6 +2042,17 @@ jobs:
             timeout 90 ops run ./zgcprobe --nightly -c probe-concurrent.json 2>&1 \
               | strip_ansi | tee "probe-race-${i}.log" || true
             echo "TIMING race-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
+          done
+
+          # And the same number of rounds of each cut, since one round proves nothing about a
+          # fault that shows up in one run out of ten.
+          for v in race1p racenw; do
+            for i in $(seq 1 10); do
+              t0=$SECONDS
+              timeout 90 ops run ./zgcprobe --nightly -c "probe-${v}.json" 2>&1 \
+                | strip_ansi | tee "probe-${v}-${i}.log" || true
+              echo "TIMING ${v}-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
+            done
           done
 
       # A guest that has stopped cannot be asked anything from inside it: the watchdog thread
@@ -2212,6 +2262,32 @@ jobs:
           echo "race: ${finished} of ${rounds} rounds finished"
           printf '\n**The race was run %d times, and %d of them finished.**\n' \
             "$rounds" "$finished" >> "$GITHUB_STEP_SUMMARY"
+
+          # Which of the two things the fault needs. Reported and never gated: these are cuts of
+          # the race made to be compared with the full one, not claims about the change.
+          {
+            echo ""
+            echo "### Which of the two the fault needs"
+            echo ""
+            echo "| race | rounds | finished | faulted |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for v in race race1p racenw; do
+            case "$v" in
+              race)   files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
+              race1p) files="probe-race1p-*.log";  what="one puncher, writer" ;;
+              racenw) files="probe-racenw-*.log";  what="two punchers, no writer" ;;
+            esac
+            n=0; ok=0; flt=0
+            for f in $files; do
+              [ -f "$f" ] || continue
+              n=$((n + 1))
+              grep -q '^PROBE DONE' "$f" && ok=$((ok + 1))
+              grep -q 'no fault handler' "$f" && flt=$((flt + 1))
+            done
+            echo "${what}: ${ok} of ${n} finished, ${flt} faulted"
+            echo "| ${what} | ${n} | ${ok} | ${flt} |" >> "$GITHUB_STEP_SUMMARY"
+          done
           if grep -q '^PROBE cycles_reclaim *PASS' probe-cycles.log; then
             echo "PASS: cycles_reclaim"
           else
