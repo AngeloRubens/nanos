@@ -1743,8 +1743,10 @@ jobs:
       # lock order, not where the kernel happens to sit.
       - name: Build the kernel upstream is at, to run the "before" against
         run: |
-          git fetch --depth 1 https://github.com/nanovms/nanos.git master
-          git worktree add /tmp/base FETCH_HEAD
+          # A clone rather than a worktree of this one: gitversion.c is made from
+          # $(ROOTDIR)/.git/index and .git/HEAD (kernel.mk:117), and a linked worktree has
+          # neither -- its .git is a file, so make has a prerequisite it cannot build.
+          git clone --depth 1 --branch master https://github.com/nanovms/nanos.git /tmp/base
           CFLAGS=-DNO_KASLR make -C /tmp/base -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
           cp "$(find /tmp/base/output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
             /tmp/kernel-baseline.img
@@ -1761,7 +1763,12 @@ jobs:
       - name: Build a kernel that stays where it was linked, for the catcher
         if: matrix.arch == 'x64'
         run: |
-          git worktree add /tmp/diag HEAD
+          # A copy of this checkout, for the same reason the baseline is a clone: a worktree
+          # has no .git/index for gitversion.c to be made from. The objects already built here
+          # are left out of it, because a build does not rebuild them for a changed flag and
+          # this one is only worth having if the flag took.
+          cp -a "$GITHUB_WORKSPACE" /tmp/diag
+          rm -rf /tmp/diag/output
           CFLAGS=-DNO_KASLR make -C /tmp/diag -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
           echo "DIAG_ELF=$(find /tmp/diag/output -name kernel.elf | head -1)" >> "$GITHUB_ENV"
           cp "$(find /tmp/diag/output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
