@@ -1731,15 +1731,46 @@ jobs:
           cp "$(find output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
             /tmp/kernel-candidate.img
 
-      - name: Prime ops nightly cache and swap in our kernel
+      - name: Prime ops nightly cache
         run: |
           # ops needs a package pulled once to populate the nightly kernel slot;
           # any package works, the JRE one is already cached across these jobs.
           ops pkg get "${{ matrix.package }}" --arch ${{ matrix.ops_arch }} --nightly || true
           OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
           [ -n "$OPSK" ] || { echo "::error::could not locate ops nightly kernel.img"; exit 1; }
-          cp /tmp/kernel-candidate.img "$OPSK"
           echo "OPSK=$OPSK" >> "$GITHUB_ENV"
+
+      # The kernel and the klibs of this ref are not in place yet, so this runs against
+      # upstream's own nightly: the punch has no dealloc method there and keeps the old
+      # behaviour of zeroing the pages where they are. It is here to answer one question --
+      # whether the race stops the guest without this change as well -- and it is reported,
+      # never gated, since the checks it prints are the ones this change exists to flip.
+      - name: Run the race on the unpatched nightly kernel (the "before")
+        run: |
+          set -o pipefail
+          strip_ansi() { sed -u 's/\x1b\[[0-9;]*m//g'; }
+          cat > probe-before.json <<'EOF'
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["concurrent"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
+          t0=$SECONDS
+          timeout 240 ops run ./zgcprobe --nightly -c probe-before.json 2>&1 \
+            | strip_ansi | tee probe-before.log || true
+          echo "TIMING before $((SECONDS - t0))s" | tee -a probe-timing.log
+          if grep -q '^PROBE DONE' probe-before.log; then
+            echo "the race runs to the end on the unpatched kernel"
+          else
+            echo "::warning::the race does not finish on the unpatched kernel either, so it is not this change that stops it"
+          fi
+          tail -3 probe-before.log
+
+      - name: Swap in the kernel and the klibs built here
+        run: |
+          OPSK="${OPSK:?}"
+          cp /tmp/kernel-candidate.img "$OPSK"
           # Same reason as in the gc-matrix job: the klibs must come from this
           # ref, not from the ones ops ships prebuilt.
           KLIBDIR="$(dirname "$OPSK")/klibs"
@@ -1864,6 +1895,16 @@ jobs:
             grep -E '^(CYCLE|PROBE cycles)' probe-cycles.log 2>/dev/null || echo "(no output)"
             echo '```'
             echo ""
+            echo "### The same race on the unpatched nightly kernel"
+            echo ""
+            echo "Run before the kernel and the klibs of this ref are swapped in, so the punch there"
+            echo "still zeroes its pages in place. Its checks are expected to fail — it is here to say"
+            echo "whether the race itself stops the guest without this change as well."
+            echo '```'
+            grep -E '^(PROBE (concurrent|DONE)|RACE alive)' probe-before.log 2>/dev/null | tail -6 \
+              || echo "(no output)"
+            echo '```'
+            echo ""
             echo "### What each variant cost"
             echo ""
             echo '```'
@@ -1915,6 +1956,21 @@ jobs:
             grep -q '^PROBE DONE' "probe-${v}.log" || {
               echo "::error::probe (${v}) did not reach the end — it crashed or never booted; see probe-${v}.log"; fail=1; }
           done
+
+          # A race that stopped has to say where. The watchdog beats once a second whatever the
+          # punchers are doing, so no beat at all means the guest itself is gone, while a beat
+          # that keeps coming while the touch count stands still means the threads faulting
+          # pages are blocked on something a punch is holding. The same race on the unpatched
+          # kernel is printed beside it, because a stop there is not this change's doing.
+          if ! grep -q '^PROBE DONE' probe-concurrent.log; then
+            echo "--- the last thing the race said ---"
+            grep -E '^RACE ' probe-concurrent.log | tail -8
+            echo "--- the same race, unpatched kernel ---"
+            grep -E '^(RACE alive|PROBE (concurrent|DONE))' probe-before.log 2>/dev/null | tail -4
+            grep -q '^PROBE DONE' probe-before.log 2>/dev/null \
+              && echo "note: it does finish without this change" \
+              || echo "note: it does not finish without this change either"
+          fi
           # Not in that list: the eviction question is reported rather than gated, and
           # its guest is the one most likely to die of the thing it is measuring -- it
           # holds the whole file while it squeezes, where the pressure run has already
