@@ -1489,7 +1489,8 @@ jobs:
               /* 4. A writable file to stand in for the memfd (the tmpfs fallback
                     ZGC would use). */
               const char *path = "/zgcprobe.dat";
-              const unsigned long flen = 8 * MB;
+              unsigned long flen = 8 * MB;
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
               int fd = (mfd >= 0) ? (int)mfd : open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
               ok("backing_file_open", fd >= 0, "%s fd=%d errno=%d (%s)",
                  (mfd >= 0) ? "via memfd" : path, fd, fd < 0 ? errno : 0,
@@ -1498,9 +1499,25 @@ jobs:
                   printf("PROBE DONE (no backing file — remaining checks skipped)\n");
                   return 0;
               }
+              /* Without memfd_create this is a file on the image's root filesystem, which is only
+                 as large as the image needed it to be: 8M does not fit, and the write that gives
+                 the punch something to free would stop at ENOSPC and take the measurement with
+                 it. Ask the filesystem what it has and take half, so that the column measures the
+                 absence of a dealloc method rather than the size of the disk. */
+              if (mfd < 0) {
+                  struct statfs rb;
+                  if ((statfs("/", &rb) == 0) && (rb.f_bavail > 0) && (rb.f_bsize > 0)) {
+                      unsigned long avail = (unsigned long)rb.f_bavail * (unsigned long)rb.f_bsize;
+                      if (avail / 2 < flen) {
+                          flen = (avail / 2) & ~(ps - 1);
+                          if (flen < 64 * 1024)
+                              flen = 64 * 1024;    /* too little to be worth adjusting for */
+                      }
+                  }
+              }
               int tr = ftruncate(fd, flen);
-              ok("ftruncate_8M", tr == 0, "rv=%d errno=%d (%s)", tr, tr ? errno : 0,
-                 tr ? strerror(errno) : "-");
+              ok("ftruncate_backing", tr == 0, "%luKB backing file: rv=%d errno=%d (%s)",
+                 flen / 1024, tr, tr ? errno : 0, tr ? strerror(errno) : "-");
 
               /* 5. THE decisive one: two MAP_SHARED mappings of the same file
                     offset must observe each other's writes. Without this a memfd
