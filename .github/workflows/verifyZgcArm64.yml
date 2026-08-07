@@ -1747,7 +1747,17 @@ jobs:
           # $(ROOTDIR)/.git/index and .git/HEAD (kernel.mk:117), and a linked worktree has
           # neither -- its .git is a file, so make has a prerequisite it cannot build.
           git clone --depth 1 --branch master https://github.com/nanovms/nanos.git /tmp/base
-          CFLAGS=-DNO_KASLR make -C /tmp/base -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
+          # The kernel image and nothing else. The top-level kernel target builds the boot
+          # loader first (Makefile:60), and the loader is not part of what is swapped -- ops
+          # supplies its own, only kernel.img is replaced -- while building the pc one from a
+          # clean tree fails on the runner over 32-bit warnings that GCC 11 here does not
+          # raise. The build under test still goes through the top-level target, so a loader
+          # that stops building for this branch would still be seen.
+          # The vendored trees have to be named by their full path: they are targets of the
+          # top-level makefile, whose own paths are absolute.
+          make -C /tmp/base -j"$(nproc)" contgen \
+            /tmp/base/vendor/acpica/.vendored /tmp/base/vendor/lwip/.vendored /tmp/base/vendor/mbedtls/.vendored
+          CFLAGS=-DNO_KASLR make -C /tmp/base/platform/${{ matrix.platform }} -j"$(nproc)" kernel
           cp "$(find /tmp/base/output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
             /tmp/kernel-baseline.img
           echo "BASE_ELF=$(find /tmp/base/output -name kernel.elf | head -1)" >> "$GITHUB_ENV"
@@ -1769,7 +1779,12 @@ jobs:
           # this one is only worth having if the flag took.
           cp -a "$GITHUB_WORKSPACE" /tmp/diag
           rm -rf /tmp/diag/output
-          CFLAGS=-DNO_KASLR make -C /tmp/diag -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
+          # The kernel image alone, for the same reason as the baseline above.
+          # The vendored trees have to be named by their full path: they are targets of the
+          # top-level makefile, whose own paths are absolute.
+          make -C /tmp/diag -j"$(nproc)" contgen \
+            /tmp/diag/vendor/acpica/.vendored /tmp/diag/vendor/lwip/.vendored /tmp/diag/vendor/mbedtls/.vendored
+          CFLAGS=-DNO_KASLR make -C /tmp/diag/platform/${{ matrix.platform }} -j"$(nproc)" kernel
           echo "DIAG_ELF=$(find /tmp/diag/output -name kernel.elf | head -1)" >> "$GITHUB_ENV"
           cp "$(find /tmp/diag/output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
             /tmp/kernel-diag.img
