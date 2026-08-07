@@ -1254,6 +1254,15 @@ jobs:
               for (unsigned long pi = half; pi < PRIV_PAGES; pi++)
                   priv[pi * ps] = 0x5e;
 
+              /* Whether those writes stayed private at all, asked before anything is punched: a
+                 mapping that does not copy on write puts them in the file's own pages, where the
+                 shared view sees them -- and then what the private view reads after the hole says
+                 nothing about the punch, because there was never a private copy to keep. */
+              unsigned long leaked = 0;
+              for (unsigned long pi = half; pi < PRIV_PAGES; pi++)
+                  if ((unsigned char)shared[pi * ps] == 0x5e)
+                      leaked++;
+
               struct stat before, after;
               fstat((int)fd, &before);
               int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, (long)len);
@@ -1284,11 +1293,15 @@ jobs:
                   else
                       (got == 0x5e) ? wrote_kept++ : other++;
               }
-              ok("punch_private_view", (read_zero == half) && (wrote_kept == half) && (other == 0),
+              ok("punch_private_view",
+                 (read_zero == half) && (wrote_kept == half) && (other == 0) && (leaked == 0),
                  "of the pages a private mapping held across the punch, %lu of %lu it had only"
                  " read came back as a hole and %lu of %lu it had written kept their copy"
-                 " (%lu did neither) -- which is what Linux reports",
-                 read_zero, half, wrote_kept, half, other);
+                 " (%lu did neither) -- which is what Linux reports; %lu of the %lu private"
+                 " writes were visible through the shared mapping before the punch, so the"
+                 " mapping %s copy on write",
+                 read_zero, half, wrote_kept, half, other, leaked, half,
+                 leaked ? "does not" : "does");
               munmap(shared, len);
               munmap(priv, len);
               close((int)fd);
