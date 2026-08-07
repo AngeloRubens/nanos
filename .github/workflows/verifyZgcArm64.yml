@@ -1037,6 +1037,221 @@ jobs:
               close((int)fd);
           }
 
+          /* A hole smaller than a page, which is the one shape of punch that can give nothing
+             back: the range contains no whole page, so there is nothing to unmap, nothing to
+             unpin and nothing to free -- only the bytes inside it have to become zeroes, while
+             the page keeps its place in the file and the file keeps its account of it. It is a
+             branch of its own in the punch, and the only one none of the checks above reach:
+             they all punch at least one whole page. */
+          static void punch_subpage_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              unsigned long len = 4 * ps;
+              long fd = syscall(SYS_memfd_create, "subpage", 0);
+              if (fd < 0) {
+                  skip("punch_subpage", "no memfd_create: errno=%d (%s)", errno, strerror(errno));
+                  skip("punch_subpage_blocks", "no memfd_create");
+                  return;
+              }
+              char *m = MAP_FAILED;
+              if (ftruncate((int)fd, len) == 0)
+                  m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+              if (m == MAP_FAILED) {
+                  ok("punch_subpage", 0, "setup failed errno=%d (%s)", errno, strerror(errno));
+                  skip("punch_subpage_blocks", "the file could not be set up");
+                  close((int)fd);
+                  return;
+              }
+              memset(m, 0x9c, len);
+              int wb = write_through_fd((int)fd, len, 0x9c);
+              struct stat before, after;
+              fstat((int)fd, &before);
+
+              /* Both ends inside page 1, so the hole crosses no page boundary at all. */
+              unsigned long hs = ps + 100, he = ps + 300;
+              int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                                 (long)hs, (long)(he - hs));
+              fstat((int)fd, &after);
+              int inside_zero = ((unsigned char)m[hs] == 0) && ((unsigned char)m[he - 1] == 0);
+              int outside_intact = ((unsigned char)m[hs - 1] == 0x9c) &&
+                                   ((unsigned char)m[he] == 0x9c) &&
+                                   ((unsigned char)m[0] == 0x9c) &&
+                                   ((unsigned char)m[len - 1] == 0x9c);
+              ok("punch_subpage", (pr == 0) && inside_zero && outside_intact,
+                 "rv=%d errno=%d hole=[%lu,%lu), both ends inside page 1: inside_zero=%d"
+                 " outside_intact=%d (m[hs-1]=0x%02x m[hs]=0x%02x m[he-1]=0x%02x m[he]=0x%02x)",
+                 pr, pr ? errno : 0, hs, he, inside_zero, outside_intact,
+                 (unsigned char)m[hs - 1], (unsigned char)m[hs],
+                 (unsigned char)m[he - 1], (unsigned char)m[he]);
+              /* And the file must still hold every page it held: one given back here would have
+                 thrown away the bytes around the hole. */
+              if (wb != 0)
+                  skip("punch_subpage_blocks", "the file could not be written through the fd: %s",
+                       strerror(wb));
+              else
+                  ok("punch_subpage_blocks",
+                     (before.st_blocks > 0) && (after.st_blocks == before.st_blocks),
+                     "st_blocks %ld -> %ld for a %lu-byte hole inside a single page",
+                     (long)before.st_blocks, (long)after.st_blocks, he - hs);
+              munmap(m, len);
+              close((int)fd);
+          }
+
+          /* More ranges in one hole than the punch takes out of the file's map in one pass. The
+             pins taken when a range was written back cannot be released while the filesystem's
+             mutex is held -- that is the lock cycle this change had to stay out of -- so the
+             ranges are collected under it in batches and their pins released after dropping it,
+             and the pass repeats for as long as it comes back full. Nothing reaches that second
+             pass unless one hole spans more than sixteen separate ranges, and that needs a file
+             written with gaps: the map only merges ranges that touch, so writing every other page
+             leaves each written page a range of its own. (The many-mappings check saturates a
+             batch of the same size elsewhere: the mappings of the node, not the ranges of the
+             file.) */
+          #define RANGES_PAGES 80         /* 40 written, 40 left as gaps -> 40 ranges */
+
+          static void punch_many_ranges_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              unsigned long len = RANGES_PAGES * ps;
+              long fd = syscall(SYS_memfd_create, "manyranges", 0);
+              if ((fd < 0) || (ftruncate((int)fd, len) != 0)) {
+                  skip("punch_many_ranges", "no memfd_create: errno=%d (%s)",
+                       errno, strerror(errno));
+                  return;
+              }
+              unsigned char v = 0xb4;
+              int wb = 0;
+              unsigned long written = 0;
+              for (unsigned long pi = 0; pi < RANGES_PAGES; pi += 2) {
+                  if (pwrite((int)fd, &v, 1, (off_t)(pi * ps)) != 1)
+                      wb = errno;
+                  else
+                      written++;
+              }
+              if ((wb == 0) && (fsync((int)fd) != 0))
+                  wb = errno;
+              struct stat before, after;
+              fstat((int)fd, &before);
+              long f0 = meminfo_free_kb();
+              int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, (long)len);
+              long f1 = meminfo_free_kb();
+              fstat((int)fd, &after);
+
+              unsigned long left = 0;
+              for (unsigned long pi = 0; pi < RANGES_PAGES; pi++) {
+                  char got;
+                  if ((pread((int)fd, &got, 1, (off_t)(pi * ps)) == 1) && (got != 0))
+                      left++;
+              }
+              /* st_blocks counts the pages the map holds, so before the punch it has to be the
+                 written pages and no more: were the map holding one range over the whole file
+                 instead of one per written page, it would report every page, and the hole would
+                 never have spanned more than a single batch whatever else passed. */
+              long accounted = (long)(before.st_blocks * 512 / (long)ps);
+              if (wb != 0)
+                  skip("punch_many_ranges", "the file could not be written through the fd: %s",
+                       strerror(wb));
+              else
+                  ok("punch_many_ranges",
+                     (pr == 0) && (left == 0) && (after.st_blocks == 0) &&
+                     (accounted == (long)written) && (written > 16),
+                     "%lu pages written one range apart (the file accounted for %ld pages, and the"
+                     " punch takes 16 ranges per pass), punched as one hole: %lu pages still"
+                     " readable, st_blocks %ld -> %ld, MemFree %ldkB -> %ldkB",
+                     written, accounted, left, (long)before.st_blocks, (long)after.st_blocks,
+                     f0, f1);
+              close((int)fd);
+          }
+
+          /* A private mapping of the file, which is the other way a page can still be referenced
+             when the hole reaches it. The concurrent check covers a reference that comes and goes
+             -- a fault racing with the punch -- while this one holds it for the whole punch, which
+             is the case that must not be freed from under it: such a page is zeroed in place
+             instead, so that the file still reads as a hole through every other view of it.
+             What the private mapping itself sees afterwards is a separate question, about how
+             nanos implements private file mappings rather than about this change, and it is
+             reported rather than gated. On Linux a page it only read is dropped and re-reads as
+             zero, while a page it wrote is a private copy of its own and keeps its contents. */
+          #define PRIV_PAGES 16
+
+          static void punch_private_test(void)
+          {
+              unsigned long ps = (unsigned long)sysconf(_SC_PAGESIZE);
+              unsigned long len = PRIV_PAGES * ps;
+              unsigned long half = PRIV_PAGES / 2;
+              long fd = syscall(SYS_memfd_create, "private", 0);
+              if (fd < 0) {
+                  skip("punch_private_shared_zero", "no memfd_create: errno=%d (%s)",
+                       errno, strerror(errno));
+                  skip("punch_private_view", "no memfd_create");
+                  return;
+              }
+              char *shared = MAP_FAILED, *priv = MAP_FAILED;
+              if (ftruncate((int)fd, len) == 0) {
+                  shared = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fd, 0);
+                  priv = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, (int)fd, 0);
+              }
+              if ((shared == MAP_FAILED) || (priv == MAP_FAILED)) {
+                  skip("punch_private_shared_zero", "MAP_SHARED=%p MAP_PRIVATE=%p errno=%d (%s)",
+                       shared, priv, errno, strerror(errno));
+                  skip("punch_private_view", "the file could not be mapped both ways");
+                  if (shared != MAP_FAILED) munmap(shared, len);
+                  if (priv != MAP_FAILED) munmap(priv, len);
+                  close((int)fd);
+                  return;
+              }
+              memset(shared, 0xc7, len);
+              int wb = write_through_fd((int)fd, len, 0xc7);
+
+              /* The first half is only read through the private mapping, so those pages are the
+                 file's own and are what the punch finds referenced; the second half is written,
+                 which on a private mapping makes a copy that the file no longer owns. */
+              unsigned long seen = 0;
+              for (unsigned long pi = 0; pi < half; pi++)
+                  seen += (unsigned char)priv[pi * ps];
+              for (unsigned long pi = half; pi < PRIV_PAGES; pi++)
+                  priv[pi * ps] = 0x5e;
+
+              struct stat before, after;
+              fstat((int)fd, &before);
+              int pr = fallocate((int)fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, (long)len);
+              fstat((int)fd, &after);
+
+              int shared_zero = 1, fd_zero = 1;
+              for (unsigned long pi = 0; pi < PRIV_PAGES; pi++) {
+                  char got;
+                  if ((unsigned char)shared[pi * ps] != 0)
+                      shared_zero = 0;
+                  if ((pread((int)fd, &got, 1, (off_t)(pi * ps)) == 1) && (got != 0))
+                      fd_zero = 0;
+              }
+              ok("punch_private_shared_zero",
+                 (pr == 0) && shared_zero && fd_zero &&
+                 ((wb != 0) || (after.st_blocks == 0)),
+                 "rv=%d with a live private mapping of the same file: shared view reads a hole=%d,"
+                 " the fd reads a hole=%d, st_blocks %ld -> %ld (%lu pages read through the"
+                 " private mapping first, sum 0x%lx)",
+                 pr, shared_zero, fd_zero, (long)before.st_blocks, (long)after.st_blocks,
+                 half, seen);
+
+              unsigned long read_zero = 0, wrote_kept = 0, other = 0;
+              for (unsigned long pi = 0; pi < PRIV_PAGES; pi++) {
+                  unsigned char got = priv[pi * ps];
+                  if (pi < half)
+                      (got == 0) ? read_zero++ : other++;
+                  else
+                      (got == 0x5e) ? wrote_kept++ : other++;
+              }
+              ok("punch_private_view", (read_zero == half) && (wrote_kept == half) && (other == 0),
+                 "of the pages a private mapping held across the punch, %lu of %lu it had only"
+                 " read came back as a hole and %lu of %lu it had written kept their copy"
+                 " (%lu did neither) -- which is what Linux reports",
+                 read_zero, half, wrote_kept, half, other);
+              munmap(shared, len);
+              munmap(priv, len);
+              close((int)fd);
+          }
+
           /* More mappings of one file than the punch can unmap in one go. The lock over a node's
              mappings cannot be held while unmapping, so they are collected in batches and the walk
              resumes from a cursor -- a loop nothing exercises with the two or three mappings the
@@ -1407,6 +1622,18 @@ jobs:
               punch_overhang("punch_overhang_tail", 1);
               punch_overhang("punch_overhang_head", 0);
 
+              /* 7f. A hole with no whole page in it: nothing can be given back, only bytes
+                     zeroed, and the file must keep every page it held. */
+              punch_subpage_test();
+
+              /* 7g. One hole spanning more ranges of the file's map than the punch takes out of
+                     it per pass, so that the pass that repeats runs at all. */
+              punch_many_ranges_test();
+
+              /* 7h. A page a private mapping holds while the hole reaches it: it cannot be freed
+                     and has to be zeroed, so that the file still reads as a hole. */
+              punch_private_test();
+
               /* 8. Anonymous shared memory, the other shape of the same need. */
               void *s = mmap(NULL, 2 * MB, PROT_READ | PROT_WRITE,
                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -1581,6 +1808,18 @@ jobs:
             grep -E '^PROBE many_maps' probe-maps.log 2>/dev/null || echo "(no output)"
             echo '```'
             echo ""
+            echo "### The shapes of hole that reach a branch of their own"
+            echo ""
+            echo "A hole with no whole page in it gives nothing back and only zeroes bytes; a hole"
+            echo "spanning more ranges of the file's map than the punch removes per pass makes that"
+            echo "pass repeat; and a page a private mapping holds across the punch cannot be freed,"
+            echo "so it is zeroed in place and the file still reads as a hole through every other view."
+            echo "What the private mapping itself then sees is reported, not gated."
+            echo '```'
+            grep -E '^PROBE punch_(subpage|many_ranges|private)' probe-klib.log 2>/dev/null \
+              || echo "(no output)"
+            echo '```'
+            echo ""
             echo "### Does a page written only through a mapping survive memory pressure?"
             echo ""
             echo "Open question, reported rather than gated, and about the data rather than the memory:"
@@ -1631,7 +1870,9 @@ jobs:
           # root filesystem has no dealloc method and is expected to keep zeroing
           # its pages in place, so the stock column is left as the contrast.
           for c in punch_hole_frees_blocks punch_hole_reclaims punch_hole_refault punch_partial \
-                   punch_partial_blocks punch_overhang_head punch_overhang_tail; do
+                   punch_partial_blocks punch_overhang_head punch_overhang_tail \
+                   punch_subpage punch_subpage_blocks punch_many_ranges \
+                   punch_private_shared_zero; do
             if grep -q "^PROBE ${c} *PASS" probe-klib.log; then
               echo "PASS: ${c}"
             else
@@ -1639,6 +1880,15 @@ jobs:
               fail=1
             fi
           done
+
+          # Reported, not gated: what a private mapping sees of a hole punched under it is about
+          # how nanos implements private file mappings, not about this change. The gate above is
+          # the part that is this change's claim -- that the page was not freed under it.
+          if grep -q '^PROBE punch_private_view *PASS' probe-klib.log; then
+            echo "PASS: a private mapping sees the hole the way Linux reports it"
+          else
+            echo "::warning::a private mapping of a punched file does not behave as it does on Linux: $(res klib punch_private_view)"
+          fi
 
           # Punching while other threads fault the same pages, and doing it over and
           # over: the first covers the "still referenced, zero it instead of freeing
