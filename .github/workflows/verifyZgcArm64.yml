@@ -1051,7 +1051,11 @@ jobs:
              The mappings are kept because the punch has to unmap through them, and the pages
              are touched through one so they are mapped when the hole arrives. */
           #define SEQ_LEN    (8 * MB)
-          #define SEQ_ROUNDS 40
+          /* As many punches a boot as the race does, or a clean run here means only that it did
+             not do enough of them: the race stops within a hundred and fifty about half the
+             time, so forty would come out empty better than one time in four with the very same
+             defect present. */
+          #define SEQ_ROUNDS CONC_PUNCHES
 
           static void sequence_test(void)
           {
@@ -1113,7 +1117,7 @@ jobs:
              On aarch64 this can dirty nothing at all, pte_is_dirty() being a stub there, so the
              file accounting for no blocks is the expected answer and the contrast. */
           #define MSYNC_LEN    (8 * MB)
-          #define MSYNC_ROUNDS 30
+          #define MSYNC_ROUNDS CONC_PUNCHES     /* as many as the race, for the same reason */
 
           static void mapsync_test(void)
           {
