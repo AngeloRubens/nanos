@@ -8,6 +8,7 @@ BSS_RO_AFTER_INIT static boolean initialized;
 BSS_RO_AFTER_INIT static int flush_ipi;
 static volatile word inval_gen;
 BSS_RO_AFTER_INIT static queue free_flush_entries;
+BSS_RO_AFTER_INIT static flush_entry flush_entries;
 static struct list entries;
 static int entries_count;
 static volatile boolean service_scheduled;
@@ -28,6 +29,17 @@ struct flush_entry {
     thunk completion;
     closure_struct(thunk, finish);
 };
+
+/* Every entry there is a slot of the one array allocated in init_flush(), and the free queue is
+ * the only thing that hands them out, so a pointer that is not one of those slots is not an entry
+ * -- whatever it was dequeued from. Checked on both sides of the queue because the two sides say
+ * different things: on the way in it is the caller, or the list it was walking, that is wrong; on
+ * the way out it is the queue itself. A fault inside the memset in get_page_flush_entry() says
+ * neither. */
+static inline boolean is_flush_entry(flush_entry f)
+{
+    return (f >= flush_entries) && (f < flush_entries + MAX_FLUSH_ENTRIES);
+}
 
 closure_func_basic(thunk, void, flush_complete)
 {
@@ -122,6 +134,7 @@ static void service_list(void)
         thunk completion = f->completion;
         if (completion)
             async_apply(completion);
+        assert(is_flush_entry(f));
         assert(enqueue(free_flush_entries, f));
     }
 }
@@ -147,6 +160,7 @@ static void queue_flush_service(void)
 void page_invalidate_sync(flush_entry f, thunk completion, boolean rendezvous)
 {
     if (initialized) {
+        assert(is_flush_entry(f));      /* before it is read, so a bad one is named here */
         if (f->npages == 0) {
             assert(enqueue(free_flush_entries, f));
             return;
@@ -226,7 +240,7 @@ flush_entry get_page_flush_entry(void)
         kern_pause();
     }
 
-    assert(fe != INVALID_ADDRESS);
+    assert(is_flush_entry(fe));
     runtime_memset((void *)fe, 0, sizeof(*fe));
     return fe;
 }
@@ -240,6 +254,7 @@ void init_flush(heap h)
     free_flush_entries = allocate_queue(h, MAX_FLUSH_ENTRIES + 1);
     flush_entry fa = allocate(h, sizeof(struct flush_entry) * MAX_FLUSH_ENTRIES);
     assert(fa);
+    flush_entries = fa;
     for (flush_entry f = fa; f < fa + MAX_FLUSH_ENTRIES; f++)
         assert(enqueue(free_flush_entries, f));
     initialized = true;
