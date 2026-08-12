@@ -2092,6 +2092,27 @@ jobs:
             fi
             echo "--- ${label}: it stopped here ---"
             tail -3 "${label}-hang.serial"
+            # A fault is not a hang, and it is not gdb's to answer: nanos prints its own trace,
+            # symbolised against the load offset it reports on the same page, and then stops the
+            # machine -- so nothing is listening on the stub by the time this gets there, and
+            # every faulting run so far has recorded "could not connect" in the place where its
+            # answer already was. Read from the serial and asked no further.
+            if grep -q 'no fault handler' "${label}-hang.serial"; then
+              sed -n '/no fault handler/,$p' "${label}-hang.serial" | head -80 \
+                > "${label}-hang.bt"
+              echo "${label}: it faulted, and nanos named the frames itself"
+              kill "$qpid" 2>/dev/null || true
+              wait "$qpid" 2>/dev/null || true
+              {
+                echo "### Where ${label} faulted, as nanos reported it"
+                echo ""
+                echo '```'
+                cat "${label}-hang.bt"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::${label} faulted; the trace nanos printed is in ${label}-hang.bt"
+              exit 0
+            fi
             # NO_KASLR was not what was missing: the kernel is linked to run at KERNEL_BASE_PHYS
             # (0x200000, platform/pc/linker_script) and runs relocated to KERNEL_BASE
             # (0xffffffff80000000, src/x86_64/kernel_machine.h), so the symbols have to be loaded
