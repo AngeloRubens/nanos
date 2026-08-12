@@ -2643,8 +2643,8 @@ jobs:
             echo ""
             echo "### Which of the two the fault needs"
             echo ""
-            echo "| race | rounds that ran | finished | faulted | never started | punches | blocks |"
-            echo "|---|---|---|---|---|---|---|"
+            echo "| race | rounds that ran | finished | faulted | stalled in a punch | never started | punches | blocks |"
+            echo "|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for v in race race1p racenw race1pnw raceser racenofs racedisj racent racesernt \
                    sequence mapsync; do
@@ -2661,7 +2661,7 @@ jobs:
               sequence) files="probe-sequence-*.log"; what="no threads: write, flush, punch" ;;
               mapsync)  files="probe-mapsync-*.log";  what="through the mapping only: msync, punch" ;;
             esac
-            n=0; ok=0; flt=0; nr=0; pun=0; blk=0
+            n=0; ok=0; flt=0; nr=0; pun=0; blk=0; stk=0
             for f in $files; do
               [ -f "$f" ] || continue
               if ! ran "$f"; then
@@ -2671,6 +2671,16 @@ jobs:
               n=$((n + 1))
               grep -q '^PROBE DONE' "$f" && ok=$((ok + 1))
               grep -q 'no fault handler' "$f" && flt=$((flt + 1))
+              # A punch that never returns while the guest is still running is not the same
+              # failure as a guest that stops answering, and until now the table called them both
+              # "did not finish". The watchdog says which: it keeps beating from another thread,
+              # and its beat carries how long a puncher has been inside one punch. Ten seconds
+              # separates them with room to spare: across the rounds measured so far, no round
+              # that finished ever spent more than four seconds inside a punch, and the ones that
+              # stalled sat there for 13, 21, 26, 39, 93 and 418.
+              s=$(grep -oE 'inside punch [0-9]+ for [0-9]+s' "$f" | grep -oE 'for [0-9]+s' \
+                  | grep -oE '[0-9]+' | sort -n | tail -1)
+              if [ "${s:-0}" -ge 10 ]; then stk=$((stk + 1)); fi
               # A cut is only clean if it was given as many chances as the one it is compared
               # with: punches attempted is that count, and the blocks the file reached says
               # whether there was anything pinned to punch. A cut that reads clean on a tenth of
@@ -2683,9 +2693,11 @@ jobs:
                      grep -oE 'blocks [0-9]+' "$f" | awk '{print $2}'; } | sort -n | tail -1)
               if [ "${b:-0}" -gt "$blk" ]; then blk=$b; fi
             done
-            echo "${what}: ${ok} of ${n} that ran finished, ${flt} faulted, ${nr} never started," \
-                 "${pun} punches attempted, up to ${blk} blocks held"
-            echo "| ${what} | ${n} | ${ok} | ${flt} | ${nr} | ${pun} | ${blk} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "${what}: ${ok} of ${n} that ran finished, ${flt} faulted, ${stk} stalled in a" \
+                 "punch with the guest alive, ${nr} never started, ${pun} punches attempted," \
+                 "up to ${blk} blocks held"
+            echo "| ${what} | ${n} | ${ok} | ${flt} | ${stk} | ${nr} | ${pun} | ${blk} |" \
+              >> "$GITHUB_STEP_SUMMARY"
           done
           if grep -q '^PROBE cycles_reclaim *PASS' probe-cycles.log; then
             echo "PASS: cycles_reclaim"
