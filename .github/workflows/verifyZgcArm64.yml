@@ -2189,18 +2189,26 @@ jobs:
             "RunConfig": { "Memory": "2G", "CPUs": 4 }
           }
           EOF
-          # Short, because the two ways this ends are both quick: the race takes a couple of
-          # seconds, and a guest that faults stops saying anything at all -- waiting out a long
-          # timeout after that only spends the job's time.
-          t0=$SECONDS
-          timeout 120 ops run ./zgcprobe --nightly -c probe-before.json 2>&1 \
-            | strip_ansi | tee probe-before.log || true
-          ./reap-qemu.sh
-          echo "TIMING before $((SECONDS - t0))s" | tee -a probe-timing.log
-          if grep -q '^PROBE DONE' probe-before.log; then
+          # Ten rounds, and the same ninety seconds each as every cut below, because the
+          # sentence this run exists to support -- "the change is not what stops it" -- is a
+          # rate and not an anecdote. One round of it has stopped in three of the seven runs
+          # recorded so far, which is the same order as the race itself, but a single round
+          # each time can only ever say "it happened", never how often.
+          bfin=0
+          for i in $(seq 1 10); do
+            if [ "$i" = 1 ]; then log=probe-before.log; else log="probe-before-${i}.log"; fi
+            t0=$SECONDS
+            timeout 90 ops run ./zgcprobe --nightly -c probe-before.json 2>&1 \
+              | strip_ansi | tee "$log" || true
+            ./reap-qemu.sh
+            echo "TIMING before-${i} $((SECONDS - t0))s" | tee -a probe-timing.log
+            grep -q '^PROBE DONE' "$log" && bfin=$((bfin + 1))
+          done
+          echo "before: ${bfin} of 10 rounds finished without this change"
+          if [ "$bfin" = 10 ]; then
             echo "the race runs to the end without this change"
           else
-            echo "::warning::the race does not finish without this change either, so it is not this change that stops it"
+            echo "::warning::the race does not finish without this change either ($((10 - bfin)) of 10), so it is not this change that stops it"
             # And now it can be asked where, which is what the baseline was built here for.
             if [ "${{ matrix.arch }}" = x64 ]; then
               ./catch-stop.sh before "${BASE_ELF}" 3
@@ -2541,9 +2549,13 @@ jobs:
             grep -E '^RACE ' probe-concurrent.log | tail -8
             echo "--- the same race, unpatched kernel ---"
             grep -E '^(RACE alive|PROBE (concurrent|DONE))' probe-before.log 2>/dev/null | tail -4
-            grep -q '^PROBE DONE' probe-before.log 2>/dev/null \
-              && echo "note: it does finish without this change" \
-              || echo "note: it does not finish without this change either"
+            bfin=0; bn=0
+            for f in probe-before.log probe-before-*.log; do
+              [ -f "$f" ] || continue
+              bn=$((bn + 1))
+              grep -q '^PROBE DONE' "$f" && bfin=$((bfin + 1))
+            done
+            echo "note: without this change, ${bfin} of ${bn} rounds finished"
           fi
           # Not in that list: the eviction question is reported rather than gated, and
           # its guest is the one most likely to die of the thing it is measuring -- it
@@ -2646,9 +2658,11 @@ jobs:
             echo "| race | rounds that ran | finished | faulted | stalled in a punch | never started | punches | blocks |"
             echo "|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for v in race race1p racenw race1pnw raceser racenofs racedisj racent racesernt \
+          for v in before race race1p racenw race1pnw raceser racenofs racedisj racent racesernt \
                    sequence mapsync; do
             case "$v" in
+              before)   files="probe-before.log probe-before-*.log"
+                        what="**the same race, without this change**" ;;
               race)     files="probe-concurrent.log probe-race-*.log"; what="two punchers, writer" ;;
               race1p)   files="probe-race1p-*.log";   what="one puncher, writer" ;;
               racenw)   files="probe-racenw-*.log";   what="two punchers, no writer" ;;
