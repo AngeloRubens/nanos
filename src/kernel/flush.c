@@ -223,6 +223,42 @@ void page_invalidate_sync(flush_entry f, thunk completion, boolean rendezvous)
     }
 }
 
+/* The ring itself cannot invent a value: a producer only ever stores an entry (asserted above),
+ * and a slot cannot be given to a producer and a consumer at the same time -- a producer may
+ * reserve no further than cons_tail + size - 1, and a consumer reading a slot holds it at or
+ * above cons_tail, so the two indices can never meet on one slot. What the ring does not
+ * survive is being re-entered on one processor, and that ends in a spin, not in a wrong
+ * pointer. So a value that is not an entry was written into the ring by something that does
+ * not know it is a ring -- and how many of the slots hold one says which kind of something:
+ * one is a stray write, a run of them is memory handed out twice. */
+static void report_bad_flush_entry(flush_entry fe)
+{
+    queue q = free_flush_entries;
+    u64 size = U64_FROM_BIT(q->order);
+    u64 foreign = 0, first = size;
+
+    for (u64 i = 0; i < size; i++) {
+        flush_entry f = q->d[i];
+        if ((f != 0) && (f != INVALID_ADDRESS) && !is_flush_entry(f)) {
+            if (foreign++ == 0)
+                first = i;
+        }
+    }
+    rputs("flush: the free queue handed out something that is not an entry\n");
+    rprintf("  got 0x%lx; the %d entries are [0x%lx, 0x%lx), one is 0x%lx bytes\n",
+            u64_from_pointer(fe), MAX_FLUSH_ENTRIES, u64_from_pointer(flush_entries),
+            u64_from_pointer(flush_entries + MAX_FLUSH_ENTRIES), sizeof(struct flush_entry));
+    rprintf("  ring 0x%lx, %ld slots, prod %d/%d, cons %d/%d\n", u64_from_pointer(q->d), size,
+            q->prod_head, q->prod_tail, q->cons_head, q->cons_tail);
+    rprintf("  %ld of those slots hold something that is not an entry, the first at %ld\n",
+            foreign, first);
+    if (first < size)
+        rprintf("  around it: 0x%lx 0x%lx 0x%lx\n",
+                u64_from_pointer(q->d[(first - 1) & MASK(q->order)]),
+                u64_from_pointer(q->d[first]),
+                u64_from_pointer(q->d[(first + 1) & MASK(q->order)]));
+}
+
 flush_entry get_page_flush_entry(void)
 {
     flush_entry fe;
@@ -240,6 +276,8 @@ flush_entry get_page_flush_entry(void)
         kern_pause();
     }
 
+    if (!is_flush_entry(fe))
+        report_bad_flush_entry(fe);
     assert(is_flush_entry(fe));
     runtime_memset((void *)fe, 0, sizeof(*fe));
     return fe;
