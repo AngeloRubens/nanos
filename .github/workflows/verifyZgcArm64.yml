@@ -2092,11 +2092,28 @@ jobs:
             fi
             echo "--- ${label}: it stopped here ---"
             tail -3 "${label}-hang.serial"
-            gdb -batch -n "$kelf" \
+            # NO_KASLR was not what was missing: the kernel is linked to run at KERNEL_BASE_PHYS
+            # (0x200000, platform/pc/linker_script) and runs relocated to KERNEL_BASE
+            # (0xffffffff80000000, src/x86_64/kernel_machine.h), so the symbols have to be loaded
+            # at the difference between the two or every frame comes back as ??, which is what the
+            # earlier runs got. The link address is read out of the ELF rather than written here,
+            # so a relink moves it too. And it goes in through add-symbol-file, never as gdb's own
+            # symbol file: given the file, gdb keeps the addresses it was linked at and the bias
+            # is lost.
+            lb=$(readelf -lW "$kelf" | awk '$1 == "LOAD" { print $3; exit }')
+            bias=$(printf '0x%x' $(( 0xffffffff80000000 - lb )))
+            echo "${label}: symbols from $(basename "$kelf") linked at ${lb}, loaded at ${bias}"
+            gdb -batch -n \
               -ex 'target remote :1234' \
+              -ex "add-symbol-file $kelf -o $bias" \
               -ex 'info threads' \
               -ex 'thread apply all bt' \
               -ex 'thread apply all info registers rip rsp' 2>&1 | tee "${label}-hang.bt"
+            # A backtrace of four unnamed addresses is what this step exists to stop producing,
+            # and it looks like a successful run unless someone reads it.
+            if ! grep -qE '^#[0-9]+ .* in [A-Za-z_]' "${label}-hang.bt"; then
+              echo "::warning::${label}: not one frame came back with a name -- the bias ${bias} no longer matches this kernel"
+            fi
             kill "$qpid" 2>/dev/null || true
             wait "$qpid" 2>/dev/null || true
             {
