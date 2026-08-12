@@ -825,7 +825,11 @@ closure_function(3, 3, boolean, pagecache_check_old_page,
     if (pte_is_present(old_entry) && pte_is_mapping(level, old_entry) && !pte_is_dirty(old_entry)) {
         u64 pi = (pcm->node_offset + vaddr - pcm->n.r.start) >> pc->page_order;
         pagecache_node pn = pcm->pn;
-        pagecache_lock_node(pn);
+        /* Under the page table lock, as pagecache_check_dirty_page() is: waiting for a node
+         * that is being unmapped would deadlock against it. This scan is ageing pages, so a
+         * node it could not have is one it simply leaves for the next pass. */
+        if (!pagecache_trylock_node(pn))
+            return false;
         pagecache_page pp = page_lookup_nodelocked(pn, pi);
         if ((pp != INVALID_ADDRESS) && (page_from_pte(old_entry) == pp->phys)) {
             flush_entry fe = bound(fe);
@@ -1558,8 +1562,8 @@ closure_function(1, 3, void, pagecache_read_sg,
 }
 
 
-closure_function(3, 3, boolean, pagecache_check_dirty_page,
-                 pagecache_map, pcm, flush_entry, fe, buffer, ptes,
+closure_function(4, 3, boolean, pagecache_check_dirty_page,
+                 pagecache_map, pcm, flush_entry, fe, buffer, ptes, boolean *, contended,
                  int level, u64 vaddr, pteptr entry)
 {
     pagecache pc = global_pagecache;
@@ -1572,9 +1576,17 @@ closure_function(3, 3, boolean, pagecache_check_dirty_page,
         range r = irangel(sm->node_offset + (vaddr - sm->n.r.start), cache_pagesize(pc));
         u64 pi = r.start >> pc->page_order;
         pagecache_debug("   dirty: vaddr 0x%lx, pi 0x%lx\n", vaddr, pi);
-        page_invalidate(bound(fe), vaddr);
         pagecache_node pn = sm->pn;
-        pagecache_lock_node(pn);
+        /* This runs from within traverse_ptes(), which holds the page table lock, while
+         * pagecache_node_unmap_pages_sync() takes the node lock and then traverses the page
+         * tables: waiting for the node lock here closes that cycle. Give the traversal up
+         * instead, and let the caller start it again -- the page is still dirty, and the entry
+         * has not been touched. */
+        if (!pagecache_trylock_node(pn)) {
+            *bound(contended) = true;
+            return false;
+        }
+        page_invalidate(bound(fe), vaddr);
         pagecache_page pp = page_lookup_nodelocked(pn, pi);
         assert(pp != INVALID_ADDRESS);
         pagecache_lock_state(pc);
@@ -1604,10 +1616,11 @@ closure_function(1, 0, void, pagecache_clean_ptes,
     buffer_clear(ptes);
 }
 
-static boolean pagecache_scan_shared_map(pagecache_map sm, flush_entry fe, buffer ptes)
+static boolean pagecache_scan_shared_map(pagecache_map sm, flush_entry fe, buffer ptes,
+                                         boolean *contended)
 {
     return traverse_ptes(sm->n.r.start, range_span(sm->n.r),
-                         stack_closure(pagecache_check_dirty_page, sm, fe, ptes));
+                         stack_closure(pagecache_check_dirty_page, sm, fe, ptes, contended));
 }
 
 static void pagecache_scan_shared_mappings(pagecache pc)
@@ -1615,19 +1628,23 @@ static void pagecache_scan_shared_mappings(pagecache pc)
     pagecache_debug("%s\n", func_ss);
     buffer ptes = little_stack_buffer(context_stack_space() / 2);
     thunk completion = stack_closure(pagecache_clean_ptes, ptes);
-    boolean done = true, progress;
+    boolean done = true, progress, contended;
     do {
         flush_entry fe = get_page_flush_entry();
+        contended = false;
         pagecache_lock_mappings();
         list_foreach(&pc->shared_maps, l) {
             pagecache_map sm = struct_from_list(l, pagecache_map, l);
             pagecache_debug("   shared map va %R, node_offset 0x%lx\n", sm->n.r, sm->node_offset);
-            done = pagecache_scan_shared_map(sm, fe, ptes);
+            done = pagecache_scan_shared_map(sm, fe, ptes, &contended);
             if (!done)
                 break;
         }
         pagecache_unlock_mappings();
-        progress = buffer_length(ptes) != 0;
+        /* A traversal that gave up on a locked node has made no progress of its own, but the
+         * page it stopped on is one this scan is here to write back: go round again rather than
+         * leave it dirty until the next timer. */
+        progress = (buffer_length(ptes) != 0) || contended;
         page_invalidate_sync(fe, completion, true);
     } while (!done && progress);
 }
@@ -1721,8 +1738,8 @@ closure_function(3, 1, boolean, pagecache_node_unmap_intersection,
     return true;
 }
 
-closure_function(2, 1, boolean, scan_shared_pages_intersection,
-                 flush_entry, fe, buffer, ptes,
+closure_function(3, 1, boolean, scan_shared_pages_intersection,
+                 flush_entry, fe, buffer, ptes, boolean *, contended,
                  rmnode n)
 {
     /* currently just scanning the whole map - it could be just a range,
@@ -1730,7 +1747,7 @@ closure_function(2, 1, boolean, scan_shared_pages_intersection,
     pagecache_map pcm = (pagecache_map)n;
     if (pcm->shared) {
         pagecache_debug("   map %p\n", pcm);
-        return pagecache_scan_shared_map(pcm, bound(fe), bound(ptes));
+        return pagecache_scan_shared_map(pcm, bound(fe), bound(ptes), bound(contended));
     }
     return true;
 }
@@ -1740,15 +1757,18 @@ void pagecache_node_scan(pagecache_node pn, range q /* bytes */, status_handler 
     pagecache_debug("%s: node %p, q %R\n", func_ss, pn, q);
     buffer ptes = little_stack_buffer(context_stack_space() / 2);
     thunk completion = stack_closure(pagecache_clean_ptes, ptes);
-    boolean done = true, progress;
+    boolean done = true, progress, contended;
     do {
         flush_entry fe = get_page_flush_entry();
+        contended = false;
         pagecache_lock_mappings();
         done = (rangemap_range_lookup(&pn->mappings, q,
-                                      stack_closure(scan_shared_pages_intersection, fe, ptes)) !=
-                RM_ABORT);
+                                      stack_closure(scan_shared_pages_intersection, fe, ptes,
+                                                    &contended)) != RM_ABORT);
         pagecache_unlock_mappings();
-        progress = buffer_length(ptes) != 0;
+        /* As above: a node that was locked when the traversal reached it is a reason to come
+         * back, not a reason to stop -- and here stopping would report the sync as failed. */
+        progress = (buffer_length(ptes) != 0) || contended;
         page_invalidate_sync(fe, completion, true);
     } while (!done && progress);
     if (!done && complete)
