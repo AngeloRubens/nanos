@@ -23,6 +23,10 @@ void init_page_tables(heap pageheap, range pagevirt);
 
 /* tlb shootdown */
 void init_flush(heap);
+
+/* diagnostic: whether a range overlaps the free flush entry queue, which has been found in use
+ * as a stack at the same time -- see report_bad_flush_entry() in flush.c */
+boolean flush_ring_overlaps(u64 start, u64 len);
 flush_entry get_page_flush_entry();
 void page_invalidate(flush_entry f, u64 address);
 void page_invalidate_sync(flush_entry f, thunk completion, boolean rendezvous);

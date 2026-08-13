@@ -45,6 +45,11 @@ void *mem_alloc(heap h, bytes size, u32 flags)
             break;
     }
     if (p != INVALID_ADDRESS) {
+        /* Diagnostic: the free flush entry queue has been found holding stack contents -- return
+         * addresses, and the text of the assertion that caught it -- which means this memory was
+         * given out while it was still the queue's. Whoever is given it next is named here,
+         * rather than a hundred slots later when a consumer takes one of them for an entry. */
+        assert(!flush_ring_overlaps(u64_from_pointer(p), size));
         if (flags & MEM_ZERO)
             zero(p, size);
     } else if (flags & MEM_NOFAIL) {

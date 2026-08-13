@@ -231,6 +231,21 @@ void page_invalidate_sync(flush_entry f, thunk completion, boolean rendezvous)
  * pointer. So a value that is not an entry was written into the ring by something that does
  * not know it is a ring -- and how many of the slots hold one says which kind of something:
  * one is a stray write, a run of them is memory handed out twice. */
+/* The ring turns out to be in use as something else -- a stack, by the contents -- so the
+ * question moved from "who wrote this" to "who was given this memory". Answered where an
+ * allocation is made rather than when its contents come back looking like a flush entry: the
+ * ring is one range, known from boot, and every allocation either overlaps it or does not. Two
+ * compares, on a path that is already allocating pages. */
+boolean flush_ring_overlaps(u64 start, u64 len)
+{
+    if (!initialized)
+        return false;
+    queue q = free_flush_entries;
+    u64 rs = u64_from_pointer(q);
+    u64 re = u64_from_pointer(q->d) + (U64_FROM_BIT(q->order) * sizeof(void *));
+    return (start < re) && (rs < start + len);
+}
+
 static void report_bad_flush_entry(flush_entry fe)
 {
     queue q = free_flush_entries;
