@@ -1087,6 +1087,11 @@ static inline void check_syscall_context_replace(cpuinfo ci, context ctx)
         context_release_refcount(ctx);
         ctx = dequeue_single(ci->free_syscall_contexts);
         if (ctx != INVALID_ADDRESS) {
+            /* This is the cache sync_complete() caught handing out something that was not a
+             * syscall context; asked here, where it is handed out. */
+            if (!(context_looks_valid(ctx) && (ctx->type == CONTEXT_TYPE_SYSCALL)))
+                report_bad_context(ci->free_syscall_contexts, ctx, ss("syscall"));
+            assert(context_looks_valid(ctx) && (ctx->type == CONTEXT_TYPE_SYSCALL));
             refcount_set_count(&ctx->refcount, 1);
         } else {
             ctx = (context)allocate_syscall_context(ci);

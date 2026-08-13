@@ -242,6 +242,11 @@ static inline boolean is_syscall_context(context c)
     return c->type == CONTEXT_TYPE_SYSCALL;
 }
 
+/* diagnostic: whether a pointer taken from a per-cpu context cache is a context at all, and
+ * what its cache looks like when it is not -- see report_bad_context() in kernel.c */
+boolean context_looks_valid(context ctx);
+void report_bad_context(queue q, context ctx, sstring which);
+
 static inline boolean is_thread_context(context c)
 {
     return c->type == CONTEXT_TYPE_THREAD;

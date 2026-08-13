@@ -92,6 +92,60 @@ void print_frame_trace_from_here(void)
     print_frame_trace(get_current_fp());
 }
 
+/* The same question the free flush entry queue was asked, put to the per-CPU context caches,
+ * because sync_complete() has already caught one of them handing out something that was not a
+ * syscall context. A context is one allocation of its own rather than a slot of an array, so
+ * what can be asked of a pointer without following it is that it is a kernel address at all;
+ * the type is asked afterwards, and only of a pointer that passed. */
+static boolean context_plausible(context ctx)
+{
+    return (ctx != 0) && (ctx != INVALID_ADDRESS) && is_kernel_memory(ctx);
+}
+
+boolean context_looks_valid(context ctx)
+{
+    return context_plausible(ctx) && (ctx->type > CONTEXT_TYPE_UNDEFINED) &&
+        (ctx->type < CONTEXT_TYPE_MAX);
+}
+
+/* One bad pointer is a bad pointer; a run of them is a ring in use as something else, which is
+ * what the flush entry queue turned out to be. Only the pointers are examined here, never what
+ * they point at, so a slot holding a stack word cannot fault this on its way to the assert. */
+void report_bad_context(queue q, context ctx, sstring which)
+{
+    u64 size = U64_FROM_BIT(q->order);
+    u64 foreign = 0, offheap = 0, first = size;
+
+    for (u64 i = 0; i < size; i++) {
+        context c = q->d[i];
+        u64 a = u64_from_pointer(c);
+        if ((c == 0) || (c == INVALID_ADDRESS))
+            continue;
+        /* Two counts rather than one, because kernel addresses cover the text as well: a
+         * pointer into the text is not a context either, but it is exactly what a stack holds,
+         * and the assert stays on the loose test so that it can never fire on a good one. */
+        if (!is_kernel_memory(c)) {
+            if (foreign++ == 0)
+                first = i;
+        } else if (!point_in_range(kvmem.linear, a)) {
+            offheap++;
+        }
+    }
+    rputs("context: a per-cpu cache handed out something that is not a context\n");
+    rprintf("  %s cache on cpu %d gave 0x%lx, type %d; contexts are allocated in %R\n", which,
+            current_cpu()->id, u64_from_pointer(ctx),
+            context_plausible(ctx) ? ctx->type : -1, kvmem.linear);
+    rprintf("  ring 0x%lx, %ld slots, prod %d/%d, cons %d/%d\n", u64_from_pointer(q->d), size,
+            q->prod_head, q->prod_tail, q->cons_head, q->cons_tail);
+    rprintf("  %ld slots hold no kernel address at all (first at %ld), %ld hold one from outside"
+            " the region these are allocated in\n", foreign, first, offheap);
+    if (first < size)
+        rprintf("  around it: 0x%lx 0x%lx 0x%lx\n",
+                u64_from_pointer(q->d[(first - 1) & MASK(q->order)]),
+                u64_from_pointer(q->d[first]),
+                u64_from_pointer(q->d[(first + 1) & MASK(q->order)]));
+}
+
 define_closure_function(2, 0, void, free_kernel_context,
                         queue, free_ctx_q, boolean, queued)
 {
@@ -108,6 +162,10 @@ define_closure_function(2, 0, void, free_kernel_context,
     }
 
     bound(queued) = false;
+    /* Asked on the way in as well as on the way out, which is what told the flush entry queue
+     * apart from whoever fills it: a cache that only ever receives contexts and hands back
+     * something else has had its ring written by someone who does not know it is a ring. */
+    assert(context_looks_valid(&kc->context));
     if (!enqueue(bound(free_ctx_q), kc)) {
         destruct_context(&kc->context);
         deallocate(heap_locked(get_kernel_heaps()), kc, kc->size);
@@ -189,6 +247,9 @@ static void kernel_context_pre_suspend(context ctx)
         context_release_refcount(ctx);
         ctx = dequeue_single(ci->free_kernel_contexts);
         if (ctx != INVALID_ADDRESS) {
+            if (!(context_looks_valid(ctx) && (ctx->type == CONTEXT_TYPE_KERNEL)))
+                report_bad_context(ci->free_kernel_contexts, ctx, ss("kernel"));
+            assert(context_looks_valid(ctx) && (ctx->type == CONTEXT_TYPE_KERNEL));
             refcount_set_count(&ctx->refcount, 1);
         } else {
             ctx = (context)allocate_kernel_context(ci);
