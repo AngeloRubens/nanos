@@ -255,6 +255,11 @@ jobs:
                           a[j] = mark;
                           n++;
                       }
+                      /* Published per block rather than per page -- an atomic every 4K costs
+                         more than the write it is counting under emulation -- and published
+                         at all rather than at the end, so the beat below can say whether the
+                         threads are still moving when a boot stops saying anything. */
+                      pages.addAndGet(a.length / 4096);
                       hold.add(a);
                       byte[] old = hold.get(0);
                       for (int j = 0; j < old.length; j += 4096)
@@ -263,7 +268,6 @@ jobs:
                          moves under the collector */
                       if (hold.size() > 32) hold.subList(0, 16).clear();
                   }
-                  pages.addAndGet(n);
                   wrong.addAndGet(bad);
               }
 
@@ -275,7 +279,8 @@ jobs:
                  is in run() above. */
               static boolean soakUncommit(int seconds, int nthreads, int balloonMB)
                       throws Exception {
-                  final long end = System.currentTimeMillis() + seconds * 1000L;
+                  final long start = System.currentTimeMillis();
+                  final long end = start + seconds * 1000L;
                   final java.util.concurrent.atomic.AtomicLong pages =
                           new java.util.concurrent.atomic.AtomicLong();
                   final java.util.concurrent.atomic.AtomicLong wrong =
@@ -299,6 +304,14 @@ jobs:
                          here -- with the threads above still faulting */
                       Thread.sleep(2000);
                       cycles++;
+                      /* The collector's own log stops when a boot stops, and says nothing
+                         about whether the workload was still moving. This does: a beat that
+                         keeps coming with the page count standing still is a different
+                         failure from no beat at all. */
+                      System.out.println("SOAK alive " + ((System.currentTimeMillis() - start)
+                              / 1000) + "s: " + cycles + " cycles, " + pages.get()
+                              + " pages written");
+                      System.out.flush();
                   }
                   for (Thread th : ts) th.join();
                   boolean ok = (wrong.get() == 0);
@@ -387,7 +400,9 @@ jobs:
             "z-shmem|UseZGC|\"tmpfs\", \"shmem\"|"
             "z-large|UseZGC|\"tmpfs\", \"shmem\"|\"-Xmx512m\", \"-Dhumongous=4\", \"-DhumongousMB=32\", \"-Drounds=6\","
             "z-uncommit|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=8\", \"-Dsettle=8\","
-            "z-soak|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=120\", \"-DsoakThreads=3\","
+            "z-soak|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=60\", \"-DsoakThreads=3\","
+            "z-soak2|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=60\", \"-DsoakThreads=3\","
+            "z-soak3|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=60\", \"-DsoakThreads=3\","
           )
           for entry in "${MATRIX[@]}"; do
             label="$(echo "$entry" | cut -d'|' -f1)"
@@ -440,7 +455,8 @@ jobs:
             echo ""
             echo "| GC | image | result | collectors / reason |"
             echo "|---|---|---|---|"
-            for l in g1 serial parallel shenandoah z z-shmem z-large z-uncommit z-soak; do
+            for l in g1 serial parallel shenandoah z z-shmem z-large z-uncommit \
+                     z-soak z-soak2 z-soak3; do
               v=$(verdict "gc-${l}.log")
               if [ "$v" = OK ]; then
                 d=$(grep -o 'collector=[^ ]*' "gc-${l}.log" | head -1)
@@ -451,7 +467,8 @@ jobs:
                 z-shmem)    img="+ klibs" ;;
                 z-large)    img="+ klibs, 32M objects (large pages)" ;;
                 z-uncommit) img="+ klibs, -Xms64m/-Xmx512m (uncommit on)" ;;
-                z-soak)     img="+ klibs, uncommit **while 3 threads write the heap**" ;;
+                z-soak|z-soak2|z-soak3)
+                            img="+ klibs, uncommit **while 3 threads write the heap**" ;;
                 *)          img="stock" ;;
               esac
               echo "| \`$l\` | $img | **$v** | ${d:-–} |"
@@ -471,11 +488,15 @@ jobs:
             echo ""
             echo '```'
             {
-              grep -E '^SOAK ' gc-z-soak.log 2>/dev/null | head -2
-              # grep -c prints its 0 and exits 1, so the fallback is for a missing file only
-              n=$(grep -cE 'Uncommitter.*Uncommitted:' gc-z-soak.log 2>/dev/null || true)
-              printf 'uncommitter fired %s time(s)\n' "${n:-0}"
-              grep -E 'Uncommitter.*Uncommitted:' gc-z-soak.log 2>/dev/null | tail -3
+              for f in gc-z-soak.log gc-z-soak2.log gc-z-soak3.log; do
+                [ -f "$f" ] || continue
+                # grep -c prints its 0 and exits 1, so the fallback is for a missing file only
+                n=$(grep -cE 'Uncommitter.*Uncommitted:' "$f" 2>/dev/null || true)
+                printf '%s: %s, %s uncommit(s), last beat: %s\n' "$f" \
+                  "$(grep -q 'GC OK' "$f" && echo finished || echo 'DID NOT FINISH')" "${n:-0}" \
+                  "$(grep -E '^SOAK alive ' "$f" | tail -1)"
+                grep -E '^SOAK (OK|MISMATCH)' "$f" 2>/dev/null | head -1
+              done
             } | sed 's/^$//'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -544,22 +565,31 @@ jobs:
           # threads keep faulting the same file. Every other measurement of that race is a C
           # probe standing in for a JVM, with an fsync in it that no collector performs. If
           # this one stops the guest, nothing has to be inferred.
-          xv=$(verdict gc-z-soak.log)
-          fired=$(grep -cE 'Uncommitter.*Uncommitted:' gc-z-soak.log 2>/dev/null || true)
-          fired=${fired:-0}
-          echo "zgc (+klib, uncommit under load): $xv, uncommitter fired ${fired} time(s)"
+          # Three boots rather than one, for the reason the baseline gets ten: the first soak
+          # ever run stopped its guest 228ms after the fourth hole was punched, and one boot
+          # can say that it happened and never how often.
+          sn=0; sfin=0; sfired=0; smis=0
+          for f in gc-z-soak.log gc-z-soak2.log gc-z-soak3.log; do
+            [ -f "$f" ] || continue
+            sn=$((sn + 1))
+            [ "$(verdict "$f")" = OK ] && sfin=$((sfin + 1))
+            grep -q '^SOAK MISMATCH' "$f" && smis=$((smis + 1))
+            n=$(grep -cE 'Uncommitter.*Uncommitted:' "$f" 2>/dev/null || true)
+            sfired=$((sfired + ${n:-0}))
+          done
+          echo "zgc (+klib, uncommit under load): ${sfin} of ${sn} boots finished, ${sfired} uncommit(s) in total"
           # The mismatch is checked first: it makes the workload report GC FAIL as well, and
           # "a page came back wrong" is a different sentence from "it never got to the end".
-          if grep -q '^SOAK MISMATCH' gc-z-soak.log 2>/dev/null; then
-            echo "::error::a page read back wrong during the soak — a punch took a page that was still in use: $(grep -E '^SOAK ' gc-z-soak.log | head -1)"
+          if [ "$smis" != 0 ]; then
+            echo "::error::a page read back wrong during the soak — a punch took a page that was still in use"
             fail=1
-          elif [ "$xv" != OK ]; then
-            echo "::error::ZGC did not survive punching holes while its own heap was being written (uncommitter fired ${fired} time(s)): $(reason gc-z-soak.log)"
+          elif [ "$sfin" != "$sn" ]; then
+            echo "::error::ZGC did not survive punching holes while its own heap was being written: $((sn - sfin)) of ${sn} boots stopped, with ${sfired} uncommit(s) between them"
             fail=1
-          elif [ "$fired" = 0 ]; then
-            echo "::warning::the soak ran to the end but the uncommitter never gave memory back, so the punch-under-load path was never entered — this cut measured nothing"
+          elif [ "$sfired" = 0 ]; then
+            echo "::warning::the soaks ran to the end but the uncommitter never gave memory back, so the punch-under-load path was never entered — these cuts measured nothing"
           else
-            echo "PASS: $(grep -E '^SOAK ' gc-z-soak.log | head -1) with ${fired} uncommit(s) taken while the heap was being written"
+            echo "PASS: ${sn} of ${sn} soak boots finished, with ${sfired} uncommit(s) taken while the heap was being written"
           fi
 
           sv=$(verdict gc-shenandoah.log)
