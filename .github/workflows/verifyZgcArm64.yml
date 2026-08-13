@@ -161,6 +161,17 @@ jobs:
                      ZGC's uncommitter has something to give back and the time
                      to do it (needs -Xms < -Xmx and a short ZUncommitDelay). */
                   final int settle = Integer.getInteger("settle", 0);
+                  /* Seconds of the one thing "settle" cannot show: the heap
+                     growing and shrinking over and over while other threads keep
+                     writing it. That is the pair the kernel has to survive --
+                     the uncommitter punching holes in the backing file while
+                     mutators fault pages of the same file -- and idling with the
+                     live set dropped produces the punches with nothing faulting
+                     beside them. Needs the same -Xms < -Xmx and short
+                     ZUncommitDelay as settle does. */
+                  final int soak = Integer.getInteger("soak", 0);
+                  final int soakThreads = Integer.getInteger("soakThreads", 3);
+                  final int balloonMB = Integer.getInteger("balloonMB", 128);
                   List<byte[]> live = new ArrayList<>(liveCount);
                   long expect = 0;
                   for (int i = 0; i < liveCount; i++) {
@@ -205,11 +216,85 @@ jobs:
                       big.clear();
                       for (int i = 0; i < settle; i++) { System.gc(); Thread.sleep(1000); }
                   }
+                  if (soak > 0) {
+                      live.clear();
+                      big.clear();
+                      ok = soakUncommit(soak, soakThreads, balloonMB) && ok;
+                  }
                   System.out.println("GC " + (ok ? "OK" : "FAIL")
                           + " collector=" + gcNames()
                           + " maxHeap=" + (Runtime.getRuntime().maxMemory() >> 20) + "m"
                           + " sink=" + sink);
               }
+              /* One thread inflates and drops a balloon, so the collector has
+                 something to give back and does it again and again; the others
+                 do nothing but allocate and write every page of what they
+                 allocate, which is what dirties the page table entries of the
+                 same backing file the holes are punched in. Each page is read
+                 back straight after it is written: a page that comes back as
+                 anything but its own mark has been taken by a punch that should
+                 not have reached it. */
+              static boolean soakUncommit(int seconds, int nthreads, int balloonMB)
+                      throws Exception {
+                  final long end = System.currentTimeMillis() + seconds * 1000L;
+                  final java.util.concurrent.atomic.AtomicLong pages =
+                          new java.util.concurrent.atomic.AtomicLong();
+                  final java.util.concurrent.atomic.AtomicLong wrong =
+                          new java.util.concurrent.atomic.AtomicLong();
+                  Thread[] ts = new Thread[nthreads];
+                  for (int t = 0; t < nthreads; t++) {
+                      final byte mark = (byte) (t + 1);
+                      ts[t] = new Thread(new Runnable() {
+                          public void run() {
+                              List<byte[]> hold = new ArrayList<>();
+                              long n = 0, bad = 0;
+                              while (System.currentTimeMillis() < end) {
+                                  byte[] a = new byte[256 * 1024];
+                                  for (int j = 0; j < a.length; j += 4096) {
+                                      a[j] = mark;
+                                      n++;
+                                  }
+                                  hold.add(a);
+                                  /* Read back the oldest one still held, not the
+                                     one just written, or the compiler folds the
+                                     check into the store it just made. A page a
+                                     punch took away comes back as zero. */
+                                  byte[] old = hold.get(0);
+                                  for (int j = 0; j < old.length; j += 4096)
+                                      if (old[j] != mark) bad++;
+                                  /* keep some of it alive, let the rest go, so
+                                     the used size moves under the collector */
+                                  if (hold.size() > 32) hold.subList(0, 16).clear();
+                              }
+                              pages.addAndGet(n);
+                              wrong.addAndGet(bad);
+                          }
+                      });
+                      ts[t].start();
+                  }
+                  int cycles = 0;
+                  while (System.currentTimeMillis() < end) {
+                      List<byte[]> balloon = new ArrayList<>();
+                      for (int i = 0; i < balloonMB / 4; i++) {
+                          byte[] a = new byte[4 * 1024 * 1024];
+                          a[0] = 1; a[a.length - 1] = 2;
+                          balloon.add(a);
+                      }
+                      balloon.clear();
+                      System.gc();
+                      /* longer than ZUncommitDelay, so the uncommitter fires
+                         here -- with the threads above still faulting */
+                      Thread.sleep(2000);
+                      cycles++;
+                  }
+                  for (Thread th : ts) th.join();
+                  boolean ok = (wrong.get() == 0);
+                  System.out.println("SOAK " + (ok ? "OK" : "MISMATCH")
+                          + " cycles=" + cycles + " pages=" + pages.get()
+                          + " wrong=" + wrong.get());
+                  return ok;
+              }
+
               static String gcNames() {
                   StringBuilder sb = new StringBuilder();
                   for (java.lang.management.GarbageCollectorMXBean b :
@@ -283,6 +368,7 @@ jobs:
             "z-shmem|UseZGC|\"tmpfs\", \"shmem\"|"
             "z-large|UseZGC|\"tmpfs\", \"shmem\"|\"-Xmx512m\", \"-Dhumongous=4\", \"-DhumongousMB=32\", \"-Drounds=6\","
             "z-uncommit|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=8\", \"-Dsettle=8\","
+            "z-soak|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=120\", \"-DsoakThreads=3\","
           )
           for entry in "${MATRIX[@]}"; do
             label="$(echo "$entry" | cut -d'|' -f1)"
@@ -335,7 +421,7 @@ jobs:
             echo ""
             echo "| GC | image | result | collectors / reason |"
             echo "|---|---|---|---|"
-            for l in g1 serial parallel shenandoah z z-shmem z-large z-uncommit; do
+            for l in g1 serial parallel shenandoah z z-shmem z-large z-uncommit z-soak; do
               v=$(verdict "gc-${l}.log")
               if [ "$v" = OK ]; then
                 d=$(grep -o 'collector=[^ ]*' "gc-${l}.log" | head -1)
@@ -346,6 +432,7 @@ jobs:
                 z-shmem)    img="+ klibs" ;;
                 z-large)    img="+ klibs, 32M objects (large pages)" ;;
                 z-uncommit) img="+ klibs, -Xms64m/-Xmx512m (uncommit on)" ;;
+                z-soak)     img="+ klibs, uncommit **while 3 threads write the heap**" ;;
                 *)          img="stock" ;;
               esac
               echo "| \`$l\` | $img | **$v** | ${d:-–} |"
@@ -355,6 +442,22 @@ jobs:
             echo '```'
             ev=$(grep -E 'Uncommitter|Uncommit:' gc-z-uncommit.log 2>/dev/null | head -5 || true)
             echo "${ev:-(none reported)}"
+            echo '```'
+            echo ""
+            # The two ingredients of the kernel race, produced by the collector alone and by
+            # nothing else: holes punched in the backing file by the uncommitter, and page
+            # faults on that same file from threads that are still writing the heap. Every
+            # other cut of that race is a C probe standing in for a JVM; this one is the JVM.
+            echo "### ZGC punching holes while the heap is being written"
+            echo ""
+            echo '```'
+            {
+              grep -E '^SOAK ' gc-z-soak.log 2>/dev/null | head -2
+              # grep -c prints its 0 and exits 1, so the fallback is for a missing file only
+              n=$(grep -cE 'Uncommitter.*Uncommitted:' gc-z-soak.log 2>/dev/null || true)
+              printf 'uncommitter fired %s time(s)\n' "${n:-0}"
+              grep -E 'Uncommitter.*Uncommitted:' gc-z-soak.log 2>/dev/null | tail -3
+            } | sed 's/^$//'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -415,6 +518,29 @@ jobs:
             echo "PASS: ZGC uncommitted memory through the memfd: $(grep -oE 'Uncommitter.*' gc-z-uncommit.log | head -1)"
           else
             echo "::warning::the uncommitter never reported giving memory back — the path stayed untested in this run (delay too long, or nothing was uncommittable)"
+          fi
+
+          # The one cut where the collector itself produces both halves of the race the kernel
+          # has to survive: the uncommitter punching holes in the backing file while three
+          # threads keep faulting the same file. Every other measurement of that race is a C
+          # probe standing in for a JVM, with an fsync in it that no collector performs. If
+          # this one stops the guest, nothing has to be inferred.
+          xv=$(verdict gc-z-soak.log)
+          fired=$(grep -cE 'Uncommitter.*Uncommitted:' gc-z-soak.log 2>/dev/null || true)
+          fired=${fired:-0}
+          echo "zgc (+klib, uncommit under load): $xv, uncommitter fired ${fired} time(s)"
+          # The mismatch is checked first: it makes the workload report GC FAIL as well, and
+          # "a page came back wrong" is a different sentence from "it never got to the end".
+          if grep -q '^SOAK MISMATCH' gc-z-soak.log 2>/dev/null; then
+            echo "::error::a page read back wrong during the soak — a punch took a page that was still in use: $(grep -E '^SOAK ' gc-z-soak.log | head -1)"
+            fail=1
+          elif [ "$xv" != OK ]; then
+            echo "::error::ZGC did not survive punching holes while its own heap was being written (uncommitter fired ${fired} time(s)): $(reason gc-z-soak.log)"
+            fail=1
+          elif [ "$fired" = 0 ]; then
+            echo "::warning::the soak ran to the end but the uncommitter never gave memory back, so the punch-under-load path was never entered — this cut measured nothing"
+          else
+            echo "PASS: $(grep -E '^SOAK ' gc-z-soak.log | head -1) with ${fired} uncommit(s) taken while the heap was being written"
           fi
 
           sv=$(verdict gc-shenandoah.log)
