@@ -121,7 +121,9 @@ jobs:
           # to satisfy that check; qemu-system-arm/aarch64 actually boot the
           # arm64 guest. Mirrors the known-good verifyCpuinfoArm64 job.
           sudo apt-get update
-          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+          # gdb is for the catcher below: a guest that stops here prints nothing, and the stub
+          # is the only thing outside it that can still be asked.
+          sudo apt-get install -y build-essential binutils wget git python3 nasm gdb \
             qemu-system qemu-user qemu-user-static qemu-system-arm \
             qemu-system-aarch64 binfmt-support qemu-utils
           which qemu-system-x86_64 qemu-system-aarch64
@@ -373,6 +375,26 @@ jobs:
             echo "klib $k <- $built"
           done
 
+      # The soak stops the guest and prints nothing at all doing it -- no fault, no assertion,
+      # the collector's log simply ends mid-cycle -- which is the shape of a stopped processor
+      # and the one thing nothing inside the guest can report on. qemu's stub is outside it, so
+      # a second kernel is built here for the stub to read the guest with: laid out where it was
+      # linked, since an address without a name is not an answer. Only the catcher runs this one.
+      # (The define goes on the single file that reads it, not through CFLAGS, which make
+      # re-exports to every sub-make; and it is a copy of the checkout rather than a worktree,
+      # because gitversion.c is made from .git/index and a worktree has none.)
+      - name: Build a kernel that stays where it was linked, for the catcher
+        if: matrix.arch == 'x64'
+        run: |
+          cp -a "$GITHUB_WORKSPACE" /tmp/diag
+          rm -rf /tmp/diag/output
+          make -C /tmp/diag -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }} \
+            CFLAGS-init.c=-DNO_KASLR
+          echo "DIAG_ELF=$(find /tmp/diag/output -name kernel.elf | head -1)" >> "$GITHUB_ENV"
+          cp "$(find /tmp/diag/output/platform/${{ matrix.platform }} -name kernel.img | head -1)" \
+            /tmp/kernel-diag.img
+          ls -l /tmp/kernel-diag.img
+
       - name: Boot the workload once per GC
         run: |
           set -o pipefail
@@ -424,6 +446,106 @@ jobs:
               --show-debug --verbose -c "cfg-${label}.json" 2>&1 \
               | strip_ansi | tee "gc-${label}.log" || true
           done
+
+      # Where the soak stops, with the symbols of the kernel built above. The image ops has just
+      # made is booted by hand, with the same devices ops gives it and the stub added, and every
+      # processor is asked where it is once the guest goes quiet. This is the instrument that
+      # named the lock inversion from the C probe; the soak is a real JVM, so what it names here
+      # is the defect as a collector meets it.
+      - name: Catch the soak where it stops, and ask every processor where it is
+        if: matrix.arch == 'x64'
+        run: |
+          set -o pipefail
+          # The stub reads the guest with the symbols of the kernel that is running in it, so the
+          # diagnostic build goes into ops's slot and one run rebuilds the image around it. That
+          # run is the soak, so it may well stop as well; it is not being measured, only used to
+          # produce the image.
+          cp /tmp/kernel-diag.img "$OPSK"
+          KLIBDIR="$(dirname "$OPSK")/klibs"
+          for k in tmpfs shmem; do
+            built="$(find /tmp/diag/output -type f -path '*/bin/*' -name "$k" | head -1)"
+            [ -n "$built" ] || { echo "::warning::klib '$k' missing from the catcher build"; continue; }
+            cp "$built" "$KLIBDIR/$k"
+          done
+          timeout 600 ops pkg load "${{ matrix.package }}" --arch ${{ matrix.ops_arch }} \
+            --nightly -c cfg-z-soak.json > /dev/null 2>&1 || true
+          # `timeout` kills ops, not the qemu underneath it, and an orphan holds the write lock
+          # on the image: every boot after it fails in a second, which in a log is indistinguishable
+          # from a guest that stopped.
+          pkill -f qemu-system >/dev/null 2>&1 && { sleep 1; pkill -9 -f qemu-system >/dev/null 2>&1 || true; }
+          img="$HOME/.ops/images/java"
+          [ -f "$img" ] || { echo "::warning::no image left to boot for the catcher"; exit 0; }
+          # The devices are the ones ops passes, read off its own command line, plus -s.
+          run_qemu() {
+            qemu-system-x86_64 -machine q35 -smp 4 -m 2G -cpu max \
+              -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x3 \
+              -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x3.0x6 \
+              -device virtio-scsi-pci,bus=pci.2,addr=0x0,id=scsi0 \
+              -device scsi-hd,bus=scsi0.0,drive=hd0 \
+              -drive file="$img",format=raw,if=none,id=hd0 \
+              -device virtio-rng-pci -device virtio-balloon \
+              -vga none -device isa-debug-exit -display none -serial stdio -s
+          }
+          for attempt in 1 2 3; do
+            echo "=== soak under the stub: attempt ${attempt} ==="
+            : > soak-hang.serial
+            run_qemu > soak-hang.serial 2>&1 &
+            qpid=$!
+            stalls=0; last=0
+            # The soak asks for sixty seconds and beats once a cycle, so half a minute with
+            # nothing new is not a slow guest.
+            for _ in $(seq 1 90); do
+              sleep 2
+              grep -q 'GC OK' soak-hang.serial && break
+              grep -q 'no fault handler' soak-hang.serial && break
+              now=$(wc -c < soak-hang.serial)
+              if [ "$now" = "$last" ]; then stalls=$((stalls + 1)); else stalls=0; fi
+              last=$now
+              [ "$stalls" -ge 15 ] && break
+            done
+            if grep -q 'GC OK' soak-hang.serial; then
+              echo "the soak finished this time"
+              kill "$qpid" 2>/dev/null || true; wait "$qpid" 2>/dev/null || true
+              continue
+            fi
+            echo "--- it stopped here ---"
+            tail -5 soak-hang.serial
+            if grep -q 'no fault handler' soak-hang.serial; then
+              # A fault is not a hang: nanos prints its own trace, symbolised against the load
+              # offset it reports, and stops the machine, so there is nothing on the stub by the
+              # time gdb reaches it. The answer is already on the serial.
+              sed -n '/no fault handler/,$p' soak-hang.serial | head -80 > soak-hang.bt
+              echo "::warning::the soak faulted; the trace nanos printed is in soak-hang.bt"
+            else
+              # Linked at KERNEL_BASE_PHYS and running relocated to KERNEL_BASE, so the symbols
+              # go in at the difference between the two, read out of the ELF rather than written
+              # here -- and through add-symbol-file, since given the file gdb keeps the addresses
+              # it was linked at.
+              lb=$(readelf -lW "$DIAG_ELF" | awk '$1 == "LOAD" { print $3; exit }')
+              bias=$(printf '0x%x' $(( 0xffffffff80000000 - lb )))
+              echo "symbols from $(basename "$DIAG_ELF") linked at ${lb}, loaded at ${bias}"
+              gdb -batch -n \
+                -ex 'target remote :1234' \
+                -ex "add-symbol-file $DIAG_ELF -o $bias" \
+                -ex 'info threads' \
+                -ex 'thread apply all bt' \
+                -ex 'thread apply all info registers rip rsp' 2>&1 | tee soak-hang.bt
+              if ! grep -qE '^#[0-9]+ .* in [A-Za-z_]' soak-hang.bt; then
+                echo "::warning::not one frame came back with a name -- the bias ${bias} no longer matches this kernel"
+              fi
+              echo "::warning::the soak stopped the guest; where each processor was is in soak-hang.bt"
+            fi
+            kill "$qpid" 2>/dev/null || true; wait "$qpid" 2>/dev/null || true
+            {
+              echo "### Where every processor was when the soak stopped"
+              echo ""
+              echo '```'
+              sed -n '1,120p' soak-hang.bt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          done
+          echo "the soak finished in all three attempts under the stub"
 
       - name: Gate the control GCs and ZGC-with-klib, report the rest
         run: |
@@ -605,6 +727,8 @@ jobs:
             GcChurn.java
             gc-*.log
             cfg-*.json
+            soak-hang.serial
+            soak-hang.bt
 
   # ====================================================================
   # What exactly would a memfd_create patch have to provide? Rather than
