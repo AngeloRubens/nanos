@@ -156,6 +156,11 @@ void demand_page_done(context ctx, u64 vaddr, status s)
     } else if (is_thread_context(ctx)) {
         pf_debug("demand page failed user mode, reason: %v", s);
         thread t = (thread)ctx;
+        /* Diagnostic: a probe run took SIGBUS reading back a page whose file had been punched,
+         * and from outside the guest the three ways this fails are one signal -- a page beyond
+         * the node's length, no memory to bring the page back, or a read that failed. The
+         * status says which, and it is dropped here. */
+        msg_err("demand page failed for user thread at 0x%lx: %v", vaddr, s);
         if (s == timm_oom) {
             spin_lock(&oom_lock);
             timestamp here = now(CLOCK_ID_MONOTONIC);

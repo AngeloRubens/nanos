@@ -1028,6 +1028,7 @@ jobs:
           static sigjmp_buf conc_fault_jb;
           static volatile int conc_in_verify, conc_fault_sig;
           static void * volatile conc_fault_addr;
+          static volatile unsigned long conc_last_unreadable;
 
           static void conc_fault_handler(int sig, siginfo_t *si, void *unused)
           {
@@ -1254,9 +1255,11 @@ jobs:
                   if (conc_disjoint && (pi >= conc_pages / 2))
                       continue;
                   if (sigsetjmp(conc_fault_jb, 1) != 0) {
-                      if (unreadable++ == 0)
+                      if (unreadable++ == 0) {
+                          conc_last_unreadable = pi;
                           printf("RACE page %lu could not be read back: signal %d at %p\n",
                                  pi, conc_fault_sig, conc_fault_addr);
+                      }
                       continue;
                   }
                   conc_in_verify = 1;
@@ -1269,10 +1272,21 @@ jobs:
               }
               conc_in_verify = 0;
               if (unreadable) {
+                  /* The three ways a demand page fails come back as one signal, and these are
+                     what tell them apart from out here: a length that has shrunk would put the
+                     page past the end of the node, and a MemFree near zero would mean the page
+                     could not be brought back rather than lost. The same offset is read through
+                     the descriptor as well -- a page that reads fine that way and faults through
+                     the mapping is a mapping problem and not a file one. */
                   struct stat st;
-                  printf("RACE %lu of %lu pages could not be read back, MemFree %ld kB, file"
-                         " %ld blocks\n", unreadable, conc_pages, meminfo_free_kb(),
-                         (fstat(conc_fd, &st) == 0) ? (long)st.st_blocks : -1L);
+                  unsigned char via_fd = 0;
+                  ssize_t rv = pread(conc_fd, &via_fd, 1, (off_t)(conc_last_unreadable * conc_ps));
+                  printf("RACE %lu of %lu pages could not be read back; MemFree %ld kB, file %ld"
+                         " blocks, size %ld, page %lu through the fd: rv=%ld byte=0x%02x\n",
+                         unreadable, conc_pages, meminfo_free_kb(),
+                         (fstat(conc_fd, &st) == 0) ? (long)st.st_blocks : -1L,
+                         (fstat(conc_fd, &st) == 0) ? (long)st.st_size : -1L,
+                         conc_last_unreadable, (long)rv, via_fd);
                   fflush(stdout);
               }
               ok("concurrent_no_corruption",
