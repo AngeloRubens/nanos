@@ -664,6 +664,8 @@ jobs:
           #include <stdio.h>
           #include <stdlib.h>
           #include <sched.h>
+          #include <setjmp.h>
+          #include <signal.h>
           #include <string.h>
           #include <time.h>
           #include <unistd.h>
@@ -1018,6 +1020,36 @@ jobs:
               return 0;
           }
 
+          /* A read of a punched page has to give a hole, never a fault: the kernel is expected
+             to bring the page back as zeroes. One run ended with SIGBUS in the verification
+             below instead, so the fault is caught and counted -- a page that cannot be read is
+             a result, and a round that dies on it is not. Only the verification is guarded;
+             anywhere else a fault still means what it always meant. */
+          static sigjmp_buf conc_fault_jb;
+          static volatile int conc_in_verify, conc_fault_sig;
+          static void * volatile conc_fault_addr;
+
+          static void conc_fault_handler(int sig, siginfo_t *si, void *unused)
+          {
+              (void)unused;
+              if (!conc_in_verify)
+                  _exit(128 + sig);   /* not ours to catch */
+              conc_fault_sig = sig;
+              conc_fault_addr = si->si_addr;
+              conc_in_verify = 0;
+              siglongjmp(conc_fault_jb, 1);
+          }
+
+          static void conc_install_fault_handler(void)
+          {
+              struct sigaction sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sa_sigaction = conc_fault_handler;
+              sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+              sigaction(SIGBUS, &sa, 0);
+              sigaction(SIGSEGV, &sa, 0);
+          }
+
           static unsigned char marker_of(unsigned long pi)
           {
               return (unsigned char)(pi % 251) + 1;   /* never zero */
@@ -1204,22 +1236,50 @@ jobs:
                  conc_werr, conc_blocks_max);
 
               /* Nothing is racing any more: every page must read the same through both mappings,
-                 and be either its own marker or a hole. */
-              unsigned long mismatched = 0, foreign = 0;
-              for (unsigned long pi = 0; pi < conc_pages; pi++) {
+                 and be either its own marker or a hole. A page that cannot be read at all is a
+                 third answer, and it is the one that killed a run outright before this was here:
+                 reading page 1444 back raised SIGBUS, which on a mapping of a punched file is
+                 the kernel saying it cannot bring the page back. Caught rather than fatal, so a
+                 round reports how many pages went that way instead of ending mid-verification. */
+              /* volatile, all four of them: a local that is written between sigsetjmp() and the
+                 jump back is restored to whatever the compiler had left in a register, and a
+                 loop counter that goes backwards reads pages twice or never ends. Proved by
+                 getting it wrong first -- the same loop over four pages, two of them
+                 unreadable, counted six. */
+              volatile unsigned long mismatched = 0, foreign = 0, unreadable = 0, pi;
+              conc_install_fault_handler();
+              for (pi = 0; pi < conc_pages; pi++) {
                   /* Nothing writes the upper half through a mapping when the two are kept
                      apart, so it holds whatever the punches left rather than a marker. */
                   if (conc_disjoint && (pi >= conc_pages / 2))
                       continue;
+                  if (sigsetjmp(conc_fault_jb, 1) != 0) {
+                      if (unreadable++ == 0)
+                          printf("RACE page %lu could not be read back: signal %d at %p\n",
+                                 pi, conc_fault_sig, conc_fault_addr);
+                      continue;
+                  }
+                  conc_in_verify = 1;
                   unsigned char a = conc_a[pi * conc_ps], b = conc_b[pi * conc_ps];
+                  conc_in_verify = 0;
                   if (a != b)
                       mismatched++;
                   if ((a != 0) && (a != marker_of(pi)))
                       foreign++;
               }
-              ok("concurrent_no_corruption", (conc_bad == 0) && (foreign == 0) && (mismatched == 0),
+              conc_in_verify = 0;
+              if (unreadable) {
+                  struct stat st;
+                  printf("RACE %lu of %lu pages could not be read back, MemFree %ld kB, file"
+                         " %ld blocks\n", unreadable, conc_pages, meminfo_free_kb(),
+                         (fstat(conc_fd, &st) == 0) ? (long)st.st_blocks : -1L);
+                  fflush(stdout);
+              }
+              ok("concurrent_no_corruption",
+                 (conc_bad == 0) && (foreign == 0) && (mismatched == 0) && (unreadable == 0),
                  "%lu pages holding another page's marker, %lu incoherent between the two mappings,"
-                 " %lu bad reads during the race", foreign, mismatched, conc_bad);
+                 " %lu that could not be read back at all, %lu bad reads during the race",
+                 foreign, mismatched, unreadable, conc_bad);
               munmap(conc_a, CONC_LEN);
               munmap(conc_b, CONC_LEN);
               close((int)fd);
