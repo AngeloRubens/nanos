@@ -142,7 +142,23 @@ jobs:
              while keeping a live set that is checked at the end: a GC that
              corrupts or drops a live object shows up as MISMATCH, not as a
              silent pass. Kept small on purpose — this boots under TCG. */
-          public class GcChurn {
+          /* The class is its own Runnable, and the soak's per-thread state is held in
+             fields, because the image ships exactly one class file: an anonymous or nested
+             class compiles to a second one (GcChurn$1.class), which is not in the manifest,
+             and the guest dies with ClassNotFoundException after booting the whole JVM. */
+          public class GcChurn implements Runnable {
+              private final byte mark;
+              private final long deadline;
+              private final java.util.concurrent.atomic.AtomicLong pages, wrong;
+
+              GcChurn(byte mark, long deadline, java.util.concurrent.atomic.AtomicLong pages,
+                      java.util.concurrent.atomic.AtomicLong wrong) {
+                  this.mark = mark;
+                  this.deadline = deadline;
+                  this.pages = pages;
+                  this.wrong = wrong;
+              }
+
               static long fnv(byte[] b) {
                   long h = 0xcbf29ce484222325L;
                   for (byte v : b) { h ^= (v & 0xff); h *= 0x100000001b3L; }
@@ -226,14 +242,37 @@ jobs:
                           + " maxHeap=" + (Runtime.getRuntime().maxMemory() >> 20) + "m"
                           + " sink=" + sink);
               }
+              /* The churn each soak thread does: allocate, write every page of what
+                 was allocated, and read back the oldest block still held -- not the
+                 one just written, or the compiler folds the check into the store it
+                 has just made. A page a punch took away comes back as zero. */
+              public void run() {
+                  List<byte[]> hold = new ArrayList<>();
+                  long n = 0, bad = 0;
+                  while (System.currentTimeMillis() < deadline) {
+                      byte[] a = new byte[256 * 1024];
+                      for (int j = 0; j < a.length; j += 4096) {
+                          a[j] = mark;
+                          n++;
+                      }
+                      hold.add(a);
+                      byte[] old = hold.get(0);
+                      for (int j = 0; j < old.length; j += 4096)
+                          if (old[j] != mark) bad++;
+                      /* keep some of it alive, let the rest go, so the used size
+                         moves under the collector */
+                      if (hold.size() > 32) hold.subList(0, 16).clear();
+                  }
+                  pages.addAndGet(n);
+                  wrong.addAndGet(bad);
+              }
+
               /* One thread inflates and drops a balloon, so the collector has
                  something to give back and does it again and again; the others
                  do nothing but allocate and write every page of what they
                  allocate, which is what dirties the page table entries of the
-                 same backing file the holes are punched in. Each page is read
-                 back straight after it is written: a page that comes back as
-                 anything but its own mark has been taken by a punch that should
-                 not have reached it. */
+                 same backing file the holes are punched in. What they read back
+                 is in run() above. */
               static boolean soakUncommit(int seconds, int nthreads, int balloonMB)
                       throws Exception {
                   final long end = System.currentTimeMillis() + seconds * 1000L;
@@ -243,33 +282,7 @@ jobs:
                           new java.util.concurrent.atomic.AtomicLong();
                   Thread[] ts = new Thread[nthreads];
                   for (int t = 0; t < nthreads; t++) {
-                      final byte mark = (byte) (t + 1);
-                      ts[t] = new Thread(new Runnable() {
-                          public void run() {
-                              List<byte[]> hold = new ArrayList<>();
-                              long n = 0, bad = 0;
-                              while (System.currentTimeMillis() < end) {
-                                  byte[] a = new byte[256 * 1024];
-                                  for (int j = 0; j < a.length; j += 4096) {
-                                      a[j] = mark;
-                                      n++;
-                                  }
-                                  hold.add(a);
-                                  /* Read back the oldest one still held, not the
-                                     one just written, or the compiler folds the
-                                     check into the store it just made. A page a
-                                     punch took away comes back as zero. */
-                                  byte[] old = hold.get(0);
-                                  for (int j = 0; j < old.length; j += 4096)
-                                      if (old[j] != mark) bad++;
-                                  /* keep some of it alive, let the rest go, so
-                                     the used size moves under the collector */
-                                  if (hold.size() > 32) hold.subList(0, 16).clear();
-                              }
-                              pages.addAndGet(n);
-                              wrong.addAndGet(bad);
-                          }
-                      });
+                      ts[t] = new Thread(new GcChurn((byte) (t + 1), end, pages, wrong));
                       ts[t].start();
                   }
                   int cycles = 0;
@@ -307,7 +320,13 @@ jobs:
           }
           EOF
           javac --release 11 -d . GcChurn.java
-          ls -l GcChurn.class
+          ls -l GcChurn*.class
+          # The image ships one file, named below in every config: a lambda or an
+          # anonymous class compiles to a second one, the manifest does not carry it,
+          # and the guest boots the whole JVM before dying with ClassNotFoundException
+          # inside nanos. Cheaper to notice here, with a sentence saying why.
+          n=$(ls GcChurn*.class | wc -l)
+          [ "$n" = 1 ] || { echo "::error::the workload compiled to ${n} class files, but the image ships only GcChurn.class — keep it to one class (no lambdas, no nested or anonymous classes) or add the others to \"Files\""; exit 1; }
 
       - name: Install ops
         run: |
