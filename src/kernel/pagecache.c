@@ -1010,7 +1010,13 @@ static void commit_dirty_node_complete(pagecache_node pn, status_handler complet
             list_delete(&op->l);
             pagecache_unlock_node(pn);
             struct pagecache_node_op_complete *c = (struct pagecache_node_op_complete *)op;
-            apply(c->sh, timm_clone(s));
+            /* Deferred rather than applied here: this runs on whichever context finished the
+             * commit -- the runloop's, when the commit completed asynchronously -- while a
+             * completion queued on the node belongs to the thread that asked for the sync.
+             * Applied directly it runs on the wrong context, which is exactly what
+             * sync_complete() asserts about before returning a value to that thread.
+             * service_async_1() restores the context the closure was made in. */
+            async_apply_status_handler(c->sh, timm_clone(s));
             deallocate(pn->pv->pc->h, c, sizeof(*c));
             pagecache_lock_node(pn);
         }
