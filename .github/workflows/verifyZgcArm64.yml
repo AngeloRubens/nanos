@@ -475,15 +475,23 @@ jobs:
           pkill -f qemu-system >/dev/null 2>&1 && { sleep 1; pkill -9 -f qemu-system >/dev/null 2>&1 || true; }
           img="$HOME/.ops/images/java"
           [ -f "$img" ] || { echo "::warning::no image left to boot for the catcher"; exit 0; }
-          # The devices are the ones ops passes, read off its own command line, plus -s.
+          # Every device ops passes, read off its own command line, and not a device fewer: the
+          # first attempt at this dropped the third root port and the network card, and the guest
+          # took a general protection fault with a non-canonical rip before printing a single
+          # line, in the code that reads the manifest -- which lists a network interface the
+          # image was built to have. Booting an ops image with fewer devices than ops gives it is
+          # not booting the thing being measured.
           run_qemu() {
             qemu-system-x86_64 -machine q35 -smp 4 -m 2G -cpu max \
               -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x3 \
               -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x3.0x6 \
+              -device pcie-root-port,port=0x12,chassis=3,id=pci.4,bus=pcie.0,addr=0x3.0x4 \
               -device virtio-scsi-pci,bus=pci.2,addr=0x0,id=scsi0 \
               -device scsi-hd,bus=scsi0.0,drive=hd0 \
               -drive file="$img",format=raw,if=none,id=hd0 \
               -device virtio-rng-pci -device virtio-balloon \
+              -device virtio-net,bus=pci.4,addr=0x0,netdev=n0,mac=d2:bd:64:08:5d:89 \
+              -netdev user,id=n0 \
               -vga none -device isa-debug-exit -display none -serial stdio -s
           }
           for attempt in 1 2 3; do
@@ -510,6 +518,11 @@ jobs:
             fi
             echo "--- it stopped here ---"
             tail -5 soak-hang.serial
+            # A serial with no boot in it at all means the guest never got as far as the
+            # workload, and what follows would be a backtrace of this step's own mistake.
+            if ! grep -qE 'Using The Z Garbage Collector|en1: assigned' soak-hang.serial; then
+              echo "::warning::the catcher's guest produced no boot output — it is this boot that is wrong, not the soak"
+            fi
             if grep -q 'no fault handler' soak-hang.serial; then
               # A fault is not a hang: nanos prints its own trace, symbolised against the load
               # offset it reports, and stops the machine, so there is nothing on the stub by the
