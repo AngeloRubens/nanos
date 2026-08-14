@@ -1127,8 +1127,19 @@ define_closure_function(3, 1, void, pagecache_commit_dirty_ranges,
             rp->start = start;
         if (range_span(r) == 0)
             break;
+        /* The node is let go around the write, and this is required rather than polite: fs_write
+         * may sleep -- tmpfs takes the filesystem mutex in tmpfsfile_write() -- and a processor
+         * that suspends holding this spinlock stops every other one that touches the node. Caught
+         * exactly so, with all four processors stopped: one here inside mutex_lock(), the other
+         * three spinning on this lock in a page fault, in a write-back completion, and in a
+         * punch. It is the rule Linux states as its own -- the mapping's tree lock protects the
+         * tree and never spans a call into the filesystem -- and it is safe here because the
+         * pages of this range are already reserved above: WRITING state, a reference and a write
+         * count each, so none of them can go away while the lock is down. */
+        pagecache_unlock_node(pn);
         apply(pn->fs_write, sg, r,
               closure(pc->h, pagecache_commit_complete, pc, first_page, page_count, sg, apply_merge(m)));
+        pagecache_lock_node(pn);
     }
     pagecache_unlock_node(pn);
     apply(sh, s);
