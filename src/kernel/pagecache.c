@@ -1939,6 +1939,11 @@ void *pagecache_get_page_if_filled(pagecache_node pn, u64 node_offset, boolean p
     return kvirt;
 }
 
+/* Pages per pass of pagecache_node_free_pages(): the run held under one lock hold. Large
+   enough that the locks are taken once per many pages, small enough that a faulting thread
+   waiting on the node behind it waits for a few dozen field updates and not for a punch. */
+#define FREE_PAGES_BATCH 32
+
 struct pagecache_unmap_range {
     range v;                    /* virtual */
     u64 node_offset;
@@ -2004,45 +2009,72 @@ void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */)
             pagecache_node_unmap_pages_sync(pn, maps[i].v, maps[i].node_offset, false);
     }
 
+    /* Taken a batch at a time, and the batch is walked rather than looked up: a hole of n pages
+       used to cost n lookups of the node's tree and n acquisitions of each of its two locks,
+       when the pages are neighbours in that tree and the whole run can be had from one lookup
+       and one hold. What has to stay outside the locks is the zeroing, which is a page-sized
+       memset, so the batch is gathered under the locks, zeroed without them, and released under
+       them again: three lock holds for the batch instead of four for every page in it. */
     range pages = range_rshift(q, page_order);
     u64 page_size = U64_FROM_BIT(page_order);
-    for (u64 pi = pages.start; pi < pages.end; pi++) {
+    pagecache_page batch[FREE_PAGES_BATCH];
+    void *to_zero[FREE_PAGES_BATCH];
+    u64 next = pages.start;
+
+    while (next < pages.end) {
+        int n = 0;
         pagecache_lock_node(pn);
-        pagecache_page pp = page_lookup_nodelocked(pn, pi);
-        if (pp == INVALID_ADDRESS) {  /* never faulted in: already a hole */
-            pagecache_unlock_node(pn);
-            continue;
-        }
+        /* The first page at or after next: an exact lookup would miss a range whose leading
+           pages were never faulted in, which is the common case for a punch. */
+        struct pagecache_page k;
+        k.state_offset = next;
+        pagecache_page pp = (pagecache_page)rbtree_lookup_max_lte(&pn->pages, &k.rbnode);
+        if ((pp != INVALID_ADDRESS) && (page_offset(pp) < next))
+            pp = (pagecache_page)rbnode_get_next(&pp->rbnode);
         pagecache_lock_state(pc);
-        if (page_state(pp) == PAGECACHE_PAGESTATE_FREE) {
-            /* An evicted page whose last reference has already been dropped: it holds no memory
-               to give back, and taking a reference on it would have us release it a second
-               time. */
-            pagecache_unlock_state(pc);
-            pagecache_unlock_node(pn);
-            continue;
+        while ((pp != INVALID_ADDRESS) && (n < FREE_PAGES_BATCH)) {
+            u64 pi = page_offset(pp);
+            if (pi >= pages.end)
+                break;
+            next = pi + 1;
+            /* An evicted page whose last reference has already been dropped holds no memory to
+               give back, and taking a reference on it would have us release it a second time. */
+            if (page_state(pp) != PAGECACHE_PAGESTATE_FREE) {
+                pp->refcount++;     /* ours, so that the page cannot go away below */
+                batch[n++] = pp;
+            }
+            pp = (pagecache_page)rbnode_get_next(&pp->rbnode);
         }
-        pp->refcount++; /* our own reference, so that the page cannot go away below */
+        if (pp == INVALID_ADDRESS)
+            next = pages.end;       /* nothing further in this node */
+        pagecache_unlock_state(pc);
+        pagecache_unlock_node(pn);
+
+        pagecache_lock_state(pc);
+        for (int i = 0; i < n; i++) {
+            pagecache_page p = batch[i];
+            if (!p->evicted) {
+                p->evicted = true;
+                pagecache_page_release_locked(pc, p, false);    /* cache reference */
+            }
+            /* Read after that release, as the reference count decides it: a page someone else
+               still holds is zeroed where it is rather than given back. */
+            to_zero[i] = ((p->refcount > 1) && (p->kvirt != INVALID_ADDRESS)) ? p->kvirt : 0;
+        }
         pagecache_unlock_state(pc);
 
-        pagecache_unlock_node(pn);
+        for (int i = 0; i < n; i++)
+            if (to_zero[i])
+                zero(to_zero[i], page_size);
+
         pagecache_lock_state(pc);
-        if (!pp->evicted) {
-            pp->evicted = true;
-            pagecache_page_release_locked(pc, pp, false);    /* cache reference */
-        }
-        boolean referenced = (pp->refcount > 1);
-        void *kvirt = pp->kvirt;
-        pagecache_unlock_state(pc);
-        if (referenced && (kvirt != INVALID_ADDRESS))
-            zero(kvirt, page_size);
-        pagecache_lock_state(pc);
-        /* The page keeps its place in the node, in the state an eviction leaves behind: only the
-           memory it holds is given back. Removing it would pull it out from under whoever is
-           walking the node's pages by pointer -- a write-back completion iterates them with
-           rbnode_get_next() long after the write itself is done -- and it is not ours to remove
-           anyway: a refault takes it back with its refault data intact. */
-        pagecache_page_release_locked(pc, pp, false);
+        /* The pages keep their place in the node, in the state an eviction leaves behind: only
+           the memory they hold is given back. Removing them would pull one out from under
+           whoever is walking the node's pages by pointer -- a write-back completion iterates
+           them with rbnode_get_next() long after the write itself is done -- and they are not
+           ours to remove anyway: a refault takes one back with its refault data intact. */
+        for (int i = 0; i < n; i++)
+            pagecache_page_release_locked(pc, batch[i], false);
         pagecache_unlock_state(pc);
     }
 }
