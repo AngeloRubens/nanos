@@ -2019,7 +2019,6 @@ void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */)
     range pages = range_rshift(q, page_order);
     u64 page_size = U64_FROM_BIT(page_order);
     pagecache_page batch[FREE_PAGES_BATCH];
-    void *to_zero[FREE_PAGES_BATCH];
     u64 next = pages.start;
 
     while (next < pages.end) {
@@ -2053,6 +2052,17 @@ void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */)
             next = pages.end;       /* nothing further in this node */
         pagecache_unlock_node(pn);
 
+        /* One pass over the batch rather than three, so that a page's own record is still in
+           cache when it is released: separating the passes puts a batch's worth of zeroing --
+           four kilobytes a page -- between the two times each record is touched, which is more
+           than this processor's first level cache holds. Here the only thing between them is
+           that page's own zeroing.
+
+           The pages keep their place in the node, in the state an eviction leaves behind: only
+           the memory they hold is given back. Removing them would pull one out from under
+           whoever is walking the node's pages by pointer -- a write-back completion iterates
+           them with rbnode_get_next() long after the write itself is done -- and they are not
+           ours to remove anyway: a refault takes one back with its refault data intact. */
         for (int i = 0; i < n; i++) {
             pagecache_page p = batch[i];
             pagecache_lock_state(pc);
@@ -2062,22 +2072,12 @@ void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */)
             }
             /* Read after that release, as the reference count decides it: a page someone else
                still holds is zeroed where it is rather than given back. */
-            to_zero[i] = ((p->refcount > 1) && (p->kvirt != INVALID_ADDRESS)) ? p->kvirt : 0;
+            void *kvirt = ((p->refcount > 1) && (p->kvirt != INVALID_ADDRESS)) ? p->kvirt : 0;
             pagecache_unlock_state(pc);
-        }
-
-        for (int i = 0; i < n; i++)
-            if (to_zero[i])
-                zero(to_zero[i], page_size);
-
-        /* The pages keep their place in the node, in the state an eviction leaves behind: only
-           the memory they hold is given back. Removing them would pull one out from under
-           whoever is walking the node's pages by pointer -- a write-back completion iterates
-           them with rbnode_get_next() long after the write itself is done -- and they are not
-           ours to remove anyway: a refault takes one back with its refault data intact. */
-        for (int i = 0; i < n; i++) {
+            if (kvirt)
+                zero(kvirt, page_size);
             pagecache_lock_state(pc);
-            pagecache_page_release_locked(pc, batch[i], false);
+            pagecache_page_release_locked(pc, p, false);
             pagecache_unlock_state(pc);
         }
     }
