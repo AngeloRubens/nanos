@@ -190,13 +190,25 @@ static inline void spin_unlock_irq(spinlock l, u64 flags)
 static inline u64 spin_lock_irq_flushing(spinlock l)
 {
     u64 flags = irq_disable_save();
-    while (!spin_try(l)) {
-        /* Asked first, so that a spin which is merely waiting its turn does not take the flush
-         * lock on every pass to find nothing to do. */
+    /* Read before the exchange, as spin_lock() does: a lock this hot -- every mmap, munmap and
+     * fault takes it -- would otherwise have every waiter writing the same line on every pass.
+     * The flush work is asked for only when there is some, so a spin that is merely waiting its
+     * turn costs what it always cost. */
+    volatile u64 *p = (volatile u64 *)&l->w;
+#ifdef LOCK_STATS
+    u64 spins = 0;
+#endif
+    while (*p || !compare_and_swap_64(&l->w, 0, 1)) {
+#ifdef LOCK_STATS
+        spins++;
+#endif
         if (page_invalidate_pending())
             page_invalidate_flush();
         kern_pause();
     }
+#ifdef LOCK_STATS
+    LOCKSTATS_RECORD_LOCK(l->s, true, spins, 0);
+#endif
     return flags;
 }
 
