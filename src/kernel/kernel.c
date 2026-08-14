@@ -166,6 +166,17 @@ define_closure_function(2, 0, void, free_kernel_context,
      * apart from whoever fills it: a cache that only ever receives contexts and hands back
      * something else has had its ring written by someone who does not know it is a ring. */
     assert(context_looks_valid(&kc->context));
+    /* And that it is finished with. Nothing reinitialises a context on the way out of the cache
+     * -- kernel_context_pre_suspend() and check_syscall_context_replace() restore the refcount
+     * and nothing else, while init_context() runs once per allocation -- so a context that goes
+     * in still queued on a mutex, still carrying a saved frame, or still owned by a processor
+     * comes back out that way, and the next syscall that runs on it trips over exactly the three
+     * assertions this workload keeps firing in mutex_lock_internal(). If one of these is what
+     * fires, the cache is being fed a live context; if none ever does, the context is being
+     * executed by a second party while it sleeps, which is a different fault entirely. */
+    assert(!kc->context.waiting_on);
+    assert(!frame_is_full(kc->context.frame));
+    assert(kc->context.active_cpu == -1u);
     if (!enqueue(bound(free_ctx_q), kc)) {
         destruct_context(&kc->context);
         deallocate(heap_locked(get_kernel_heaps()), kc, kc->size);
