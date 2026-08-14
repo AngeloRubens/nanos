@@ -179,6 +179,27 @@ static inline void spin_unlock_irq(spinlock l, u64 flags)
     irq_restore(flags);
 }
 
+/* For a lock whose holder can end up parked in a TLB flush rendezvous. Waiting for one of those
+ * with interrupts off is a deadlock: the flush IPI never arrives, so this processor never joins,
+ * so the rendezvous never ends, so its holder never lets go. Caught in the act with qemu's stub,
+ * all four processors stopped: one owned the rendezvous and waited for everyone to join; one held
+ * the process's vmap lock and had joined, waiting for the rendezvous to end (madvise() unmapping
+ * pages, page.c:626); one was here, spinning for that same vmap lock with interrupts off and
+ * unable to answer anything. So the wait does the flush work itself, which is what
+ * get_page_flush_entry() already does when it spins for the same reason. */
+static inline u64 spin_lock_irq_flushing(spinlock l)
+{
+    u64 flags = irq_disable_save();
+    while (!spin_try(l)) {
+        /* Asked first, so that a spin which is merely waiting its turn does not take the flush
+         * lock on every pass to find nothing to do. */
+        if (page_invalidate_pending())
+            page_invalidate_flush();
+        kern_pause();
+    }
+    return flags;
+}
+
 static inline u64 spin_wlock_irq(rw_spinlock l)
 {
     u64 flags = irq_disable_save();

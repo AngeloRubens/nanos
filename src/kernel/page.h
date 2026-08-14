@@ -31,6 +31,7 @@ flush_entry get_page_flush_entry();
 void page_invalidate(flush_entry f, u64 address);
 void page_invalidate_sync(flush_entry f, thunk completion, boolean rendezvous);
 void page_invalidate_flush();
+boolean page_invalidate_pending(void);
 
 void invalidate(u64 page);
 void flush_tlb(boolean full_flush);

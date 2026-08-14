@@ -828,7 +828,9 @@ boolean unix_timers_init(unix_heaps uh);
 
 #define sysreturn_from_pointer(__x) ((s64)u64_from_pointer(__x));
 
-#define vmap_lock(p) u64 _savedflags = spin_lock_irq(&(p)->vmap_lock)
+/* Taken and then held across the unmapping of pages, which waits for every processor to flush:
+ * see spin_lock_irq_flushing(), which is why this one is not spin_lock_irq(). */
+#define vmap_lock(p) u64 _savedflags = spin_lock_irq_flushing(&(p)->vmap_lock)
 #define vmap_unlock(p) spin_unlock_irq(&(p)->vmap_lock, _savedflags)
 
 extern sysreturn syscall_ignore();

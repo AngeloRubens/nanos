@@ -110,6 +110,15 @@ void page_invalidate_flush(void)
         _flush_handler();
 }
 
+/* Whether this processor has a generation of invalidations it has not handled -- which is also
+ * the only case in which it may have a rendezvous to join. Asked by those who spin for a lock
+ * with interrupts off (spin_lock_irq_flushing()), so that the common spin does not take the
+ * flush lock on every turn just to find nothing. */
+boolean page_invalidate_pending(void)
+{
+    return initialized && (current_cpu()->inval_gen != inval_gen);
+}
+
 void page_invalidate(flush_entry f, u64 p)
 {
     if (f && initialized) {
