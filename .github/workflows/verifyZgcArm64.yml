@@ -3082,8 +3082,8 @@ jobs:
             echo ""
             echo "### Which of the two the fault needs"
             echo ""
-            echo "| race | rounds that ran | finished | faulted | stalled in a punch | never started | punches | blocks |"
-            echo "|---|---|---|---|---|---|---|---|"
+            echo "| race | rounds that ran | finished | faulted | stalled in a punch | touchers wedged | never started | punches | blocks |"
+            echo "|---|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for v in before race race1p racenw race1pnw raceser racenofs racedisj racent racesernt \
                    sequence mapsync; do
@@ -3102,7 +3102,7 @@ jobs:
               sequence) files="probe-sequence-*.log"; what="no threads: write, flush, punch" ;;
               mapsync)  files="probe-mapsync-*.log";  what="through the mapping only: msync, punch" ;;
             esac
-            n=0; ok=0; flt=0; nr=0; pun=0; blk=0; stk=0
+            n=0; ok=0; flt=0; nr=0; pun=0; blk=0; stk=0; wdg=0
             for f in $files; do
               [ -f "$f" ] || continue
               if ! ran "$f"; then
@@ -3122,6 +3122,30 @@ jobs:
               s=$(grep -oE 'inside punch [0-9]+ for [0-9]+s' "$f" | grep -oE 'for [0-9]+s' \
                   | grep -oE '[0-9]+' | sort -n | tail -1)
               if [ "${s:-0}" -ge 10 ]; then stk=$((stk + 1)); fi
+              # A third way to stop, which the two counts above both call "finished" or "did not
+              # finish" and neither of them sees. One round of racedisj punched all 150 holes,
+              # kept writing, and answered the watchdog throughout -- while the touch counter sat
+              # at 3924 from the forty-third punch onward, where a healthy round of the same cut
+              # reaches eight million. The puncher was between punches, so it is not a stall in a
+              # punch; the guest was answering, so it is not a guest that stopped. It is the
+              # threads that fault, and only those, held by something a punch left behind, and
+              # the round ended wedged in pthread_join.
+              #
+              # Read off the line each punch prints: the touch counter standing still across
+              # punches that keep completing. Counted only where it had been moving, so that the
+              # cuts with nothing faulting -- racent, racesernt -- are not reported as wedged for
+              # a counter that is zero by construction.
+              w=$(awk '$9 == "done," && $11 == "touches," {
+                         d = $8 + 0; t = $10 + 0
+                         if (seen) {
+                           if (t == last_t) {
+                             if (d != last_d) { run++; if (run > max) max = run }
+                           } else { run = 0; if (t > 0) moved = 1 }
+                         }
+                         seen = 1; last_t = t; last_d = d
+                       }
+                       END { print (moved ? max + 0 : 0) }' "$f")
+              if [ "${w:-0}" -ge 20 ]; then wdg=$((wdg + 1)); fi
               # A cut is only clean if it was given as many chances as the one it is compared
               # with: punches attempted is that count, and the blocks the file reached says
               # whether there was anything pinned to punch. A cut that reads clean on a tenth of
@@ -3135,9 +3159,9 @@ jobs:
               if [ "${b:-0}" -gt "$blk" ]; then blk=$b; fi
             done
             echo "${what}: ${ok} of ${n} that ran finished, ${flt} faulted, ${stk} stalled in a" \
-                 "punch with the guest alive, ${nr} never started, ${pun} punches attempted," \
-                 "up to ${blk} blocks held"
-            echo "| ${what} | ${n} | ${ok} | ${flt} | ${stk} | ${nr} | ${pun} | ${blk} |" \
+                 "punch with the guest alive, ${wdg} had their touchers wedged, ${nr} never" \
+                 "started, ${pun} punches attempted, up to ${blk} blocks held"
+            echo "| ${what} | ${n} | ${ok} | ${flt} | ${stk} | ${wdg} | ${nr} | ${pun} | ${blk} |" \
               >> "$GITHUB_STEP_SUMMARY"
           done
           if grep -q '^PROBE cycles_reclaim *PASS' probe-cycles.log; then
