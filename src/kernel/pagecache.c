@@ -406,6 +406,24 @@ static void pagecache_page_release_locked(pagecache pc, pagecache_page pp, boole
     if (--pp->refcount > 0)
         return;
     pagecache_debug("%s: pp %p state %d\n", func_ss, pp, page_state(pp));
+    assert(pp->refcount == 0);
+
+    /* A page that is already free holds no memory, and this is a reference on it being dropped
+       rather than the last reference on a resident page: give nothing back. The state is the
+       one realloc_pagelocked() states the contract for -- free means no memory and a refcount
+       of exactly zero, which is what it asserts before taking the page back -- and a record can
+       be sitting in the node in that state either because a punch gave its memory back and left
+       it where it was, or because eviction could not take the node lock to remove it
+       (pagecache_page_delete_locked). Either way a reference taken on it afterwards, by
+       pagecache_pin_handler walking the range, comes back here to be dropped; deallocating on
+       that path hands pp->kvirt, which is INVALID_ADDRESS, to the page heap, and the page heap
+       looks up a range for it, finds none, and reads through the miss. */
+    if (page_state(pp) == PAGECACHE_PAGESTATE_FREE) {
+        assert(pp->kvirt == INVALID_ADDRESS);
+        if (full_delete)
+            pagecache_page_delete_locked(pc, pp);
+        return;
+    }
     assert(pp->write_count == 0);
     assert(pp->read_refcount.c == 0);
 

@@ -223,6 +223,11 @@ static pageheap_area pageheap_area_from_page(u64 p)
 {
     u64 base = p & ~(PAGEHEAP_AREA_MAX_PAGES * PAGESIZE - 1);
     rmnode n = rangemap_lookup(&page_heap.ranges, p >> PAGELOG);
+    /* An address the page heap never handed out has no range here, and reading through the miss
+       turns a caller that freed the wrong thing into a data abort inside the allocator, some
+       hundred frames from whoever did it -- 0x17, the offset of r.start in an rmnode, read off
+       INVALID_ADDRESS. Named where it happens instead. */
+    assert(n != INVALID_ADDRESS);
     u64 range_start = n->r.start << PAGELOG;
     if (base < range_start)
         base = range_start;
