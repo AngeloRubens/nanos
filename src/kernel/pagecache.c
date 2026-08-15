@@ -2033,8 +2033,15 @@ void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */)
             pp = (pagecache_page)rbnode_get_next(&pp->rbnode);
         while ((pp != INVALID_ADDRESS) && (n < FREE_PAGES_BATCH)) {
             u64 pi = page_offset(pp);
-            if (pi >= pages.end)
+            if (pi >= pages.end) {
+                /* Past the hole: nothing further in it. Said by clearing pp rather than by
+                   breaking, or a range whose first page is beyond the hole leaves next where it
+                   was and the loop outside starts the same search again, for ever -- which is
+                   what a punch of a range holding no cached pages does, and that is the ordinary
+                   case. */
+                pp = INVALID_ADDRESS;
                 break;
+            }
             next = pi + 1;
             /* Taken and dropped for each page rather than held across the batch: this one is the
                whole cache's, not this node's, and every page fault in the system waits on it. */
