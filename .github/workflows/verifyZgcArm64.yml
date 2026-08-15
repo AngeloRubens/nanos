@@ -384,7 +384,6 @@ jobs:
       # re-exports to every sub-make; and it is a copy of the checkout rather than a worktree,
       # because gitversion.c is made from .git/index and a worktree has none.)
       - name: Build a kernel that stays where it was linked, for the catcher
-        if: matrix.arch == 'x64'
         run: |
           cp -a "$GITHUB_WORKSPACE" /tmp/diag
           rm -rf /tmp/diag/output
@@ -453,7 +452,6 @@ jobs:
       # named the lock inversion from the C probe; the soak is a real JVM, so what it names here
       # is the defect as a collector meets it.
       - name: Catch the soak where it stops, and ask every processor where it is
-        if: matrix.arch == 'x64'
         run: |
           set -o pipefail
           # The stub reads the guest with the symbols of the kernel that is running in it, so the
@@ -482,17 +480,31 @@ jobs:
           # image was built to have. Booting an ops image with fewer devices than ops gives it is
           # not booting the thing being measured.
           run_qemu() {
-            qemu-system-x86_64 -machine q35 -smp 4 -m 2G -cpu max \
-              -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x3 \
-              -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x3.0x6 \
-              -device pcie-root-port,port=0x12,chassis=3,id=pci.4,bus=pcie.0,addr=0x3.0x4 \
-              -device virtio-scsi-pci,bus=pci.2,addr=0x0,id=scsi0 \
-              -device scsi-hd,bus=scsi0.0,drive=hd0 \
-              -drive file="$img",format=raw,if=none,id=hd0 \
-              -device virtio-rng-pci -device virtio-balloon \
-              -device virtio-net,bus=pci.4,addr=0x0,netdev=n0,mac=d2:bd:64:08:5d:89 \
-              -netdev user,id=n0 \
-              -vga none -device isa-debug-exit -display none -serial stdio -s
+            if [ "$(uname -m)" = aarch64 ]; then
+              # On virt the kernel is not in the image: ops passes it with -kernel and the image
+              # carries the klibs, so the diagnostic kernel is named here as well as copied into
+              # ops's slot above. The rest is ops's own line for this platform.
+              qemu-system-aarch64 -machine virt -machine gic-version=2 -smp 4 -m 2G -cpu max \
+                -kernel /tmp/kernel-diag.img -semihosting \
+                -device virtio-blk-pci,drive=hd0 \
+                -drive file="$img",format=raw,if=none,id=hd0 \
+                -device virtio-rng-pci -device virtio-balloon \
+                -device virtio-net,netdev=n0,mac=d2:bd:64:08:5d:89 \
+                -netdev user,id=n0 \
+                -display none -serial stdio -s
+            else
+              qemu-system-x86_64 -machine q35 -smp 4 -m 2G -cpu max \
+                -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x3 \
+                -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x3.0x6 \
+                -device pcie-root-port,port=0x12,chassis=3,id=pci.4,bus=pcie.0,addr=0x3.0x4 \
+                -device virtio-scsi-pci,bus=pci.2,addr=0x0,id=scsi0 \
+                -device scsi-hd,bus=scsi0.0,drive=hd0 \
+                -drive file="$img",format=raw,if=none,id=hd0 \
+                -device virtio-rng-pci -device virtio-balloon \
+                -device virtio-net,bus=pci.4,addr=0x0,netdev=n0,mac=d2:bd:64:08:5d:89 \
+                -netdev user,id=n0 \
+                -vga none -device isa-debug-exit -display none -serial stdio -s
+            fi
           }
           for attempt in 1 2 3; do
             echo "=== soak under the stub: attempt ${attempt} ==="
@@ -534,15 +546,20 @@ jobs:
               # go in at the difference between the two, read out of the ELF rather than written
               # here -- and through add-symbol-file, since given the file gdb keeps the addresses
               # it was linked at.
+              # KERNEL_BASE is the same on both architectures and the link address is not
+              # (0x200000 on pc, 0x40400000 on virt), which is why it is read out of the ELF; the
+              # instruction and stack pointer have to be named per architecture, since gdb answers
+              # nothing at all when asked for a register the target has not got.
               lb=$(readelf -lW "$DIAG_ELF" | awk '$1 == "LOAD" { print $3; exit }')
               bias=$(printf '0x%x' $(( 0xffffffff80000000 - lb )))
+              if [ "$(uname -m)" = aarch64 ]; then ipsp="pc sp"; else ipsp="rip rsp"; fi
               echo "symbols from $(basename "$DIAG_ELF") linked at ${lb}, loaded at ${bias}"
               gdb -batch -n \
                 -ex 'target remote :1234' \
                 -ex "add-symbol-file $DIAG_ELF -o $bias" \
                 -ex 'info threads' \
                 -ex 'thread apply all bt' \
-                -ex 'thread apply all info registers rip rsp' 2>&1 | tee soak-hang.bt
+                -ex "thread apply all info registers ${ipsp}" 2>&1 | tee soak-hang.bt
               if ! grep -qE '^#[0-9]+ .* in [A-Za-z_]' soak-hang.bt; then
                 echo "::warning::not one frame came back with a name -- the bias ${bias} no longer matches this kernel"
               fi
@@ -2400,7 +2417,6 @@ jobs:
       # meantime: tools got -nostdinc and could not find unistd.h, and the boot loader got the
       # 64-bit kernel flags before adding its own -m32.
       - name: Build a kernel that stays where it was linked, for the catcher
-        if: matrix.arch == 'x64'
         run: |
           # A copy of this checkout, for the same reason the baseline is a clone: a worktree
           # has no .git/index for gitversion.c to be made from. The objects already built here
@@ -2440,18 +2456,39 @@ jobs:
           cat > catch-stop.sh <<'EOF'
           #!/bin/bash
           set -o pipefail
-          label="$1"; kelf="$2"; attempts="${3:-6}"
+          label="$1"; kelf="$2"; attempts="${3:-6}"; kimg="${4:-}"
           img="$HOME/.ops/images/zgcprobe"
           [ -f "$kelf" ] || { echo "::warning::no kernel.elf to symbolise ${label} with"; exit 0; }
           [ -f "$img" ] || { echo "::warning::no image left to boot for ${label}"; exit 0; }
+          # The two architectures do not carry the kernel in the same place. On x86 it is inside
+          # the image and the caller has already put the right one there, so booting the image is
+          # enough. On arm64 ops passes it from outside with -kernel and the image holds only the
+          # klibs, so the kernel whose symbols this reads has to be named here -- boot the image
+          # alone and the stub would be reading a guest running somebody else's kernel, which is
+          # worse than no answer because it looks like one.
+          if [ "$(uname -m)" = aarch64 ] && [ ! -f "$kimg" ]; then
+            echo "::warning::${label}: no kernel image given to boot arm64 with; skipping the catcher"
+            exit 0
+          fi
           run_qemu() {
-            qemu-system-x86_64 -machine q35,accel=tcg -cpu max -smp 4 -m 2G \
-              -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x3 \
-              -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x3.0x6 \
-              -device virtio-scsi-pci,bus=pci.2,addr=0x0,id=scsi0 \
-              -device scsi-hd,bus=scsi0.0,drive=hd0 \
-              -drive file="$img",format=raw,if=none,id=hd0 \
-              -vga none -device isa-debug-exit -display none -serial stdio -s
+            if [ "$(uname -m)" = aarch64 ]; then
+              # ops's own line for virt, read off the command it prints, plus the stub.
+              qemu-system-aarch64 -machine virt -machine gic-version=2 -cpu max -smp 4 -m 2G \
+                -kernel "$kimg" -semihosting \
+                -device virtio-blk-pci,drive=hd0 \
+                -drive file="$img",format=raw,if=none,id=hd0 \
+                -device virtio-rng-pci -device virtio-balloon \
+                -device virtio-net,netdev=n0,mac=9a:8f:51:a5:c9:bd -netdev user,id=n0 \
+                -display none -serial stdio -s
+            else
+              qemu-system-x86_64 -machine q35,accel=tcg -cpu max -smp 4 -m 2G \
+                -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x3 \
+                -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x3.0x6 \
+                -device virtio-scsi-pci,bus=pci.2,addr=0x0,id=scsi0 \
+                -device scsi-hd,bus=scsi0.0,drive=hd0 \
+                -drive file="$img",format=raw,if=none,id=hd0 \
+                -vga none -device isa-debug-exit -display none -serial stdio -s
+            fi
           }
           for attempt in $(seq 1 "$attempts"); do
             echo "=== ${label}: attempt ${attempt} ==="
@@ -2507,15 +2544,22 @@ jobs:
             # so a relink moves it too. And it goes in through add-symbol-file, never as gdb's own
             # symbol file: given the file, gdb keeps the addresses it was linked at and the bias
             # is lost.
+            #
+            # Both architectures relocate to the same KERNEL_BASE (src/x86_64/kernel_machine.h:16,
+            # src/aarch64/kernel_machine.h:6), and they are linked at different addresses -- pc at
+            # 0x200000, virt at 0x40400000 -- so reading the link address out of the ELF is what
+            # makes one line serve both. The instruction and stack pointer are not shared, and
+            # asking gdb for a register the target does not have makes it answer nothing at all.
             lb=$(readelf -lW "$kelf" | awk '$1 == "LOAD" { print $3; exit }')
             bias=$(printf '0x%x' $(( 0xffffffff80000000 - lb )))
+            if [ "$(uname -m)" = aarch64 ]; then ipsp="pc sp"; else ipsp="rip rsp"; fi
             echo "${label}: symbols from $(basename "$kelf") linked at ${lb}, loaded at ${bias}"
             gdb -batch -n \
               -ex 'target remote :1234' \
               -ex "add-symbol-file $kelf -o $bias" \
               -ex 'info threads' \
               -ex 'thread apply all bt' \
-              -ex 'thread apply all info registers rip rsp' 2>&1 | tee "${label}-hang.bt"
+              -ex "thread apply all info registers ${ipsp}" 2>&1 | tee "${label}-hang.bt"
             # A backtrace of four unnamed addresses is what this step exists to stop producing,
             # and it looks like a successful run unless someone reads it.
             if ! grep -qE '^#[0-9]+ .* in [A-Za-z_]' "${label}-hang.bt"; then
@@ -2596,9 +2640,7 @@ jobs:
           else
             echo "::warning::the race does not finish without this change either ($((10 - bfin)) of 10), so it is not this change that stops it"
             # And now it can be asked where, which is what the baseline was built here for.
-            if [ "${{ matrix.arch }}" = x64 ]; then
-              ./catch-stop.sh before "${BASE_ELF}" 3
-            fi
+            ./catch-stop.sh before "${BASE_ELF}" 3 /tmp/kernel-baseline.img
           fi
           tail -3 probe-before.log
 
@@ -2816,7 +2858,6 @@ jobs:
       # stub is outside it, so it still answers -- and what each processor is executing, with
       # the symbols of the kernel built here, is what says which lock is held by whom.
       - name: Catch the race where it stops, and ask every processor where it is
-        if: matrix.arch == 'x64'
         run: |
           set -o pipefail
           # The image the stub gets has to carry the kernel whose symbols it will be read
@@ -2827,7 +2868,7 @@ jobs:
           ./swap-kernel.sh /tmp/kernel-diag.img /tmp/diag/output
           timeout 90 ops run ./zgcprobe --nightly -c probe-concurrent.json > /dev/null 2>&1 || true
           ./reap-qemu.sh
-          ./catch-stop.sh race "${DIAG_ELF}" 6
+          ./catch-stop.sh race "${DIAG_ELF}" 6 /tmp/kernel-diag.img
 
       - name: Report the stock-vs-klib capability matrix
         run: |
