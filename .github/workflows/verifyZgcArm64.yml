@@ -408,7 +408,11 @@ jobs:
           # tmpfs_new() resolves against it, exactly as test/runtime/shmem.manifest
           # does upstream).
           # label|flag|klibs|extra args (appended last, so they override the
-          # defaults). The last two entries exist because heap size alone only
+          # defaults)|timeout|guest memory. The last two are optional and default to what every
+          # cut used before: ten minutes and two gigabytes. They exist for the one cut that
+          # cannot fit in either -- a gigabyte of heap soaked for ten minutes, which is the run
+          # that was measured on real KVM and is repeated here under emulation, where the same
+          # work takes many times longer. The last two entries exist because heap size alone only
           # repeats the same code: what changes the path taken is the object
           # size (large pages) and -Xms < -Xmx (uncommit, i.e. the JVM punching
           # holes in the memfd rather than only committing).
@@ -424,12 +428,15 @@ jobs:
             "z-soak|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=60\", \"-DsoakThreads=3\","
             "z-soak2|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=60\", \"-DsoakThreads=3\","
             "z-soak3|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx512m\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=60\", \"-DsoakThreads=3\","
+            "z-soak1g|UseZGC|\"tmpfs\", \"shmem\"|\"-Xms64m\", \"-Xmx1g\", \"-XX:ZUncommitDelay=1\", \"-Xlog:gc+heap\", \"-Drounds=2\", \"-Dsoak=600\", \"-DsoakThreads=3\",|3000|4G"
           )
           for entry in "${MATRIX[@]}"; do
             label="$(echo "$entry" | cut -d'|' -f1)"
             flag="$(echo "$entry" | cut -d'|' -f2)"
             klibs="$(echo "$entry" | cut -d'|' -f3)"
             extra="$(echo "$entry" | cut -d'|' -f4)"
+            tmo="$(echo "$entry" | cut -d'|' -f5)"; tmo="${tmo:-600}"
+            mem="$(echo "$entry" | cut -d'|' -f6)"; mem="${mem:-2G}"
             [ -n "$klibs" ] && klibline="  \"Klibs\": [${klibs}]," || klibline=""
             cat > "cfg-${label}.json" <<EOF
           {
@@ -437,11 +444,11 @@ jobs:
             "Args": ["-XX:+${flag}", "-Xlog:gc+init=debug", "-Xlog:gc", "-Xms192m", "-Xmx192m",
                      "-Drounds=12", ${extra} "-cp", "/", "GcChurn"],
             "Files": ["GcChurn.class"],
-            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+            "RunConfig": { "Memory": "${mem}", "CPUs": 4 }
           }
           EOF
             echo "=== ${label} (-XX:+${flag}) ==="
-            timeout 600 ops pkg load "${{ matrix.package }}" --arch ${{ matrix.ops_arch }} --nightly \
+            timeout "${tmo}" ops pkg load "${{ matrix.package }}" --arch ${{ matrix.ops_arch }} --nightly \
               --show-debug --verbose -c "cfg-${label}.json" 2>&1 \
               | strip_ansi | tee "gc-${label}.log" || true
           done
@@ -608,7 +615,7 @@ jobs:
             echo "| GC | image | result | collectors / reason |"
             echo "|---|---|---|---|"
             for l in g1 serial parallel shenandoah z z-shmem z-large z-uncommit \
-                     z-soak z-soak2 z-soak3; do
+                     z-soak z-soak2 z-soak3 z-soak1g; do
               v=$(verdict "gc-${l}.log")
               if [ "$v" = OK ]; then
                 d=$(grep -o 'collector=[^ ]*' "gc-${l}.log" | head -1)
@@ -621,6 +628,7 @@ jobs:
                 z-uncommit) img="+ klibs, -Xms64m/-Xmx512m (uncommit on)" ;;
                 z-soak|z-soak2|z-soak3)
                             img="+ klibs, uncommit **while 3 threads write the heap**" ;;
+                z-soak1g)   img="+ klibs, **1G heap soaked for ten minutes**, 3 threads writing" ;;
                 *)          img="stock" ;;
               esac
               echo "| \`$l\` | $img | **$v** | ${d:-–} |"
@@ -640,7 +648,7 @@ jobs:
             echo ""
             echo '```'
             {
-              for f in gc-z-soak.log gc-z-soak2.log gc-z-soak3.log; do
+              for f in gc-z-soak.log gc-z-soak2.log gc-z-soak3.log gc-z-soak1g.log; do
                 [ -f "$f" ] || continue
                 # grep -c prints its 0 and exits 1, so the fallback is for a missing file only
                 n=$(grep -cE 'Uncommitter.*Uncommitted:' "$f" 2>/dev/null || true)
@@ -721,7 +729,7 @@ jobs:
           # ever run stopped its guest 228ms after the fourth hole was punched, and one boot
           # can say that it happened and never how often.
           sn=0; sfin=0; sfired=0; smis=0
-          for f in gc-z-soak.log gc-z-soak2.log gc-z-soak3.log; do
+          for f in gc-z-soak.log gc-z-soak2.log gc-z-soak3.log gc-z-soak1g.log; do
             [ -f "$f" ] || continue
             sn=$((sn + 1))
             [ "$(verdict "$f")" = OK ] && sfin=$((sfin + 1))
