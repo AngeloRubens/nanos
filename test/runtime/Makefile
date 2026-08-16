@@ -41,6 +41,8 @@ PROGRAMS= \
 	tmpfs_punch \
 	tmpfs_commit_race \
 	tmpfs_punch_race \
+	tmpfs_punch_nosync \
+	release_page_race \
 	vmap_flush_race \
 	tmpfs_punch \
 	time \
@@ -99,6 +101,18 @@ SRCS-filesystem= \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-filesystem=		-static
 LIBS-filesystem=		-lpthread
+
+SRCS-tmpfs_punch_nosync= \
+	$(CURDIR)/tmpfs_punch_nosync.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-tmpfs_punch_nosync=	-static
+LIBS-tmpfs_punch_nosync=	-lpthread
+
+SRCS-release_page_race= \
+	$(CURDIR)/release_page_race.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-release_page_race=	-static
+LIBS-release_page_race=		-lpthread
 
 SRCS-tmpfs_punch_race= \
 	$(CURDIR)/tmpfs_punch_race.c \

@@ -1,0 +1,16 @@
+(
+    boot:(
+        children:(
+            klib:(children:(
+                tmpfs:(contents:(host:ARCH_DIR/bin/tmpfs))
+                shmem:(contents:(host:ARCH_DIR/bin/shmem))
+            ))
+        )
+    )
+    children:(
+        tmpfs_punch_nosync:(contents:(host:output/test/runtime/bin/tmpfs_punch_nosync))
+    )
+    klibs:bootfs
+    program:/tmpfs_punch_nosync
+    environment:()
+)
