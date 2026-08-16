@@ -39,6 +39,8 @@ PROGRAMS= \
 	syslog \
 	thread_test \
 	tmpfs_punch \
+	tmpfs_commit_race \
+	vmap_flush_race \
 	tmpfs_punch \
 	time \
 	tlbshootdown \
@@ -96,6 +98,18 @@ SRCS-filesystem= \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-filesystem=		-static
 LIBS-filesystem=		-lpthread
+
+SRCS-tmpfs_commit_race= \
+	$(CURDIR)/tmpfs_commit_race.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-tmpfs_commit_race=	-static
+LIBS-tmpfs_commit_race=		-lpthread
+
+SRCS-vmap_flush_race= \
+	$(CURDIR)/vmap_flush_race.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-vmap_flush_race=	-static
+LIBS-vmap_flush_race=		-lpthread
 
 SRCS-tmpfs_punch= \
 	$(CURDIR)/tmpfs_punch.c \

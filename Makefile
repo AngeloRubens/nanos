@@ -132,6 +132,8 @@ RUNTIME_TESTS=	\
 	thread_test \
 	time \
 	tmpfs_punch \
+	tmpfs_commit_race \
+	vmap_flush_race \
 	tmpfs_punch \
 	tlbshootdown \
 	tun \
