@@ -569,13 +569,23 @@ static void pagecache_nodelocked_traverse(pagecache_node pn, range pages,
 {
     if (range_span(pages) == 0)
         return;
-    pagecache_page pp = page_lookup_nodelocked(pn, pages.start);
+    /* The range need not be covered. A page of it is missing whenever something
+       else has taken the record out -- eviction, or a mapping being dropped --
+       and walking by successor through the hole hands the handler whatever comes
+       after the range, or INVALID_ADDRESS when nothing does. The pin handler
+       increments a refcount through it: refcount sits at 0x3c in the record, so
+       a pointer of all ones is a write to 0x3b, which is the fault this used to
+       take. Start from the first page at or after the range rather than an exact
+       lookup, for the same reason, and stop at the first page past it. */
+    struct pagecache_page k;
+    k.state_offset = pages.start;
+    pagecache_page pp = (pagecache_page)rbtree_lookup_max_lte(&pn->pages, &k.rbnode);
+    if ((pp != INVALID_ADDRESS) && (page_offset(pp) < pages.start))
+        pp = (pagecache_page)rbnode_get_next(&pp->rbnode);
     pagecache_lock_state(global_pagecache);
-    while (true) {
+    while ((pp != INVALID_ADDRESS) && (page_offset(pp) < pages.end)) {
         apply(handler, pp);
-        if (++pages.start == pages.end)
-            break;
-        pp = (pagecache_page)rbnode_get_next((rbnode)pp);
+        pp = (pagecache_page)rbnode_get_next(&pp->rbnode);
     }
     pagecache_unlock_state(global_pagecache);
 }
