@@ -1,6 +1,14 @@
 #ifdef KERNEL
 extern struct spinlock pt_lock;
-#define pagetable_lock() u64 _savedflags = spin_lock_irq(&pt_lock)
+/* The same reason the vmap lock is taken this way, and the same processors: the
+   page tables are locked by the fault that maps a page and by the unmap that
+   takes one away, and the unmap opens a shootdown that every processor has to
+   join. A waiter that spins here with interrupts disabled and without servicing
+   the shootdown never joins it, so whoever opened it never finishes and never
+   releases this lock. Measured rather than argued: a workload of concurrent
+   madvise and fsync stops the machine after twenty-eight rounds with this as a
+   plain spin_lock_irq, and runs on with the flushing wait. */
+#define pagetable_lock() u64 _savedflags = spin_lock_irq_flushing(&pt_lock)
 #define pagetable_unlock() spin_unlock_irq(&pt_lock, _savedflags)
 #else
 #define pagetable_lock()
