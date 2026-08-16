@@ -2114,11 +2114,15 @@ void pagecache_release_page(pagecache_node pn, u64 node_offset)
     pagecache_lock_node(pn);
     pagecache_page pp = page_lookup_nodelocked(pn, node_offset >> pn->pv->pc->page_order);
     pagecache_debug("%s: pn %p, node_offset 0x%lx, pp %p\n", func_ss, pn, node_offset, pp);
-    if (pp == INVALID_ADDRESS)
-        return;
-    pagecache_lock_state(pc);
-    pagecache_page_release_locked(pc, pp, true);
-    pagecache_unlock_state(pc);
+    /* The page is gone when another path has already removed the record -- eviction, or
+       pagecache_get_private_page stealing it -- and leaving by the early return took the node's
+       lock with it. Every thread that faults on this node afterwards waits on a lock nobody
+       holds any more in any sense that matters, on the page fault path itself. */
+    if (pp != INVALID_ADDRESS) {
+        pagecache_lock_state(pc);
+        pagecache_page_release_locked(pc, pp, true);
+        pagecache_unlock_state(pc);
+    }
     pagecache_unlock_node(pn);
 }
 
