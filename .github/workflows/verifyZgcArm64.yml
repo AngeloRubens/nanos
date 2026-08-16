@@ -3194,7 +3194,19 @@ jobs:
             echo "${what}: ${ok} of ${n} that ran finished, ${flt} faulted, ${stk} stalled in a" \
                  "punch with the guest alive, ${wdg} had their touchers wedged, ${nr} never" \
                  "started, ${pun} punches attempted, up to ${blk} blocks held"
-            echo "| ${what} | ${n} | ${ok} | ${flt} | ${stk} | ${wdg} | ${nr} | ${pun} | ${blk} |" \
+            # A cut that punched hundreds of times against a file holding no blocks did not come
+            # through clean: it had nothing to break. Three of the cuts that read 10 of 10 here
+            # are in that state -- take the writer away, or the fsync, and nothing is ever
+            # committed, so the range map stays empty and every punch is a walk over an empty
+            # tree. Their passing is the absence of a measurement, and it belongs beside the
+            # result rather than in place of it.
+            if [ "$n" -gt 0 ] && [ "${pun:-0}" -gt 0 ] && [ "${blk:-0}" = 0 ]; then
+              echo "::warning::${what}: ${pun} punches against a file that never held a block — this cut measured nothing, and its ${ok} of ${n} is not a result"
+              note=" (no blocks: nothing to punch)"
+            else
+              note=""
+            fi
+            echo "| ${what} | ${n} | ${ok} | ${flt} | ${stk} | ${wdg} | ${nr} | ${pun} | ${blk}${note} |" \
               >> "$GITHUB_STEP_SUMMARY"
           done
           if grep -q '^PROBE cycles_reclaim *PASS' probe-cycles.log; then
