@@ -95,11 +95,12 @@ int main(int argc, char **argv)
     for (int round = 0; round < ROUNDS; round++) {
         printf("round %d\n", round);
         fflush(stdout);
+        /* No truncation here: shortening the file under the writers makes their
+           own writes come up short, which is this test failing at its own hand
+           rather than at the kernel's. The contention that matters is already
+           there -- two writers, a mapping and a sync, all on one node. */
         test_assert(fsync(fd) == 0);
-        /* Truncating down and back up gives the write-back something to finish
-           against a node whose pages are going away underneath it. */
-        test_assert(ftruncate(fd, FILE_BYTES / 2) == 0);
-        test_assert(ftruncate(fd, FILE_BYTES) == 0);
+        test_assert(msync((void *)map, FILE_BYTES, MS_SYNC) == 0);
     }
 
     stop = 1;

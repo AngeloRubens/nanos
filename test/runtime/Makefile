@@ -40,6 +40,7 @@ PROGRAMS= \
 	thread_test \
 	tmpfs_punch \
 	tmpfs_commit_race \
+	tmpfs_punch_race \
 	vmap_flush_race \
 	tmpfs_punch \
 	time \
@@ -98,6 +99,12 @@ SRCS-filesystem= \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-filesystem=		-static
 LIBS-filesystem=		-lpthread
+
+SRCS-tmpfs_punch_race= \
+	$(CURDIR)/tmpfs_punch_race.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-tmpfs_punch_race=	-static
+LIBS-tmpfs_punch_race=		-lpthread
 
 SRCS-tmpfs_commit_race= \
 	$(CURDIR)/tmpfs_commit_race.c \
