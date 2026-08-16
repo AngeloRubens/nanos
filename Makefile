@@ -131,6 +131,8 @@ RUNTIME_TESTS=	\
 	syslog \
 	thread_test \
 	time \
+	tmpfs_punch \
+	tmpfs_punch \
 	tlbshootdown \
 	tun \
 	unixsocket \

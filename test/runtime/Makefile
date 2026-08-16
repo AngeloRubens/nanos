@@ -38,6 +38,8 @@ PROGRAMS= \
 	socketpair \
 	syslog \
 	thread_test \
+	tmpfs_punch \
+	tmpfs_punch \
 	time \
 	tlbshootdown \
 	tun \
@@ -94,6 +96,16 @@ SRCS-filesystem= \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-filesystem=		-static
 LIBS-filesystem=		-lpthread
+
+SRCS-tmpfs_punch= \
+	$(CURDIR)/tmpfs_punch.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-tmpfs_punch=		-static
+
+SRCS-tmpfs_punch= \
+	$(CURDIR)/tmpfs_punch.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-tmpfs_punch=		-static
 
 SRCS-fs_full= \
 	$(CURDIR)/fs_full.c \
