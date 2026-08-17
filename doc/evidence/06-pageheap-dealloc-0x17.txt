@@ -1,0 +1,11 @@
+no fault handler for frame 
+     frame: 00ff800041a00000
+      type: kernel
+      spsr: 00000000600003c5
+       esr: 0000000096000006 data abort in el1 read
+       far: 0000000000000017
+       elr: fffffffff95b8ca0	(pageheap_dealloc + 0000000000000030/0000000000000290)
+       far: 0000000000000017
+active_cpu: 0000000000000000
+ stack top: 00ff800041a07ff0
+

@@ -1,0 +1,8 @@
+lastvector: 000000000000000e (Page fault)
+     frame: ffffc00002830000
+      type: syscall
+active_cpu: 0000000000000001
+ stack top: ffffc00002837ff0
+error code: 0000000000000000
+   address: 000000000000003b
+

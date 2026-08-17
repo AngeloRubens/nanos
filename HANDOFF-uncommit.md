@@ -46,6 +46,44 @@ la configurazione della CI dei manutentori (CircleCI, docker, `make VCPUS=2 test
 - **"`tmpfs_commit_race` dimostra #7 e #8"**: FALSO, passa su master.
 - **Attribuzione "a chi serve"**: sbagliata due volte a memoria (#3 e #4). Va verificata sul codice.
 
+## Il decimo difetto, diagnosticato con gdb il 18/08 — leggere prima di toccare i lock
+
+Catturato con lo stub gdb su 4 processori (`tmpfs_punch_nosync`, VCPUS=4, si pianta da noi e
+passa su master):
+
+    CPU0  tiene il node lock, PARCHEGGIATA in flush_gen_rlocked (flush.c:77)
+          <- _flush_handler <- spin_lock_irq_flushing(&pt_lock) <- traverse_ptes
+          <- pagecache_node_unmap_pages_sync   (dentro pagecache_lock_node)
+    CPU1  page_invalidate_sync(rendezvous=1), aspetta joined == 4
+          <- pagecache_node_free_pages <- fallocate     ← la NOSTRA punch
+    CPU3  aspetta il node lock che CPU0 tiene -> non joina mai
+
+**Il meccanismo**: `flush_gen_rlocked` non fa un ack, fa un *join e parcheggia*
+(`fetch_and_add(&f->joined,1); while (f->wait) kern_pause();`, flush.c:75-78) perche'
+l'iniziatore esegue `apply(completion)` con tutti gli altri congelati (flush.c:221-222).
+Quel parcheggio e' corretto solo dall'handler dell'IPI, dove non si tiene nulla. Le nostre
+#1 e #2 lo invocano da `spin_lock_irq_flushing`, cioe' **da dentro una sezione critica**.
+
+**Non esiste una toppa locale.** Se il servizio non joina, l'iniziatore attende per sempre;
+se joina, parcheggia tenendo lock. Le due strade vere, con precedenti letti sui sorgenti:
+
+1. **aarch64: togliere IPI e rendezvous.** `invalidate()`/`flush_tlb()` (src/aarch64/page.c:18-31)
+   sono gia' broadcast inner-shareable: il coordinamento software e' ridondante. Precedenti:
+   OSv `arch/aarch64/mmu.cc:118-120`, Unikraft `plat/native/arch/arm64/.../tlb.h:45-52`,
+   Linux `arch/arm64/include/asm/tlbflush.h:376-386`.
+2. **Modello ad ack invece del rendezvous**: il bersaglio invalida, conferma e torna; solo
+   l'iniziatore aspetta un contatore. Chi ha gli interrupt spenti *ritarda* soltanto, che Linux
+   dichiara corretto (`mm/mmu_gather.c:245-248`). Precedenti: FreeBSD `mp_machdep.c:558-569,700-706`
+   (ha spinlock IRQ-off come noi, e mette il vincolo sull'INIZIATORE: `KASSERT` a :668-670),
+   OSv `arch/x64/mmu.cc:63-68`, Linux `kernel/smp.c:920-921` ("must be fast and non-blocking").
+
+**Conseguenza per le nostre patch**: con il modello ad ack, #1 e #2 diventerebbero superflue.
+Restano valide come rimedio locale finche' il modello e' quello attuale, e la #4 (inversione
+node lock / pt_lock) vale a prescindere.
+
+**Il test c'e' gia'**: `tmpfs_punch_nosync` con **VCPUS=4** — master passa 32 round due volte
+su due, il nostro albero si pianta (due osservazioni). A VCPUS=2 non si vede.
+
 ## Aperto
 
 - Ablazioni #5 e #6 (in corso quando questa nota è stata scritta): log in `/tmp/soaklab/y-*.log`.
