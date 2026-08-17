@@ -197,9 +197,12 @@ and `FileDescriptor.sync` (`libnio.so` and `libjava.so` import `fsync`).
 a file on the root filesystem so that committing is real I/O and the node stays
 busy, one syncing thread per processor so that a completion can queue behind
 another -- and it passes on master, on this branch, and on this branch with only
-this patch reverted, at 128K on the default image and again at 4M on a 64M one
-(`EXTRA_MKFS_OPTS="-s 64m"`). So the size was not the obstacle, and the reason
-the window does not open is not established. Recorded rather than dropped, so
+this patch reverted -- at 128K on the default image, at 4M on a 64M one, and at
+96M on a 512M one, the last of which recorded 751 completed syncs in a single
+round. So neither the size of the work nor the number of callers is the
+obstacle: the threads are not serialising, and the queued-completion window
+still does not open from a plain multi-threaded fsync. Whether it is reachable
+from userspace at all is not established. Recorded rather than dropped, so
 that the next attempt starts from what has already failed.
 
 This is the weakest patch of the nine and is sent last: the observations that

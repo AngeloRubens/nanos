@@ -31,9 +31,9 @@
 #include "../test_utils.h"
 
 #define MAX_CPUS    16
-#define FILE_BYTES  (4 * 1024 * 1024)  /* needs EXTRA_MKFS_OPTS="-s 64m" */
+#define FILE_BYTES  (96 * 1024 * 1024)  /* needs EXTRA_MKFS_OPTS="-s 512m" */
 #define CHUNK       (64 * 1024)
-#define ROUNDS      48
+#define ROUNDS      24
 
 static pthread_t threads[MAX_CPUS];
 static volatile int done;
