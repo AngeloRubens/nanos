@@ -44,7 +44,24 @@ Il **cappello va in cima a ogni PR, identico**. Poi la sezione della singola pat
 
 ---
 
-## La scala misurata — nel testo delle PR 1, 2 e 3
+## L'argomento della serie — in cima a tutte
+
+`test/runtime/vmap_flush_jvmpath` returns pages the way HotSpot does --
+`PROT_NONE` mapped over the range with `MAP_FIXED`, which is
+`os::pd_uncommit_memory` on every collector -- while other threads fault them
+back in and the mapping is synced. With `VCPUS=2`:
+
+| tree | result |
+|---|---|
+| master, unpatched | **hangs at round 0, 5 times out of 5** |
+| only the lock patches, master's pagecache | **hangs at round 0, 3 of 3** |
+| only the pagecache patches, master's locks | **hangs at round 0, 3 of 3** |
+| all nine | **64 rounds, 13 of 14** |
+
+Neither half is enough on its own. That is the reason they are sent together
+rather than the locks first and the rest later.
+
+# La scala misurata — nel testo delle PR 1, 2 e 3
 
 `test/runtime/vmap_flush_race` (new, built on the barrier and shape of
 `tlbshootdown.c`) returns pages from more than one thread while others fault on
@@ -175,6 +192,14 @@ one (`pagecache.c:1208-1215`), which happens from `sync_node` (`:1276`) --
 `zPhysicalMemoryBacking_linux.cpp` contains neither `fsync` nor `msync`, so the
 heap file is never synced. In a JVM it is reached through `FileChannel.force`
 and `FileDescriptor.sync` (`libnio.so` and `libjava.so` import `fsync`).
+
+**Test:** none. `test/runtime/fsync_completion_race` was written for this path --
+a file on the root filesystem so that committing is real I/O and the node stays
+busy, one syncing thread per processor so a completion can queue behind another
+-- and it passes on master, on this branch, and on this branch with only this
+patch reverted. The test image's root filesystem is small enough that the file
+has to be 128K, which commits too fast for the window to open. Recorded rather
+than dropped, so the next attempt starts from what did not work.
 
 This is the weakest patch of the nine and is sent last: the observations that
 prompted it come from before patches 7 and 8 themselves, so it justifies itself
