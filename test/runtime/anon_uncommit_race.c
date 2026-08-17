@@ -140,10 +140,13 @@ int main(int argc, char **argv)
         fflush(stdout);
         wait_for_children();
         wake_children();
-        /* This thread faults the whole heap while they are giving halves of it
-           back, which is what puts a waiter on the locks they are holding. */
-        for (size_t off = 0; off < HEAP_BYTES; off += PAGESIZE)
-            heap[off] = 0x44;
+        /* This thread drives the rounds and touches nothing. An earlier version
+           wrote the whole heap here, which is a range another thread may be
+           holding at PROT_NONE at that moment: the write is then a segfault the
+           test earned rather than a defect it found, and it showed up as a user
+           fault with error code 7 -- present, write, user mode. The contention
+           that matters is already between the children: the odd ones fault the
+           pages in while the even ones are giving them back. */
     }
 
     wait_for_children();
