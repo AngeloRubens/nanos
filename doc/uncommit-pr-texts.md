@@ -65,6 +65,8 @@ pages at once.
 
 ## 1 — vmap lock
 
+**Test:** `test/runtime/vmap_flush_race` (new). Red on master (stops before round 0), green here (64 rounds).
+
 Four processors caught with the gdb stub on a stock build: two spinning on
 `p->vmap_lock` in `madvise` (`mmap.c:1466`) with interrupts disabled, one holding
 it inside `page_invalidate_sync`, one in `fsync` waiting for every processor to
@@ -77,12 +79,16 @@ does.
 
 ## 2 — page table lock
 
+**Test:** `test/runtime/vmap_flush_race`. 28 rounds of 64 without this patch, 64 with.
+
 The same shape on `pt_lock`, which the fault takes to map a page and the unmap
 takes to remove one. Not argued from symmetry: 28 rounds without it, 64 with.
 
 **Who walks this path:** the page fault and the unmap. Everything.
 
 ## 3 — traverse
+
+**Test:** `test/runtime/vmap_flush_race`, once the two above are in: 43 rounds and a fault at 0x3b without this patch, 64 with.
 
 `pagecache_nodelocked_traverse` hands the first page to the handler without
 asking whether it is there, then walks by successor for the length of the range
@@ -95,6 +101,8 @@ dirty ranges (`klib/tmpfs.c:39`). A memfd, which is where ZGC keeps its heap.
 
 ## 4 — node lock inside the page table walk
 
+**Test:** none. Reproduction only: concurrent madvise and fsync on a shared mapping while the pagecache scan timer runs.
+
 `pagecache_check_dirty_page` and `pagecache_check_old_page` take the node lock
 from inside `traverse_ptes`, which runs holding the page table lock, while the
 unmap path takes the two in the opposite order.
@@ -105,6 +113,8 @@ mapping in the system -- which includes a ZGC heap.
 
 ## 5 — node lock on the early return
 
+**Test:** `test/runtime/tmpfs_punch_race` -- see below; single observation so far, being repeated.
+
 `pagecache_release_page` takes the node's lock, looks the page up, and returns
 from inside the lock when the lookup finds nothing. The caller is the page fault
 path (`mmap.c:264`), reached when two processors fault the same page at once and
@@ -112,6 +122,8 @@ one of them has to give its reference back. Found by reading rather than from a
 failure.
 
 ## 6 — page that is already free
+
+**Test:** none that tells the two kernels apart. Removing this patch alone leaves every test in the tree passing; the evidence is the arithmetic above and twelve occurrences in CI.
 
 `realloc_pagelocked` states the contract -- free means no memory and a refcount
 of exactly zero -- and the release path deallocates `pp->kvirt` without asking
@@ -125,10 +137,14 @@ the runs without this series.
 
 ## 8 — filesystem call under the node lock
 
+**Test:** none. `test/runtime/tmpfs_commit_race` exercises this path but passes on master too, so it is offered as a non-regression test and not as evidence.
+
 `pagecache_commit_dirty_ranges` calls `pn->fs_write` holding the node's spinlock,
 and a memory filesystem's write path takes a mutex that can sleep.
 
 ## 9 — the punch
+
+**Test:** `test/runtime/tmpfs_punch`. Red on master at the line that requires the block count to drop, green here.
 
 Comes with `test/runtime/tmpfs_punch`, which punches half a file and requires the
 block count to drop; on master it fails at that line, and it is the only
