@@ -31,8 +31,8 @@
 #include "../test_utils.h"
 
 #define MAX_CPUS    16
-#define FILE_BYTES  (128 * 1024)   /* the test image's root filesystem is small */
-#define CHUNK       (8 * 1024)
+#define FILE_BYTES  (4 * 1024 * 1024)  /* needs EXTRA_MKFS_OPTS="-s 64m" */
+#define CHUNK       (64 * 1024)
 #define ROUNDS      48
 
 static pthread_t threads[MAX_CPUS];

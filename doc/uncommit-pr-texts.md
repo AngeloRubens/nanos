@@ -195,11 +195,12 @@ and `FileDescriptor.sync` (`libnio.so` and `libjava.so` import `fsync`).
 
 **Test:** none. `test/runtime/fsync_completion_race` was written for this path --
 a file on the root filesystem so that committing is real I/O and the node stays
-busy, one syncing thread per processor so a completion can queue behind another
--- and it passes on master, on this branch, and on this branch with only this
-patch reverted. The test image's root filesystem is small enough that the file
-has to be 128K, which commits too fast for the window to open. Recorded rather
-than dropped, so the next attempt starts from what did not work.
+busy, one syncing thread per processor so that a completion can queue behind
+another -- and it passes on master, on this branch, and on this branch with only
+this patch reverted, at 128K on the default image and again at 4M on a 64M one
+(`EXTRA_MKFS_OPTS="-s 64m"`). So the size was not the obstacle, and the reason
+the window does not open is not established. Recorded rather than dropped, so
+that the next attempt starts from what has already failed.
 
 This is the weakest patch of the nine and is sent last: the observations that
 prompted it come from before patches 7 and 8 themselves, so it justifies itself
