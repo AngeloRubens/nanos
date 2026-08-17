@@ -28,6 +28,7 @@ la configurazione della CI dei manutentori (CircleCI, docker, `make VCPUS=2 test
 | test | dimostra | master | nostro |
 |---|---|---|---|
 | `vmap_flush_race` | #1 #2 #3 | round 0, piantato | 64, passa |
+| `vmap_flush_jvmpath` | **la serie intera** | hang round 0, 5/5 | 64 round, 13/14 |
 | `tmpfs_punch` | #9 | `holed < full` | passa |
 | `tmpfs_punch_race` | — (imita ZGC) | — | 32, passa |
 | `tmpfs_punch_nosync` | — (più vicino a ZGC: niente fsync) | — | 32, passa |

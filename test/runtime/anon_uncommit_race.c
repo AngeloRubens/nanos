@@ -14,8 +14,14 @@
    services the shootdown, so it never joins, so whoever opened it never
    finishes. Two processors are enough, which is what the CI gives.
 
-   The companion test vmap_flush_race does this against a file mapping; this one
-   removes the file, so that what it finds cannot be blamed on the page cache.
+   Every thread owns a share of the heap and touches nothing else: a collector
+   never writes into a range it is uncommitting at the same time, and a test that
+   does is not testing the kernel -- the write lands on PROT_NONE and takes the
+   SIGSEGV it asked for, on Linux as much as here. What is concurrent is the
+   unmapping and the faulting, which is what closes the cycle: each thread gives
+   its own share back, takes it again, and faults every page of it in, so at any
+   moment one processor is inside a shootdown and another is in the fault
+   handler waiting for the same lock.
 
    A kernel that closes the cycle stops the machine, so the round is printed
    before the work: a log that ends says which round it ended in. */
@@ -42,6 +48,7 @@ static pthread_t threads[MAX_CPUS];
 static volatile uint8_t *heap;
 static volatile int done;
 static int np;
+static size_t share;
 
 static int kidcnt;
 static pthread_cond_t kid_cv;
@@ -89,23 +96,27 @@ static void commit(void *addr, size_t len)
                      -1, 0) != MAP_FAILED);
 }
 
+/* One share, given back and taken again and then faulted in from end to end.
+   The commit frees the pages, so every one of these stores is a fault, and they
+   run while the other processors are in the middle of their own unmapping. */
+static void work(int id)
+{
+    size_t base = share * id;
+    uncommit((void *)(heap + base), share);
+    commit((void *)(heap + base), share);
+    for (size_t off = base; off < base + share; off += PAGESIZE)
+        heap[off] = (uint8_t)(id + 1);
+}
+
 static void *cpu_thread(void *v)
 {
     int id = (int)((uintptr_t)v);
-    size_t share = HEAP_BYTES / np;
-    size_t base = share * id;
 
     while (!done) {
         wait_for_sync();
         if (done)
             break;
-        if (id & 1) {
-            for (size_t off = base; off < base + share; off += PAGESIZE)
-                heap[off] = (uint8_t)(id + 1);
-        } else {
-            uncommit((void *)(heap + base), share);
-            commit((void *)(heap + base), share);
-        }
+        work(id);
     }
     return NULL;
 }
@@ -120,6 +131,10 @@ int main(int argc, char **argv)
         printf("anon uncommit race needs more than one processor -- skipped\n");
         return EXIT_SUCCESS;
     }
+
+    /* One share for each thread and one for this one, so that nobody reads or
+       writes a range somebody else is uncommitting. */
+    share = (HEAP_BYTES / (np + 1)) & ~(size_t)(PAGESIZE - 1);
 
     pthread_cond_init(&kid_cv, NULL);
     pthread_cond_init(&sync_cv, NULL);
@@ -140,13 +155,9 @@ int main(int argc, char **argv)
         fflush(stdout);
         wait_for_children();
         wake_children();
-        /* This thread drives the rounds and touches nothing. An earlier version
-           wrote the whole heap here, which is a range another thread may be
-           holding at PROT_NONE at that moment: the write is then a segfault the
-           test earned rather than a defect it found, and it showed up as a user
-           fault with error code 7 -- present, write, user mode. The contention
-           that matters is already between the children: the odd ones fault the
-           pages in while the even ones are giving them back. */
+        /* This thread does the same to a share of its own, which is what puts a
+           second unmapper and a second faulter on the locks the others hold. */
+        work(np);
     }
 
     wait_for_children();

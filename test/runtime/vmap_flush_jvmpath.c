@@ -1,25 +1,20 @@
-/* More than one thread giving pages back at the same time, while others fault
-   on them and the file they came from is synced.
+/* Giving pages back the way HotSpot does -- PROT_NONE mapped over the range with
+   MAP_FIXED, then the file mapped back over it -- from more than one thread,
+   while the file behind them is synced.
 
-   tlbshootdown covers the neighbouring case: one thread unmaps while the others
-   read, and each of them takes the fault it should. What it never has is two
-   threads returning pages at once, and that is what closes a cycle -- madvise
-   takes the process's vmap lock with interrupts disabled and then unmaps, which
-   opens a shootdown every processor has to join; a second thread waiting for
-   that same lock with interrupts disabled never services the shootdown, so it
-   never joins, so the first never finishes and never lets the lock go. The page
-   tables are locked the same way by the fault and by the unmap, so the same
-   cycle closes there too.
+   The companion test vmap_flush_race does the same with madvise(MADV_DONTNEED).
+   This one takes the route the JVM actually takes, os::pd_uncommit_memory
+   followed by a fresh mmap of the backing file, which on nanos goes through
+   process_remove_range_locked() rather than straight into vmap_unmap_page_range()
+   -- the same vmap lock and the same shootdown, reached by the other door.
 
-   Two processors are enough. Nothing here punches a hole or asks for anything
-   unusual: returning memory to the system is what every garbage collector does.
+   Every thread owns a share of the mapping and touches nothing but its own: a
+   range that one thread has mapped PROT_NONE is not readable by another, here or
+   on Linux, and a test that reads it is testing nothing. What overlaps is the
+   unmapping and the faulting and the sync, which is what closes the cycle.
 
-   A kernel that closes the cycle stops the machine, so there is no message to
-   print -- the round is printed before the work instead, and a log that ends
-   says which round it ended in.
-
-   Built on the barrier and the shape of tlbshootdown.c, since it is the same
-   machinery under test. */
+   A kernel that closes the cycle stops the machine, so the round is printed
+   before the work: a log that ends says which round it ended in. */
 
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -45,6 +40,7 @@ static volatile uint8_t *m;
 static volatile int done;
 static int np;
 static int fd;
+static size_t share;
 
 static int kidcnt;
 static pthread_cond_t kid_cv;
@@ -76,33 +72,30 @@ static void wake_children(void)
     pthread_mutex_unlock(&sync_mut);
 }
 
-/* Half of them give the pages back, half bring them in again: it takes both,
-   because a range that is already gone is unmapped without a shootdown. */
+/* The way a JVM gives a range back and takes it again: PROT_NONE over it with
+   MAP_FIXED, then the backing file mapped over it at the same offset. */
+static void work(int id)
+{
+    size_t base = share * id;
+
+    test_assert(mmap((void *)(m + base), share, PROT_NONE,
+                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                     -1, 0) != MAP_FAILED);
+    test_assert(mmap((void *)(m + base), share, PROT_READ | PROT_WRITE,
+                     MAP_FIXED | MAP_SHARED, fd, base) != MAP_FAILED);
+    for (size_t off = base; off < base + share; off += PAGESIZE)
+        m[off] = (uint8_t)(id + 1);
+}
+
 static void *cpu_thread(void *v)
 {
     int id = (int)((uintptr_t)v);
-    size_t share = MAP_BYTES / np;
-    size_t base = share * id;
 
     while (!done) {
         wait_for_sync();
         if (done)
             break;
-        if (id & 1) {
-            for (size_t off = base; off < base + share; off += PAGESIZE)
-                m[off] = (uint8_t)(id + 1);
-        } else {
-            /* The way a JVM gives a range back: PROT_NONE mapped over it with
-               MAP_FIXED, which is os::pd_uncommit_memory on every collector --
-               not madvise, which HotSpot uses in one place only. It reaches the
-               same lock and the same unmap here, and doing it the way the caller
-               that matters does it is worth the two lines. */
-            test_assert(mmap((void *)(m + base), share, PROT_NONE,
-                             MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                             -1, 0) != MAP_FAILED);
-            test_assert(mmap((void *)(m + base), share, PROT_READ | PROT_WRITE,
-                             MAP_FIXED | MAP_SHARED, fd, base) != MAP_FAILED);
-        }
+        work(id);
     }
     return NULL;
 }
@@ -114,11 +107,11 @@ int main(int argc, char **argv)
         np = MAX_CPUS;
     printf("There are %d processors available\n", np);
     if (np < 2) {
-        /* Said rather than skipped quietly: with one processor there is nobody
-           to wait for the lock, and the cycle cannot exist. */
-        printf("vmap flush race needs more than one processor -- skipped\n");
+        printf("vmap flush jvmpath needs more than one processor -- skipped\n");
         return EXIT_SUCCESS;
     }
+
+    share = (MAP_BYTES / (np + 1)) & ~(size_t)(PAGESIZE - 1);
 
     pthread_cond_init(&kid_cv, NULL);
     pthread_cond_init(&sync_cv, NULL);
@@ -140,11 +133,11 @@ int main(int argc, char **argv)
         wait_for_children();
         wake_children();
         /* The other way into the shootdown, from this thread, while they are in
-           the middle of theirs. */
+           the middle of theirs. The sync walks the whole file; a share that is
+           anonymous at that moment is skipped rather than read. */
         test_assert(msync((void *)m, MAP_BYTES, MS_SYNC) == 0);
         test_assert(fsync(fd) == 0);
-        for (size_t off = 0; off < MAP_BYTES; off += PAGESIZE)
-            m[off] = 0x44;
+        work(np);
     }
 
     wait_for_children();
