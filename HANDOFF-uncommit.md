@@ -84,6 +84,37 @@ node lock / pt_lock) vale a prescindere.
 **Il test c'e' gia'**: `tmpfs_punch_nosync` con **VCPUS=4** — master passa 32 round due volte
 su due, il nostro albero si pianta (due osservazioni). A VCPUS=2 non si vede.
 
+## La decima patch: analisi fatta, scrittura NON fatta
+
+La forma giusta l'ha suggerita il codice dei manutentori stessi, `flush.c:69-73`: *non aspettare
+tenendo un lock* -- loro rilasciano `flush_lock` prima di parcheggiare e lo riprendono dopo.
+Va applicata dove il lock e' preso, non dove si parcheggia (li' dentro non si sa cosa tenga
+il chiamante).
+
+Nel nostro caso: `pagecache_node_unmap_pages_sync` tiene il node lock attraverso
+`traverse_ptes`, e il parcheggio scatta in fondo a quella catena. Il node lock serve perche'
+l'handler chiama `page_lookup_nodelocked()` (pagecache.c, closure
+`pagecache_unmap_page_nodelocked`). **Idea**: salvare nell'entry l'indice di pagina invece del
+puntatore `pp`, e risolvere il lookup DOPO il walk, sotto il node lock -- cosi' `traverse_ptes`
+gira senza tenere niente.
+
+**Perche' non e' banale, verificato leggendo:** ci sono due produttori e due consumatori con
+locking diverso.
+- consumatore in `pagecache_node_unmap_pages_complete` (~:2185) prende gia'
+  `pagecache_lock_node(pn)`: qui il lookup differito si innesta bene;
+- consumatore nel drain (~:905) gira sotto `pagecache_lock_state`, **non ha `pn`**: li' va
+  ristrutturato, non solo adattato.
+
+**Due domande a cui rispondere prima di scrivere:**
+1. fra il walk e la risoluzione differita, un'altra CPU puo' togliere il record dall'albero:
+  `page_lookup_nodelocked` tornerebbe INVALID_ADDRESS dove oggi c'e' un `assert`. Va tollerato,
+  non asserito (stesso difetto della #3 in forma nuova).
+2. il walk azzera il PTE (`pte_set(entry, 0)`): capire se il record possa sparire proprio in
+  conseguenza di questo.
+
+**Test gia' disponibile per verificarla**: `tmpfs_punch_nosync` con **VCPUS=4** -- oggi si pianta
+sul nostro albero e passa su master. Rosso prima, verde dopo, e' la verifica nei due sensi.
+
 ## Aperto
 
 - Ablazioni #5 e #6 (in corso quando questa nota è stata scritta): log in `/tmp/soaklab/y-*.log`.
