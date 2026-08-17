@@ -30,6 +30,10 @@ typedef struct pagecache_page_entry {
         pte pte;
     };
     pagecache_page pp;
+    /* The unmap walk records the index instead of the pointer, and the completion resolves it
+       under the node's lock: that is what lets the walk run without holding the node. The drain
+       path still fills in pp, since it resolves nothing later. */
+    u64 pi;
 } *pagecache_page_entry;
 
 typedef struct pagecache_drain_work {
@@ -2157,9 +2161,12 @@ closure_function(6, 3, boolean, pagecache_unmap_page_nodelocked,
         } else {
             e->pte_ptr = entry;
         }
-        pagecache_page pp = page_lookup_nodelocked(bound(pn), pi);
-        assert(pp != INVALID_ADDRESS);
-        e->pp = pp;
+        /* The lookup this used to do is what required the node's lock to be held across the
+           walk -- and the walk spins for the page table lock, which services a flush, which
+           parks. A processor parked there while holding the node is what the other processors
+           then wait for. Recorded and resolved later instead. */
+        e->pi = pi;
+        e->pp = INVALID_ADDRESS;
         buffer_produce(unmap_entries, sizeof(*e));
     }
     return true;
@@ -2182,7 +2189,17 @@ closure_function(5, 0, void, pagecache_node_unmap_pages_complete,
             old_pte = e->pte;
         }
         pagecache pc = global_pagecache;
-        pagecache_page pp = e->pp;
+        pagecache_lock_node(pn);
+        pagecache_page pp = page_lookup_nodelocked(pn, e->pi);
+        pagecache_unlock_node(pn);
+        if (pp == INVALID_ADDRESS) {
+            /* Something took the record out of the node between the walk and here -- eviction,
+               or a punch. There is nothing left to release: clear the entry and go on, rather
+               than assert as the walk used to. */
+            if (check_dirty)
+                pte_set(pte_ptr, 0);
+            continue;
+        }
         if (check_dirty && pte_is_dirty(old_pte)) {
             pagecache_lock_node(pn);
             boolean success = pagecache_set_dirty(pn, range_lshift(irangel(page_offset(pp), 1),
@@ -2236,11 +2253,12 @@ static void pagecache_node_unmap_pages_sync(pagecache_node pn, range v, u64 node
     boolean done, progress;
     do {
         flush_entry fe = get_page_flush_entry();
-        pagecache_lock_node(pn);
+        /* Without the node's lock: the walk no longer looks anything up in the node, and
+           holding it here is what let a processor park inside the flush service while other
+           processors waited for the node. */
         done = traverse_ptes(v.start, range_span(v),
                              stack_closure(pagecache_unmap_page_nodelocked, pn, v.start,
                                            node_offset, fe, !shared_mappings, unmap_entries));
-        pagecache_unlock_node(pn);
         bytes queued = buffer_length(unmap_entries);
         remaining = queued;
         page_invalidate_sync(fe, completion, true);
