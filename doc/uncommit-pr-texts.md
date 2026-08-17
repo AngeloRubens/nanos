@@ -113,7 +113,9 @@ mapping in the system -- which includes a ZGC heap.
 
 ## 5 — node lock on the early return
 
-**Test:** `test/runtime/tmpfs_punch_race` -- see below; single observation so far, being repeated.
+**Test:** none. `test/runtime/tmpfs_punch_race` stopped once at round 8 without this patch, which
+looked like the signature -- threads that fault held while the rest runs -- but four repeats without
+it and four with it all completed, so that was noise and is not offered as evidence.
 
 `pagecache_release_page` takes the node's lock, looks the page up, and returns
 from inside the lock when the lookup finds nothing. The caller is the page fault
