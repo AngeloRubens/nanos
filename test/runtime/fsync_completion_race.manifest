@@ -1,0 +1,7 @@
+(
+    children:(
+        fsync_completion_race:(contents:(host:output/test/runtime/bin/fsync_completion_race))
+    )
+    program:/fsync_completion_race
+    environment:()
+)

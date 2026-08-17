@@ -46,6 +46,7 @@ PROGRAMS= \
 	vmap_flush_race \
 	vmap_flush_jvmpath \
 	anon_uncommit_race \
+	fsync_completion_race \
 	tmpfs_punch \
 	time \
 	tlbshootdown \
@@ -133,6 +134,12 @@ SRCS-vmap_flush_jvmpath= \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-vmap_flush_jvmpath=	-static
 LIBS-vmap_flush_jvmpath=	-lpthread
+
+SRCS-fsync_completion_race= \
+	$(CURDIR)/fsync_completion_race.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-fsync_completion_race=	-static
+LIBS-fsync_completion_race=	-lpthread
 
 SRCS-anon_uncommit_race= \
 	$(CURDIR)/anon_uncommit_race.c \

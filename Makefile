@@ -139,6 +139,7 @@ RUNTIME_TESTS=	\
 	vmap_flush_race \
 	vmap_flush_jvmpath \
 	anon_uncommit_race \
+	fsync_completion_race \
 	tmpfs_punch \
 	tlbshootdown \
 	tun \
