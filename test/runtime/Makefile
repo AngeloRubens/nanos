@@ -44,6 +44,8 @@ PROGRAMS= \
 	tmpfs_punch_nosync \
 	release_page_race \
 	vmap_flush_race \
+	vmap_flush_jvmpath \
+	anon_uncommit_race \
 	tmpfs_punch \
 	time \
 	tlbshootdown \
@@ -125,6 +127,18 @@ SRCS-tmpfs_commit_race= \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-tmpfs_commit_race=	-static
 LIBS-tmpfs_commit_race=		-lpthread
+
+SRCS-vmap_flush_jvmpath= \
+	$(CURDIR)/vmap_flush_jvmpath.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-vmap_flush_jvmpath=	-static
+LIBS-vmap_flush_jvmpath=	-lpthread
+
+SRCS-anon_uncommit_race= \
+	$(CURDIR)/anon_uncommit_race.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-anon_uncommit_race=	-static
+LIBS-anon_uncommit_race=	-lpthread
 
 SRCS-vmap_flush_race= \
 	$(CURDIR)/vmap_flush_race.c \

@@ -137,6 +137,8 @@ RUNTIME_TESTS=	\
 	tmpfs_punch_nosync \
 	release_page_race \
 	vmap_flush_race \
+	vmap_flush_jvmpath \
+	anon_uncommit_race \
 	tmpfs_punch \
 	tlbshootdown \
 	tun \

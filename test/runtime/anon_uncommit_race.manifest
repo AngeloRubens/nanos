@@ -1,0 +1,7 @@
+(
+    children:(
+        anon_uncommit_race:(contents:(host:output/test/runtime/bin/anon_uncommit_race))
+    )
+    program:/anon_uncommit_race
+    environment:()
+)
