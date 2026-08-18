@@ -115,6 +115,25 @@ locking diverso.
 **Test gia' disponibile per verificarla**: `tmpfs_punch_nosync` con **VCPUS=4** -- oggi si pianta
 sul nostro albero e passa su master. Rosso prima, verde dopo, e' la verifica nei due sensi.
 
+## L'assert visto una volta e non riprodotto (18/08)
+
+Durante la suite dei 45 test consecutivi, `tmpfs_punch_race` si e' fermato al round 7 con
+`assertion n != INVALID_ADDRESS failed at src/runtime/heap/page.c:230` -- l'assert aggiunto
+dalla patch #6, che nomina chi passa al page heap un indirizzo mai consegnato.
+
+Sospettato: la #10, che risolve la pagina per INDICE invece che per puntatore; se il record
+cambia fra il walk e la risoluzione, la completion lavora sulla pagina sbagliata. Il rischio
+e' reale nel codice.
+
+**Ma non si riproduce**: 5 giri da 32 round e poi **3 giri da 200 round** (circa mezzo milione
+di punch complessive), a macchina scarica e con la sospensione disattivata: nessun fallimento.
+Quindi l'evento resta **non attribuito**: comparve durante 45 boot consecutivi, con la macchina
+calda e la memoria frammentata. La #10 resta, l'episodio e' dichiarato.
+
+**Nota sul test**: i contatori dicono 167.000 punch contro 520 touch. I toucher sono quasi
+fermi: quel test esercita il percorso della punch e quasi per niente quello del fault, quindi
+non e' il riproduttore giusto per difetti che vivono di la'.
+
 ## Aperto
 
 - Ablazioni #5 e #6 (in corso quando questa nota è stata scritta): log in `/tmp/soaklab/y-*.log`.

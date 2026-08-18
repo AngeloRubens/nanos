@@ -38,7 +38,7 @@
 #define PAGESIZE        4096
 #define FILE_PAGES      2048
 #define FILE_BYTES      (FILE_PAGES * PAGESIZE)
-#define ROUNDS          32
+#define ROUNDS          200
 #define PUNCHERS        2
 #define TOUCHERS        3
 #define CHUNK           (32 * 1024)
