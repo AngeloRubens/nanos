@@ -75,6 +75,11 @@ typedef struct pagecache_node {
     sg_io fs_read;
     sg_io fs_write;
     pagecache_node_reserve fs_reserve;
+
+    /* Set for nodes whose pages may be laid over one contiguous block, so that a mapping of the
+       node can be described by a single block PTE. Only a filesystem that fills a page without
+       reading from a device may ask for this: the whole block is populated at the first fault. */
+    boolean huge;
     closure_struct(thunk, free);
     closure_struct(thunk, queue_free);
     struct refcount refcount;   /* count dirty pages before freeing node */

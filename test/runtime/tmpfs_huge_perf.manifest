@@ -1,0 +1,16 @@
+(
+    boot:(
+        children:(
+            klib:(children:(
+                tmpfs:(contents:(host:ARCH_DIR/bin/tmpfs))
+                shmem:(contents:(host:ARCH_DIR/bin/shmem))
+            ))
+        )
+    )
+    children:(
+        tmpfs_huge_perf:(contents:(host:output/test/runtime/bin/tmpfs_huge_perf))
+    )
+    klibs:bootfs
+    program:/tmpfs_huge_perf
+    environment:()
+)

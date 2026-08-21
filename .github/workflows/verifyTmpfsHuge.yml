@@ -1,0 +1,239 @@
+name: 2 MiB pages for tmpfs mappings (arm64 + x86_64)
+
+# nanos already maps anonymous memory with 2 MiB blocks, and does it by default:
+# every MAP_ANONYMOUS mapping gets VMAP_FLAG_THP (src/unix/mmap.c) and the manifest's
+# transparent_hugepage tuple only turns it off. A collector that keeps its heap in
+# anonymous memory therefore gets huge pages for free -- G1, Parallel, Shenandoah all
+# do. ZGC does not: its heap is a memfd mapped MAP_SHARED, which is file-backed, and
+# the file-backed fault path mapped one page at a time.
+#
+# The change under test lays one contiguous 2 MiB block under a whole window of a
+# tmpfs node's cache pages, keeping the 512 ordinary 4 KiB page records over it, so a
+# shared mapping of that window can be described by one block entry. The page size,
+# the cache's page order and the anonymous path are all untouched.
+#
+# What the jobs check, on BOTH architectures because the fault and unmap paths are
+# shared code and only x86_64 has a real pte_is_dirty():
+#
+#   * granularity  - test/runtime/tmpfs_huge, which uses mincore() to see the
+#                    granularity from user space: an entry covering 2 MiB reports 512
+#                    resident pages after a single touch, a page at a time mapping
+#                    reports one. Run twice against the same kernel, once normally and
+#                    once with transparent_hugepage:never, which must put the count
+#                    back to one -- the gate is the existing tuple, and 2 MiB is never
+#                    mandatory.
+#
+#   * perf         - test/runtime/tmpfs_huge_perf, the commit/fault/punch cycle a
+#                    collector runs against its heap, timed in both configurations.
+#                    Reported, never gated: TCG timings are not a threshold anyone
+#                    should gate on.
+#
+#   * regression   - the neighbouring tmpfs and mapping tests, because the change
+#                    touches the page-table walks the page cache shares with every
+#                    filesystem.
+#
+# TCG on the free hosted runners is enough; nothing here needs KVM, and the hosted
+# arm64 runners do not expose /dev/kvm anyway. VCPUS=2 is the maintainers' own CI
+# configuration.
+
+on:
+  push:
+    branches: [ci/zgc-probe, feat/tmpfs-huge-pages]
+    paths:
+      - 'src/**'
+      - 'klib/**'
+      - 'test/runtime/tmpfs_huge*'
+      - '.github/workflows/verifyTmpfsHuge.yml'
+  workflow_dispatch:
+
+jobs:
+  granularity:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+    name: granularity (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 qemu-utils
+
+      - name: 2 MiB granularity, with the default manifest
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" image TARGET=tmpfs_huge PLATFORM=${{ matrix.platform }} 2>&1 | tail -20
+          timeout 900 make VCPUS=2 run-noaccel TARGET=tmpfs_huge \
+            PLATFORM=${{ matrix.platform }} 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g' | tee huge-on.log || true
+          echo "--- guest ---"; grep -E 'resident|OK|Error' huge-on.log || true
+
+      - name: Assert the window is described by one entry
+        run: |
+          if grep -qE 'failed at|Error: ' huge-on.log; then
+            echo "::error::tmpfs_huge failed inside nanos:"
+            grep -E 'failed at|Error: ' huge-on.log | head -5
+            exit 1
+          fi
+          grep -q 'tmpfs_huge: OK' huge-on.log || {
+            echo "::error::tmpfs_huge did not report success"; tail -20 huge-on.log; exit 1; }
+          grep -q 'shared aligned: 512 of 512' huge-on.log || {
+            echo "::error::the shared aligned mapping was not described by one entry"
+            grep 'shared aligned' huge-on.log; exit 1; }
+          echo "PASS: $(grep 'shared aligned' huge-on.log)"
+
+      - name: And with transparent_hugepage:never, which must put it back to one page
+        run: |
+          set -o pipefail
+          sed -i 's/^    environment:()/    environment:()\n    transparent_hugepage:never/' \
+            test/runtime/tmpfs_huge.manifest
+          grep transparent_hugepage test/runtime/tmpfs_huge.manifest
+          make -j"$(nproc)" image TARGET=tmpfs_huge PLATFORM=${{ matrix.platform }} 2>&1 | tail -5
+          timeout 900 make VCPUS=2 run-noaccel TARGET=tmpfs_huge \
+            PLATFORM=${{ matrix.platform }} 2>&1 \
+            | sed 's/\x1b\[[0-9;]*m//g' | tee huge-off.log || true
+          # The test asserts the huge granularity, so it is expected to fail here: what
+          # is being checked is that the manifest turned the block mappings off, which
+          # is the same tuple that turns them off for anonymous memory.
+          grep -q 'shared aligned: 1 of 512' huge-off.log || {
+            echo "::error::transparent_hugepage:never did not disable the block mappings"
+            grep 'shared aligned' huge-off.log || tail -20 huge-off.log
+            exit 1; }
+          echo "PASS (gate honoured): $(grep 'shared aligned' huge-off.log)"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmpfs-huge-granularity-${{ matrix.arch }}
+          path: |
+            huge-on.log
+            huge-off.log
+
+  perf:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+    name: perf (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 qemu-utils
+
+      - name: Commit/fault/punch cycle, both granularities
+        run: |
+          set -o pipefail
+          run() { # $1 = label
+            make -j"$(nproc)" image TARGET=tmpfs_huge_perf PLATFORM=${{ matrix.platform }} \
+              2>&1 | tail -5
+            timeout 1800 make VCPUS=2 run-noaccel TARGET=tmpfs_huge_perf \
+              PLATFORM=${{ matrix.platform }} 2>&1 \
+              | sed 's/\x1b\[[0-9;]*m//g' | tee "perf-$1.log" || true
+          }
+          run with-2m
+          sed -i 's/^    environment:()/    environment:()\n    transparent_hugepage:never/' \
+            test/runtime/tmpfs_huge_perf.manifest
+          run without-2m
+
+      - name: Report the two side by side
+        run: |
+          {
+            echo "## tmpfs 2 MiB pages — ${{ matrix.arch }}, TCG, VCPUS=2"
+            echo
+            echo '| | first fault | punch + fault |'
+            echo '|---|---|---|'
+            for f in with-2m without-2m; do
+              ff=$(grep -o 'first fault:.*' "perf-$f.log" | head -1)
+              pf=$(grep -o 'punch+fault:.*' "perf-$f.log" | head -1)
+              echo "| $f | ${ff:-n/a} | ${pf:-n/a} |"
+            done
+            echo
+            echo 'Timings under TCG, reported and not gated.'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          for f in with-2m without-2m; do
+            grep -q 'tmpfs_huge_perf: OK' "perf-$f.log" || {
+              echo "::error::the $f run did not finish correctly"; tail -20 "perf-$f.log"; exit 1; }
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmpfs-huge-perf-${{ matrix.arch }}
+          path: perf-*.log
+
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+    name: regression (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 qemu-utils
+
+      - name: The tests that share the walks this change touches
+        run: |
+          set -o pipefail
+          fail=0
+          for t in tmpfs_punch tmpfs_commit_race tmpfs_punch_race release_page_race \
+                   vmap_flush_race shmem mmap; do
+            echo "=== $t ==="
+            make -j"$(nproc)" image TARGET=$t PLATFORM=${{ matrix.platform }} 2>&1 | tail -3
+            timeout 1200 make VCPUS=2 run-noaccel TARGET=$t PLATFORM=${{ matrix.platform }} \
+              2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee "reg-$t.log" || true
+            if grep -qE 'failed at|Error: |no fault handler' "reg-$t.log"; then
+              echo "::error::$t regressed"; grep -E 'failed at|Error: ' "reg-$t.log" | head -3
+              fail=1
+            else
+              echo "$t: ok"
+            fi
+          done
+          exit $fail
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmpfs-huge-regression-${{ matrix.arch }}
+          path: reg-*.log

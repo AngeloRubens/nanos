@@ -52,6 +52,13 @@ void pagecache_get_page(pagecache_node pn, u64 node_offset, boolean private,
                         pagecache_page_handler handler);
 void *pagecache_get_page_if_filled(pagecache_node pn, u64 node_offset, boolean private);
 void pagecache_release_page(pagecache_node pn, u64 node_offset);
+
+/* Huge windows: one contiguous block of PAGESIZE_2M laid over the cache pages of a node, so
+   that a mapping of it can be described by a single block PTE. Only for nodes whose pages are
+   filled by zeroing. */
+void pagecache_node_set_huge(pagecache_node pn);
+void *pagecache_get_huge_window(pagecache_node pn, u64 node_offset);
+void pagecache_release_huge_window(pagecache_node pn, u64 node_offset);
 void pagecache_node_free_pages(pagecache_node pn, range q /* bytes */);
 
 void pagecache_node_unmap_pages(pagecache_node pn, range v /* bytes */, u64 node_offset,

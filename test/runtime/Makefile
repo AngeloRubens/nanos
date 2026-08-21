@@ -39,6 +39,8 @@ PROGRAMS= \
 	syslog \
 	thread_test \
 	tmpfs_punch \
+	tmpfs_huge \
+	tmpfs_huge_perf \
 	tmpfs_commit_race \
 	tmpfs_punch_race \
 	tmpfs_punch_nosync \
@@ -162,6 +164,16 @@ SRCS-tmpfs_punch= \
 	$(CURDIR)/tmpfs_punch.c \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-tmpfs_punch=		-static
+
+SRCS-tmpfs_huge= \
+	$(CURDIR)/tmpfs_huge.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-tmpfs_huge=		-static
+
+SRCS-tmpfs_huge_perf= \
+	$(CURDIR)/tmpfs_huge_perf.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-tmpfs_huge_perf=	-static
 
 SRCS-fs_full= \
 	$(CURDIR)/fs_full.c \

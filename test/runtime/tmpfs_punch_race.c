@@ -42,11 +42,12 @@
 #define PUNCHERS        2
 #define TOUCHERS        3
 #define CHUNK           (32 * 1024)
+#define SECTOR_SIZE     512
 
 static int fd;
 static volatile uint8_t *map;
 static volatile int stop;
-static volatile unsigned long punches, touches, writes;
+static volatile unsigned long punches, touches, writes, stats;
 
 static unsigned long rnd(unsigned long *seed)
 {
@@ -103,9 +104,28 @@ static void *toucher(void *arg)
     return NULL;
 }
 
+/* Asks the file how big it is, as fast as it can, while the punchers are taking
+   ranges away from it. What st_blocks reports is kept as a running total for
+   exactly this reason: answering by walking the ranges walks a tree another
+   thread is pulling nodes out of, and a punch frees the node it removes. So this
+   thread is the guard on that -- it costs nothing while the total is a counter,
+   and it faults here, in a test, if the walk ever comes back. */
+static void *observer(void *arg)
+{
+    while (!stop) {
+        struct stat st;
+        test_assert(fstat(fd, &st) == 0);
+        /* The file cannot hold more than it is long, nor less than nothing. */
+        test_assert(st.st_blocks >= 0);
+        test_assert(st.st_blocks <= (blkcnt_t)((FILE_BYTES + PAGESIZE) / SECTOR_SIZE));
+        stats++;
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
-    pthread_t pt[PUNCHERS], tt[TOUCHERS], wt;
+    pthread_t pt[PUNCHERS], tt[TOUCHERS], wt, ot;
 
     printf("There are %d processors available\n", get_nprocs());
 
@@ -124,6 +144,7 @@ int main(int argc, char **argv)
     for (long i = 0; i < TOUCHERS; i++)
         test_assert(pthread_create(&tt[i], NULL, toucher, (void *)i) == 0);
     test_assert(pthread_create(&wt, NULL, writer, NULL) == 0);
+    test_assert(pthread_create(&ot, NULL, observer, NULL) == 0);
 
     for (int round = 0; round < ROUNDS; round++) {
         printf("round %d\n", round);
@@ -132,8 +153,8 @@ int main(int argc, char **argv)
         test_assert(fsync(fd) == 0);
         struct stat st;
         test_assert(fstat(fd, &st) == 0);
-        printf("  punches %lu touches %lu writes %lu blocks %ld\n",
-               punches, touches, writes, (long)st.st_blocks);
+        printf("  punches %lu touches %lu writes %lu blocks %ld stats %lu\n",
+               punches, touches, writes, (long)st.st_blocks, stats);
         fflush(stdout);
         usleep(100000);
     }
@@ -144,6 +165,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < TOUCHERS; i++)
         test_assert(pthread_join(tt[i], NULL) == 0);
     test_assert(pthread_join(wt, NULL) == 0);
+    test_assert(pthread_join(ot, NULL) == 0);
 
     test_assert(munmap((void *)map, FILE_BYTES) == 0);
     test_assert(close(fd) == 0);

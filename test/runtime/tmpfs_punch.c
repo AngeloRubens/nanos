@@ -27,6 +27,7 @@
 
 #define FILE_SIZE   (4 * 1024 * 1024)
 #define CHUNK       (64 * 1024)
+#define SECTOR_SIZE 512
 
 static blkcnt_t blocks_of(int fd)
 {
@@ -38,7 +39,9 @@ static blkcnt_t blocks_of(int fd)
 /* The blocks of a file on a memory filesystem are counted from the ranges its
    write handler has been given, and the page cache hands those over when it
    commits, not when write() returns -- so a file that has only been written to
-   holds no blocks yet, and fsync is what makes the count mean anything. */
+   holds no blocks yet, and fsync is what makes the count mean anything. Keeping
+   the count as a running total instead of walking the ranges does not change
+   that: the total moves where the ranges do, which is inside the write-back. */
 static void fill(int fd, size_t size)
 {
     uint8_t buf[CHUNK];
@@ -59,12 +62,12 @@ static void test_punch_frees_blocks(void)
     fill(fd, FILE_SIZE);
 
     blkcnt_t full = blocks_of(fd);
-    test_assert(full > 0);
+    test_assert(full == FILE_SIZE / SECTOR_SIZE);
 
     test_assert(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                           0, FILE_SIZE / 2) == 0);
     blkcnt_t holed = blocks_of(fd);
-    test_assert(holed < full);
+    test_assert(holed == full / 2);
 
     /* The size is kept, and what the hole covered is zero. */
     test_assert(lseek(fd, 0, SEEK_END) == FILE_SIZE);
@@ -83,7 +86,7 @@ static void test_punch_frees_blocks(void)
     /* The whole file, and then nothing left to give back. */
     test_assert(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                           0, FILE_SIZE) == 0);
-    test_assert(blocks_of(fd) < holed);
+    test_assert(blocks_of(fd) == 0);
 
     test_assert(close(fd) == 0);
 }
@@ -100,9 +103,12 @@ static void test_rewrite_after_punch(void)
 
     for (int round = 0; round < 4; round++) {
         fill(fd, FILE_SIZE);
+        test_assert(blocks_of(fd) == FILE_SIZE / SECTOR_SIZE);
         test_assert(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                               0, FILE_SIZE) == 0);
+        test_assert(blocks_of(fd) == 0);
         fill(fd, FILE_SIZE);
+        test_assert(blocks_of(fd) == FILE_SIZE / SECTOR_SIZE);
 
         uint8_t buf[CHUNK];
         test_assert(lseek(fd, 0, SEEK_SET) == 0);

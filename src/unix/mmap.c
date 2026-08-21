@@ -265,6 +265,31 @@ static status mmap_filebacked_page(vmap vm, u64 page_addr, pageflags flags, void
     return STATUS_OK;
 }
 
+/* Describes a whole PAGESIZE_2M window of a shared file mapping with one block mapping of the
+   contiguous block the page cache laid under it. Every page of the window has to be unmapped:
+   the window was handed over because none of its pages held memory, but another processor may
+   have faulted one of them in the meantime and mapped it a page at a time, and overwriting that
+   would lose the reference it holds. Nothing is forced -- when the window cannot be described
+   this way it is given back and the caller falls to the page at a time path. */
+static status mmap_filebacked_huge(vmap vm, u64 win_addr, u64 win_node_offset, pageflags flags,
+                                   void *kvirt)
+{
+    boolean mapped = true;
+    pagetable_lock();
+    for (u64 off = 0; off < PAGESIZE_2M; off += PAGESIZE) {
+        if (__physical_from_virtual_locked(pointer_from_u64(win_addr + off)) != INVALID_PHYSICAL) {
+            mapped = false;
+            break;
+        }
+    }
+    if (mapped)
+        map_nolock(win_addr, physical_from_virtual(kvirt), PAGESIZE_2M, flags);
+    pagetable_unlock();
+    if (!mapped)
+        pagecache_release_huge_window(vm->cache_node, win_node_offset);
+    return STATUS_OK;
+}
+
 closure_func_basic(pagecache_page_handler, void, pending_fault_page_handler,
                    void *kvirt)
 {
@@ -304,6 +329,28 @@ static status demand_filebacked_page(process p, context ctx, u64 vaddr, vmap vm,
     if (node_offset >= padlen) {
         pf_debug("   extends past map limit 0x%lx\n", padlen);
         return timm("result", "out of range page");
+    }
+
+    /* A whole window at once, when the mapping is a shared one of a node that can lay its pages
+       over a contiguous block, and transparent huge pages have not been turned off. Tried
+       before the page at a time path, and never required: whatever does not line up -- the
+       window falling outside the mapping or the file, the file offset not congruent with the
+       virtual address, no contiguous block to be had, some page of the window already in
+       memory -- leaves the fault to be taken the way it always was. */
+    if (!*pf && shared && !private_page && !(vm->flags & VMAP_FLAG_TAIL_BSS) &&
+        (mmap_info.thp_max_size >= PAGESIZE_2M)) {
+        u64 win_addr = page_addr & ~MASK(PAGELOG_2M);
+        u64 win_node_offset = node_offset & ~MASK(PAGELOG_2M);
+        if (((page_addr - win_addr) == (node_offset - win_node_offset)) &&
+            (win_addr >= vm->node.r.start) && (win_addr + PAGESIZE_2M <= vm->node.r.end) &&
+            (win_node_offset + PAGESIZE_2M <= padlen)) {
+            void *block = pagecache_get_huge_window(pn, win_node_offset);
+            if (block != INVALID_ADDRESS) {
+                pf_debug("   huge window at 0x%lx, node offset 0x%lx\n", win_addr,
+                         win_node_offset);
+                return mmap_filebacked_huge(vm, win_addr, win_node_offset, flags, block);
+            }
+        }
     }
 
     void *kvirt;
