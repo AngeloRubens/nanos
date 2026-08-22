@@ -1,0 +1,130 @@
+name: tmpfs uncommit and 2 MiB pages (arm64 + x86_64)
+
+# Verification branch for the three pull requests it carries:
+#
+#   * the vmap lock answering a pending flush     (test/runtime/vmap_flush.c, in mmap)
+#   * giving back the pages of a punched hole     (test/runtime/fallocate.c, in filesystem)
+#   * one 2 MiB block under a window of pages     (test/runtime/thp.c, in mmap)
+#
+# All three are exercised by the ordinary runtime test binaries, so the jobs below build and
+# run those. TCG on the hosted runners is enough; nothing here needs KVM, and the hosted arm64
+# runners do not expose /dev/kvm anyway. VCPUS=2 is the maintainers' own CI configuration, and
+# the flush race needs more than one processor to exist at all.
+
+on:
+  # No path filter: this branch exists only to verify the pull requests, so every push to it
+  # should run the checks, including one that touches nothing but this file.
+  push:
+    branches: [ci/thp-pr-verify]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+    name: tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 qemu-utils
+
+      - name: The tests that cover the three changes, and their neighbours
+        run: |
+          set -o pipefail
+          fail=0
+          for t in mmap filesystem shmem fs_full tlbshootdown; do
+            echo "=== $t ==="
+            make -j"$(nproc)" image TARGET=$t PLATFORM=${{ matrix.platform }} 2>&1 | tail -3
+            timeout 1200 make VCPUS=2 run-noaccel TARGET=$t PLATFORM=${{ matrix.platform }} \
+              2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee "run-$t.log" || true
+            if grep -qE 'failed at|Error: |no fault handler|assertion failed' "run-$t.log"; then
+              echo "::error::$t failed"
+              grep -E 'failed at|Error: ' "run-$t.log" | head -3
+              fail=1
+            else
+              echo "$t: ok"
+            fi
+          done
+          grep -q 'thp test:' run-mmap.log || {
+            echo "::error::the huge window test did not run"; fail=1; }
+          grep -q 'vmap_flush test:' run-mmap.log || {
+            echo "::error::the vmap flush test did not run"; fail=1; }
+          grep -q 'all tests passed' run-mmap.log || {
+            echo "::error::mmap did not report success"; tail -20 run-mmap.log; fail=1; }
+          grep -q 'fallocate test:' run-filesystem.log || {
+            echo "::error::the fallocate test did not run"; fail=1; }
+          exit $fail
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.arch }}
+          path: run-*.log
+
+  # The block mappings stay optional: the manifest tuple that turns transparent huge pages off
+  # for anonymous memory has to turn them off here too. With it set, the huge window test is
+  # expected to fail, at the assertion that the window was described by one entry -- that
+  # failure is what proves the gate is honoured.
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+    name: transparent_hugepage:never (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout (this ref = the kernel under test)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 qemu-utils
+
+      - name: Run the mmap tests with the tuple set
+        run: |
+          set -o pipefail
+          sed -i 's/^    klibs:bootfs/    klibs:bootfs\n    transparent_hugepage:never/' \
+            test/runtime/mmap.manifest
+          grep transparent_hugepage test/runtime/mmap.manifest
+          make -j"$(nproc)" image TARGET=mmap PLATFORM=${{ matrix.platform }} 2>&1 | tail -3
+          timeout 1200 make VCPUS=2 run-noaccel TARGET=mmap PLATFORM=${{ matrix.platform }} \
+            2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee gate.log || true
+
+      - name: Assert the tuple put the mapping back to one page
+        run: |
+          grep -qE 'failed at .*thp\.c' gate.log || {
+            echo "::error::transparent_hugepage:never did not disable the block mappings"
+            tail -20 gate.log; exit 1; }
+          echo "PASS (gate honoured): $(grep -E 'failed at .*thp\.c' gate.log | head -1)"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-${{ matrix.arch }}
+          path: gate.log
