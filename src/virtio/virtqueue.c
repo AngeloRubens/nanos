@@ -205,6 +205,19 @@ static void vq_poll(virtqueue vq)
                                 func_ss, vq->name, vq->last_used_idx, uep->id, uep->len);
         u16 head = uep->id;
         vqmsg m = vq->msgs[head];
+        if (!m) {
+            rprintf("VQDIAG null msg: vq %s cpu %d head %d last_used_idx %d used->idx %d desc_idx %d "
+                    "free_cnt %ld entries %d polling %d events %d avail->idx %d uep->len %d\n",
+                    vq->name, current_cpu()->id, head, vq->last_used_idx, vq->used->idx, vq->desc_idx,
+                    vq->free_cnt, vq->entries, vq->polling, vq->events_enabled, vq->avail->idx, uep->len);
+            for (int k = -6; k <= 2; k++) {
+                u16 ix = (u16)(vq->last_used_idx + k) & (vq->entries - 1);
+                u16 id = vq->used->ring[ix].id;
+                rprintf("VQDIAG used[%d] id %d len %d msg %p\n", ix, id, vq->used->ring[ix].len,
+                        vq->msgs[id & (vq->entries - 1)]);
+            }
+            halt("VQDIAG halt in vq_poll\n");
+        }
 
         /* return descriptor(s) to free list */
         int dcount = 1;
@@ -401,6 +414,11 @@ static void virtqueue_fill(virtqueue vq)
 
         assert(m->completion);
         u16 head = vq->desc_idx;
+        if (vq->msgs[head]) {
+            rprintf("VQDIAG double head: vq %s cpu %d head %d old %p new %p desc_idx %d free_cnt %ld\n",
+                    vq->name, current_cpu()->id, head, vq->msgs[head], m, vq->desc_idx, vq->free_cnt);
+            halt("VQDIAG halt in virtqueue_fill\n");
+        }
         vq->msgs[head] = m;
 
         for (int i = 0; i < m->count; i++) {
