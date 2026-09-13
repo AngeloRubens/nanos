@@ -1,0 +1,61 @@
+name: who the process is (arm64 + x86_64)
+
+# Verification branch for the change that lets the manifest say the uid and gid of a process.
+# The check lives in the mkdir runtime test, beside the one for cwd, which is the other thing the
+# manifest says about a process.
+
+on:
+  push:
+    branches: [ci/uid-verify]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+    name: tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 qemu-utils
+
+      - name: The test that covers it, and its neighbours
+        run: |
+          set -o pipefail
+          fail=0
+          for t in mkdir filesystem; do
+            echo "=== $t ==="
+            make -j"$(nproc)" image TARGET=$t PLATFORM=${{ matrix.platform }} 2>&1 | tail -3
+            timeout 900 make VCPUS=2 run-noaccel TARGET=$t PLATFORM=${{ matrix.platform }} \
+              2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee "run-$t.log" || true
+            if grep -qE 'failed at|Error: |no fault handler|assertion failed' "run-$t.log"; then
+              echo "::error::$t failed"
+              grep -E 'failed at|Error: ' "run-$t.log" | head -3
+              fail=1
+            else
+              echo "$t: ok"
+            fi
+          done
+          grep -q 'mkdir test passed\|all tests passed' run-mkdir.log || {
+            echo "::error::the mkdir test did not report success"; tail -20 run-mkdir.log; fail=1; }
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: uid-${{ matrix.arch }}
+          path: run-*.log
