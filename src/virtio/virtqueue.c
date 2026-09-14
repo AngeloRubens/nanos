@@ -206,6 +206,8 @@ static void vq_poll(virtqueue vq)
         u16 head = uep->id;
         vqmsg m = head < vq->entries ? vq->msgs[head] : 0;
         if (!m) {
+            rprintf("VQFIX stale used element skipped: vq %s cpu %d head %d last_used_idx %d used->idx %d\n",
+                    vq->name, current_cpu()->id, head, vq->last_used_idx, vq->used->idx);
             /* The device has advanced used->idx, but the element at last_used_idx does not name a
              * message in flight: its id is still the one left there on the previous lap of the
              * ring. Leave the element for the next poll instead of dereferencing a null message. */
