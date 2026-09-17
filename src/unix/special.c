@@ -195,14 +195,14 @@ static u32 maps_events(file f)
     return EPOLLIN;
 }
 
-static sysreturn cpu_online_read(file f, void *dest, u64 length, u64 offset)
+static sysreturn cpu_list_read(file f, void *dest, u64 length, u64 offset)
 {
     buffer b = little_stack_buffer(16);
     bprintf(b, "0-%d\n", total_processors - 1);
     return buffer_read_at(b, offset, dest, length);
 }
 
-static u32 cpu_online_events(file f)
+static u32 cpu_list_events(file f)
 {
     return (EPOLLIN | EPOLLOUT);
 }
@@ -253,8 +253,15 @@ static const special_file special_files[] = {
       .read = mounts_read, .events = mounts_events,
       .alloc_size = sizeof(struct mounts_notify_data)},
     { ss_static_init("/proc/self/maps"), .read = maps_read, .events = maps_events, },
-    { ss_static_init("/sys/devices/system/cpu/online"), .read = cpu_online_read,
-      .write = null_write, .events = cpu_online_events },
+    /* Every processor brought up is online and there is no other, so one list answers for all
+       three. A program that counts processors may read any of them: the allocator mongodb is built
+       with stops the process when it cannot read "possible". */
+    { ss_static_init("/sys/devices/system/cpu/online"), .read = cpu_list_read,
+      .write = null_write, .events = cpu_list_events },
+    { ss_static_init("/sys/devices/system/cpu/possible"), .read = cpu_list_read,
+      .write = null_write, .events = cpu_list_events },
+    { ss_static_init("/sys/devices/system/cpu/present"), .read = cpu_list_read,
+      .write = null_write, .events = cpu_list_events },
     FTRACE_SPECIAL_FILES
 };
 
