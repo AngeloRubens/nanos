@@ -1915,6 +1915,15 @@ closure_function(4, 1, void, get_page_finish,
     closure_finish();
 }
 
+static u64 thpdbg[5];
+static void thpdbg_count(int k)
+{
+    u64 n = fetch_and_add(&thpdbg[k], 1) + 1;
+    if ((n & (n - 1)) == 0)
+        rprintf("THPDBG win_ok %ld win_busy %ld win_unwind %ld unmap_whole %ld unmap_split %ld\n",
+                thpdbg[0], thpdbg[1], thpdbg[2], thpdbg[3], thpdbg[4]);
+}
+
 /* Returns whether no page of a window holds memory */
 static boolean window_is_free_nodelocked(pagecache_node pn, u64 base_pi, u64 count)
 {
@@ -2011,8 +2020,10 @@ static boolean pagecache_get_window(pagecache_node pn, u64 node_offset, u64 size
     pagecache_lock_node(pn);
     boolean free = window_is_free_nodelocked(pn, base_pi, count);
     pagecache_unlock_node(pn);
-    if (!free)
+    if (!free) {
+        thpdbg_count(1);
         return false;
+    }
 
     void *block = allocate(pc->contiguous, size);
     if (block == INVALID_ADDRESS)
@@ -2081,6 +2092,7 @@ static boolean pagecache_get_window(pagecache_node pn, u64 node_offset, u64 size
     pagecache_unlock_state(pc);
     pagecache_unlock_node(pn);
     pagecache_debug("%s: pn %p, node_offset 0x%lx, size 0x%lx\n", func_ss, pn, node_offset, size);
+    thpdbg_count(0);
     if (!sg) {
         apply(handler, kvirt);
         return true;
@@ -2089,6 +2101,7 @@ static boolean pagecache_get_window(pagecache_node pn, u64 node_offset, u64 size
     apply(pn->fs_read, sg, r, complete);
     return true;
   fail_unwind:
+    thpdbg_count(2);
     /* Give back what was laid out, a page at a time as the cache always does -- the page heap
        coalesces the slices back into the block -- and the untouched tail in one piece. */
     for (pagecache_page q = page_lookup_at_or_next_nodelocked(pn, base_pi);
@@ -2192,6 +2205,7 @@ closure_function(6, 3, boolean, pagecache_unmap_page_nodelocked,
         u64 size = pte_map_size(level, old_entry);
         if (!range_contains(bound(v), irangel(vaddr, size))) {
             /* block mapping partially unmapped */
+            thpdbg_count(4);
             page_invalidate(bound(fe), vaddr);
             return split_mapping(entry);
         }
@@ -2213,6 +2227,8 @@ closure_function(6, 3, boolean, pagecache_unmap_page_nodelocked,
         assert(pp != INVALID_ADDRESS);
         e->pp = pp;
         e->npages = size >> PAGELOG;
+        if (e->npages > 1)
+            thpdbg_count(3);
         buffer_produce(unmap_entries, sizeof(*e));
     }
     return true;
