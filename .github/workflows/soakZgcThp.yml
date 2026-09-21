@@ -30,7 +30,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [arm64, x64]
-        kernel: [pr2181, prereview, master]
+        kernel: [fix, debug, master]
         include:
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -83,8 +83,8 @@ jobs:
         run: |
           if [ "${{ matrix.kernel }}" = master ]; then
             git clone --depth 1 https://github.com/nanovms/nanos.git /tmp/src
-          elif [ "${{ matrix.kernel }}" = prereview ]; then
-            git clone --depth 1 --branch ci/old-2181 "https://github.com/${{ github.repository }}.git" /tmp/src
+          elif [ "${{ matrix.kernel }}" = debug ]; then
+            git clone --depth 1 --branch ci/debug-2181 "https://github.com/${{ github.repository }}.git" /tmp/src
           else
             cp -a "$GITHUB_WORKSPACE" /tmp/src
             rm -rf /tmp/src/output
@@ -169,7 +169,7 @@ jobs:
             rc=0; wait $pid || rc=$?; echo "exit=$rc" >> "boot-$i.log"
             pkill -9 -f qemu-system || true
             sleep 2
-            grep -E "Version|Temurin|SOAK (OK|MISMATCH)|GC (OK|FAIL)|assert|panic|fault|exit=" "boot-$i.log" | head -20 || true
+            grep -E "THPDBG|Version|Temurin|SOAK (OK|MISMATCH)|GC (OK|FAIL)|assert|panic|fault|exit=" "boot-$i.log" | head -20 || true
           done
 
       - name: Symbolize the frame traces
@@ -208,7 +208,7 @@ jobs:
           done
           echo >> "$GITHUB_STEP_SUMMARY"
           echo "$ok OK, $bad not OK" | tee -a "$GITHUB_STEP_SUMMARY"
-          [ "${{ matrix.kernel }}" = master ] || [ "$bad" = 0 ]
+          [ "${{ matrix.kernel }}" != fix ] || [ "$bad" = 0 ]
 
       - uses: actions/upload-artifact@v4
         if: always()
