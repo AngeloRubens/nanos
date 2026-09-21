@@ -1,0 +1,194 @@
+name: ZGC uncommit soak on Temurin 25 (PR 2181 against master)
+
+# Boots a Temurin 25 JRE whose ZGC heap is a tmpfs memfd, and has the collector commit and
+# uncommit it over and over while other threads keep writing it: the uncommitter punches holes in
+# the backing file, the mutators fault pages of the same file, and with PR 2181 those faults lay
+# 2 MiB windows that the punch has to take apart. Each boot checks every page it reads back.
+#
+# The same boots run on upstream master as a control, so that a guest that stops can be told
+# apart from one that stops without the pull request as well.
+
+on:
+  push:
+    branches: [ci/thp-zgc-soak]
+  workflow_dispatch:
+    inputs:
+      boots:
+        description: "soak boots per job"
+        default: "6"
+      soak_seconds:
+        description: "seconds of soak per boot"
+        default: "90"
+
+env:
+  BOOTS: ${{ inputs.boots || '6' }}
+  SOAK_SECONDS: ${{ inputs.soak_seconds || '90' }}
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
+        kernel: [pr2181, master]
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+            ops_arch: arm64
+            adoptium_arch: aarch64
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+            ops_arch: amd64
+            adoptium_arch: x64
+    name: soak (${{ matrix.arch }}, ${{ matrix.kernel }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (this ref = PR 2181)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-user qemu-user-static qemu-system-arm \
+            qemu-system-aarch64 binfmt-support qemu-utils
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+            echo "KVM: yes"
+          else
+            echo "KVM: no (TCG)"
+          fi
+
+      - name: Set up a JDK to compile the workload
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Compile GcChurn
+        run: |
+          git fetch --depth 1 origin ci/zgc-probe
+          git show FETCH_HEAD:.github/workflows/verifyZgcArm64.yml \
+            | awk '/cat > GcChurn.java <<.EOF./{f=1;next} f&&/^          EOF$/{exit} f' \
+            | sed 's/^          //' > GcChurn.java
+          javac --release 11 -d . GcChurn.java
+          [ "$(ls GcChurn*.class | wc -l)" = 1 ]
+
+      - name: Build the kernel under test
+        run: |
+          if [ "${{ matrix.kernel }}" = master ]; then
+            git clone --depth 1 https://github.com/nanovms/nanos.git /tmp/src
+          else
+            cp -a "$GITHUB_WORKSPACE" /tmp/src
+            rm -rf /tmp/src/output
+          fi
+          git -C /tmp/src log --oneline -1
+          make -C /tmp/src -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
+          make -C /tmp/src -j"$(nproc)" klibs PLATFORM=${{ matrix.platform }} || true
+
+      - name: Install ops
+        run: |
+          curl https://ops.city/get.sh -sSfL | sh
+          echo "$HOME/.ops/bin" >> "$GITHUB_PATH"
+
+      - name: Swap our kernel and klibs into the ops nightly slot
+        run: |
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            ops pkg get AngeloRubens/TemurinJREarm64Linux:25.0.1 --arch arm64 --nightly || true
+          else
+            ops pkg get AngeloRubens/AzulJREx64Linux:25.0.1 --arch amd64 --nightly || true
+          fi
+          find "$HOME/.ops" -name kernel.img
+          OPSK="$(find "$HOME/.ops" -name kernel.img -path '*nightly*' | head -1)"
+          [ -n "$OPSK" ] || { echo "::error::no ops nightly kernel.img"; exit 1; }
+          cp "$(find /tmp/src/output/platform/${{ matrix.platform }} -name kernel.img | head -1)" "$OPSK"
+          KLIBDIR="$(dirname "$OPSK")/klibs"
+          for k in tmpfs shmem; do
+            built="$(find /tmp/src/output -type f -path '*/bin/*' -name "$k" | head -1)"
+            [ -n "$built" ] || { echo "::error::klib $k not built"; exit 1; }
+            cp "$built" "$KLIBDIR/$k"
+          done
+          echo "kernel slot: $OPSK"; ls -l "$OPSK" "$KLIBDIR"/tmpfs "$KLIBDIR"/shmem
+
+      # The registry has Temurin 25 only for arm64 (its x64 "Temurin" package is Zulu inside), so on
+      # x64 the official Adoptium JRE is laid over the glibc of the x64 package in a local package.
+      - name: Prepare the Temurin 25 JRE
+        run: |
+          if [ "${{ matrix.arch }}" = arm64 ]; then
+            echo "PKG=AngeloRubens/TemurinJREarm64Linux:25.0.1" >> "$GITHUB_ENV"
+            echo "PKGFLAGS=--nightly" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          curl -sSfL -o jre.tgz \
+            "https://api.adoptium.net/v3/binary/latest/25/ga/linux/${{ matrix.adoptium_arch }}/jre/hotspot/normal/eclipse"
+          mkdir jre && tar -xzf jre.tgz -C jre --strip-components=1
+          jre/bin/java -version
+          AZUL="$(find "$HOME/.ops/packages" -maxdepth 3 -type d -name 'AzulJREx64Linux_25.0.1' | head -1)"
+          [ -n "$AZUL" ] || { echo "::error::no Azul package to take glibc from"; exit 1; }
+          for d in "$HOME/.ops/local_packages/amd64/TemurinJREx64_25.0" "$HOME/.ops/local_packages/TemurinJREx64_25.0"; do
+            mkdir -p "$d/sysroot"
+            cp -a "$AZUL/sysroot/usr" "$AZUL/sysroot/lib64" "$d/sysroot/"
+            cp -a jre "$d/sysroot/temurin-jre"
+            printf '{\n "Program": "/temurin-jre/bin/java",\n "Args": ["java"],\n "Env": {"JAVA_HOME": "/temurin-jre"},\n "Version": "25.0"\n}\n' \
+              > "$d/package.manifest"
+          done
+          echo "PKG=TemurinJREx64_25.0" >> "$GITHUB_ENV"
+          echo "PKGFLAGS=--nightly -l" >> "$GITHUB_ENV"
+
+      - name: Soak ZGC uncommit
+        run: |
+          strip_ansi() { sed -u 's/\x1b\[[0-9;]*m//g'; }
+          cat > cfg.json <<EOF
+          {
+            "Klibs": ["tmpfs", "shmem"],
+            "Args": ["-XX:+UseZGC", "-Xms64m", "-Xmx512m", "-XX:ZUncommitDelay=1",
+                     "-Xlog:gc", "-Xlog:gc+heap", "-Xlog:os+cpu",
+                     "-Drounds=2", "-Dsoak=${SOAK_SECONDS}", "-DsoakThreads=3",
+                     "-cp", "/", "GcChurn"],
+            "Files": ["GcChurn.class"],
+            "RunConfig": { "Memory": "2G", "CPUs": 4 }
+          }
+          EOF
+          for i in $(seq 1 "$BOOTS"); do
+            echo "=== boot $i/$BOOTS ==="
+            timeout $((SOAK_SECONDS + 400)) ops pkg load "$PKG" --arch ${{ matrix.ops_arch }} $PKGFLAGS \
+              -c cfg.json 2>&1 | strip_ansi > "boot-$i.log"
+            echo "exit=${PIPESTATUS[0]}" >> "boot-$i.log"
+            pkill -9 -f qemu-system || true
+            sleep 2
+            grep -E "Version|Temurin|SOAK (OK|MISMATCH)|GC (OK|FAIL)|assert|panic|fault|exit=" "boot-$i.log" | head -20 || true
+          done
+
+      - name: Summarize
+        if: always()
+        run: |
+          ok=0; bad=0
+          {
+            echo "### soak ${{ matrix.arch }} / ${{ matrix.kernel }}"
+            echo
+            echo "| boot | result | cycles | pages | wrong | uncommits |"
+            echo "|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in boot-*.log; do
+            s="$(grep -o 'SOAK [A-Z]* cycles=[0-9]* pages=[0-9]* wrong=[0-9]*' "$f" | tail -1)"
+            unc="$(grep -c 'Uncommitted' "$f" || true)"
+            if grep -q 'GC OK' "$f" && echo "$s" | grep -q 'SOAK OK'; then r=OK; ok=$((ok+1));
+            elif [ -n "$s" ]; then r=MISMATCH; bad=$((bad+1));
+            else r="STOPPED ($(grep -o 'exit=[0-9]*' "$f" | tail -1))"; bad=$((bad+1)); fi
+            set -- $(echo "$s" | sed 's/[a-z]*=//g')
+            echo "| ${f#boot-} | $r | ${3:-} | ${4:-} | ${5:-} | $unc |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "$ok OK, $bad not OK" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "${{ matrix.kernel }}" = master ] || [ "$bad" = 0 ]
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ matrix.arch }}-${{ matrix.kernel }}
+          path: boot-*.log
