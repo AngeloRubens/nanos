@@ -30,7 +30,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [arm64, x64]
-        kernel: [pr2181, master]
+        kernel: [pr2181, prereview, master]
         include:
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -52,7 +52,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+          sudo apt-get install -y build-essential binutils wget git python3 nasm gdb \
             qemu-system qemu-user qemu-user-static qemu-system-arm \
             qemu-system-aarch64 binfmt-support qemu-utils
           if [ -e /dev/kvm ]; then
@@ -83,6 +83,8 @@ jobs:
         run: |
           if [ "${{ matrix.kernel }}" = master ]; then
             git clone --depth 1 https://github.com/nanovms/nanos.git /tmp/src
+          elif [ "${{ matrix.kernel }}" = prereview ]; then
+            git clone --depth 1 --branch ci/old-2181 "https://github.com/${{ github.repository }}.git" /tmp/src
           else
             cp -a "$GITHUB_WORKSPACE" /tmp/src
             rm -rf /tmp/src/output
@@ -157,12 +159,33 @@ jobs:
           for i in $(seq 1 "$BOOTS"); do
             echo "=== boot $i/$BOOTS ==="
             timeout $((SOAK_SECONDS + 400)) ops pkg load "$PKG" --arch ${{ matrix.ops_arch }} $PKGFLAGS \
-              -c cfg.json 2>&1 | strip_ansi > "boot-$i.log"
-            echo "exit=${PIPESTATUS[0]}" >> "boot-$i.log"
+              -c cfg.json 2>&1 | strip_ansi > "boot-$i.log" &
+            pid=$!
+            # a guest that asserts stops printing and waits for the timeout: end it at once
+            while kill -0 $pid 2>/dev/null; do
+              grep -q '^assertion ' "boot-$i.log" 2>/dev/null && { sleep 3; pkill -9 -f qemu-system || true; }
+              sleep 2
+            done
+            rc=0; wait $pid || rc=$?; echo "exit=$rc" >> "boot-$i.log"
             pkill -9 -f qemu-system || true
             sleep 2
             grep -E "Version|Temurin|SOAK (OK|MISMATCH)|GC (OK|FAIL)|assert|panic|fault|exit=" "boot-$i.log" | head -20 || true
           done
+
+      - name: Symbolize the frame traces
+        if: always()
+        run: |
+          ELF="$(find /tmp/src/output/platform/${{ matrix.platform }} -name kernel.elf | head -1)"
+          echo "elf: $ELF"
+          [ -n "$ELF" ] || exit 0
+          grep -ohE '\(([a-z_0-9]+) \+ ([0-9a-f]+)/' boot-*.log | sort | uniq -c | sort -rn | head -20 \
+          | while read n rest; do
+              fn="$(echo "$rest" | sed -E 's/\(([a-z_0-9]+) \+ ([0-9a-f]+)\//\1/')"
+              off="$(echo "$rest" | sed -E 's/\(([a-z_0-9]+) \+ ([0-9a-f]+)\//\2/')"
+              echo "== $n x $fn+0x$off"
+              gdb -batch -ex "info line *($fn+0x$off)" -ex "info symbol ($fn+0x$off)" "$ELF" 2>&1 | head -3
+              addr2line -f -i -e "$ELF" $(gdb -batch -ex "p/x $fn+0x$off" "$ELF" 2>/dev/null | awk '{print $NF}') 2>&1 | head -12
+            done
 
       - name: Summarize
         if: always()
