@@ -15,13 +15,13 @@ on:
     inputs:
       boots:
         description: "soak boots per job"
-        default: "6"
+        default: "12"
       soak_seconds:
         description: "seconds of soak per boot"
         default: "90"
 
 env:
-  BOOTS: ${{ inputs.boots || '6' }}
+  BOOTS: ${{ inputs.boots || '12' }}
   SOAK_SECONDS: ${{ inputs.soak_seconds || '90' }}
 
 jobs:
@@ -158,15 +158,15 @@ jobs:
           EOF
           for i in $(seq 1 "$BOOTS"); do
             echo "=== boot $i/$BOOTS ==="
-            timeout $((SOAK_SECONDS + 400)) ops pkg load "$PKG" --arch ${{ matrix.ops_arch }} $PKGFLAGS \
-              -c cfg.json 2>&1 | strip_ansi > "boot-$i.log" &
+            { timeout $((SOAK_SECONDS + 400)) ops pkg load "$PKG" --arch ${{ matrix.ops_arch }} $PKGFLAGS \
+                -c cfg.json 2>&1; echo "exit=$?"; } | strip_ansi > "boot-$i.log" &
             pid=$!
             # a guest that asserts stops printing and waits for the timeout: end it at once
             while kill -0 $pid 2>/dev/null; do
               grep -q '^assertion ' "boot-$i.log" 2>/dev/null && { sleep 3; pkill -9 -f qemu-system || true; }
               sleep 2
             done
-            rc=0; wait $pid || rc=$?; echo "exit=$rc" >> "boot-$i.log"
+            wait $pid || true
             pkill -9 -f qemu-system || true
             sleep 2
             grep -E "THPDBG|Version|Temurin|SOAK (OK|MISMATCH)|GC (OK|FAIL)|assert|panic|fault|exit=" "boot-$i.log" | head -20 || true
@@ -205,9 +205,11 @@ jobs:
             else r="STOPPED ($(grep -o 'exit=[0-9]*' "$f" | tail -1))"; bad=$((bad+1)); fi
             set -- $(echo "$s" | sed 's/[a-z]*=//g')
             echo "| ${f#boot-} | $r | ${3:-} | ${4:-} | ${5:-} | $unc |" >> "$GITHUB_STEP_SUMMARY"
+            grep 'THPDBG' "$f" | tail -1 | sed "s/^/    ${f#boot-}: /" >> thpdbg.txt || true
           done
           echo >> "$GITHUB_STEP_SUMMARY"
           echo "$ok OK, $bad not OK" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -s thpdbg.txt ] && { echo; echo '```'; cat thpdbg.txt; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY" || true
           [ "${{ matrix.kernel }}" != fix ] || [ "$bad" = 0 ]
 
       - uses: actions/upload-artifact@v4
