@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [arm64, x64]
+        arch: [x64]
         kernel: [fix, master]
         include:
           - arch: arm64
@@ -132,6 +132,8 @@ jobs:
           jre/bin/java -version
           AZUL="$(find "$HOME/.ops/packages" -maxdepth 3 -type d -name 'AzulJREx64Linux_25.0.1' | head -1)"
           [ -n "$AZUL" ] || { echo "::error::no Azul package to take glibc from"; exit 1; }
+          # newer ops leave the package as a tarball until it is loaded
+          [ -d "$AZUL/sysroot" ] || tar -xzf "$AZUL/amd64.tar.gz" -C "$(dirname "$AZUL")"
           for d in "$HOME/.ops/local_packages/amd64/TemurinJREx64_25.0" "$HOME/.ops/local_packages/TemurinJREx64_25.0"; do
             mkdir -p "$d/sysroot"
             cp -a "$AZUL/sysroot/usr" "$AZUL/sysroot/lib64" "$d/sysroot/"
