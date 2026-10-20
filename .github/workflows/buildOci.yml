@@ -1,0 +1,45 @@
+name: kernel for OCI (arm64 + x86_64 build)
+
+# Builds the arm64 kernel and UEFI loader with every open patch merged, and keeps them as an artifact.
+
+on:
+  push:
+    branches: [ci/oci-all-final]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: virt
+          - arch: x64
+            runner: ubuntu-24.04
+            platform: pc
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm
+
+      - name: Kernel and loader
+        run: |
+          make -j"$(nproc)" kernel PLATFORM=${{ matrix.platform }}
+          find output/platform/${{ matrix.platform }} \( -name kernel.img -o -name bootaa64.efi \) -exec ls -l {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: |
+            output/platform/${{ matrix.platform }}/bin/kernel.img
+            output/platform/${{ matrix.platform }}/boot/bootaa64.efi
+            output/platform/${{ matrix.platform }}/bin/cloud_init
+            output/platform/${{ matrix.platform }}/bin/tls
+          if-no-files-found: warn
