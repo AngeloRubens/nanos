@@ -1,0 +1,63 @@
+name: disassemble start() of the arm64 virt kernel
+
+on:
+  push:
+    branches: [ci/disasm-start]
+  workflow_dispatch:
+
+jobs:
+  native:
+    name: native gcc (ubuntu arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm
+      - name: Build
+        run: make -j"$(nproc)" kernel PLATFORM=virt V=1 2>&1 | tee build.log
+      - name: Toolchain and disassembly
+        run: |
+          gcc --version | head -1; ld --version | head -1
+          grep -m3 -E "aarch64|-fpie|-fPIE|-fno-pic|-mcmodel" build.log | cut -c1-600 || true
+          K=$(find output/platform/virt -name 'kernel*' -type f ! -name '*.img' ! -name '*.map' | head -5); echo "$K"
+          for f in $K; do file $f; done
+          ELF=$(find output/platform/virt -type f -name kernel -o -type f -name 'kernel.elf' | head -1); echo "ELF=$ELF"
+          objdump -d --no-show-raw-insn "$ELF" > start.dis || true
+          awk '/^[0-9a-f]+ <start>:/,/^$/' start.dis | tee start-only.dis | head -150
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disasm-native
+          path: |
+            start.dis
+            start-only.dis
+            build.log
+  cross:
+    name: cross gcc 14.2 nolibc (kernel.org)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget git python3 nasm xz-utils
+          wget -q https://cdn.kernel.org/pub/tools/crosstool/files/bin/x86_64/14.2.0/x86_64-gcc-14.2.0-nolibc-aarch64-linux.tar.xz
+          tar xf x86_64-gcc-14.2.0-nolibc-aarch64-linux.tar.xz
+          echo "$PWD/gcc-14.2.0-nolibc/aarch64-linux/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: make -j"$(nproc)" ARCH=aarch64 CROSS_COMPILE=aarch64-linux- V=1 kernel PLATFORM=virt 2>&1 | tee build.log
+      - name: Toolchain and disassembly
+        run: |
+          aarch64-linux-gcc --version | head -1; aarch64-linux-ld --version | head -1
+          grep -m3 -E "aarch64|-fpie|-fPIE|-fno-pic|-mcmodel" build.log | cut -c1-600 || true
+          ELF=$(find output/platform/virt -type f -name kernel -o -type f -name 'kernel.elf' | head -1); echo "ELF=$ELF"
+          aarch64-linux-objdump -d --no-show-raw-insn "$ELF" > start.dis || true
+          awk '/^[0-9a-f]+ <start>:/,/^$/' start.dis | tee start-only.dis | head -150
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disasm-cross
+          path: |
+            start.dis
+            start-only.dis
+            build.log
