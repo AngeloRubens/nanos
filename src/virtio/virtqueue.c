@@ -204,6 +204,12 @@ static void vq_poll(virtqueue vq)
         virtqueue_debug_verbose("%s: vq %s: last_used_idx %d, id %d, len %d\n",
                                 func_ss, vq->name, vq->last_used_idx, uep->id, uep->len);
         u16 head = uep->id;
+        read_barrier();
+        if (uep->id != head) {
+            rprintf("VQREORDER vq %s head %d reread %d last_used_idx %d used->idx %d\n",
+                    vq->name, head, uep->id, vq->last_used_idx, vq->used->idx);
+            head = uep->id;
+        }
         vqmsg m = vq->msgs[head];
 
         /* return descriptor(s) to free list */
