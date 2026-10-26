@@ -1,0 +1,26 @@
+name: arm64 kernel ctl-fix
+
+on:
+  push:
+    branches: [ci/ctl-fix]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm
+      - name: Kernel and loader
+        run: make -j"$(nproc)" kernel PLATFORM=virt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-ctl-fix
+          path: |
+            output/platform/virt/bin/kernel.img
+            output/platform/virt/boot/bootaa64.efi
+            output/platform/virt/bin/cloud_init
+            output/platform/virt/bin/tls
