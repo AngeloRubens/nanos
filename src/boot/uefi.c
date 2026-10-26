@@ -9,7 +9,7 @@
  * inserted in the memory map between a get_memory_map() call and a exit_boot_services() call. */
 #define UEFI_MEMDESC_SPARE_COUNT    8
 
-//#define UEFI_DEBUG
+#define UEFI_DEBUG
 #ifdef UEFI_DEBUG
 # define uefi_debug(x, ...) rprintf("UEFI: " x "\n", ##__VA_ARGS__)
 #else
