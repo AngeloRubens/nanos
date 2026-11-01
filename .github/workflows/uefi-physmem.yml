@@ -63,7 +63,7 @@ jobs:
             ok=1
             grep -aq "hello world" boot-$m.log || ok=0
             case "${{ matrix.variant }}-$m" in
-              branch-low-reserved-2G|branch-low-reserved-3G) grep -aq "memory base 0x0000000080000000" boot-$m.log || ok=0 ;;
+              branch-low-reserved-2G|branch-low-reserved-3G) grep -aq "memory base 0x80000000" boot-$m.log || ok=0 ;;
               branch-low-reserved-*) ;;
               branch-*) grep -aq "starting kernel at 0x0000000040400024" boot-$m.log || ok=0 ;;
             esac
