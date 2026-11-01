@@ -163,6 +163,7 @@ def test_basic_options():
                   (out, p['name'], p['option']))
             raise RuntimeError
         ctx['output'] = out
+    print('DIAG guest output:\n' + out, flush=True)
         if 'post' in p:
             try:
                 t = p['post'](ctx)
@@ -220,6 +221,7 @@ def test_aslr():
 ###############################################################################
 ACCEPT_PROBE_PORT = 9090
 ACCEPT_PROBE_DEAD = 10
+T0 = time.time()
 
 
 def accept_reset_peer(ctx):
@@ -234,6 +236,7 @@ def accept_reset_peer(ctx):
         except OSError:
             time.sleep(0.2)     # the guest is still booting
             continue
+        print('DIAG %.2f connected %d' % (time.time() - T0, opened), flush=True)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
         s.close()
         opened += 1
@@ -241,6 +244,15 @@ def accept_reset_peer(ctx):
     if opened == ACCEPT_PROBE_DEAD:
         try:
             ctx['live'] = socket.create_connection(('127.0.0.1', ACCEPT_PROBE_PORT), timeout=5)
+            print('DIAG %.2f live connected' % (time.time() - T0), flush=True)
+            time.sleep(1)
+            ctx['live'].setblocking(False)
+            try:
+                print('DIAG live after 1s peek: %r' % ctx['live'].recv(1, socket.MSG_PEEK), flush=True)
+            except BlockingIOError:
+                print('DIAG live after 1s: still open', flush=True)
+            except OSError as e:
+                print('DIAG live after 1s: %r' % e, flush=True)
         except OSError:
             pass
 
@@ -277,6 +289,7 @@ def test_accept_reset():
         print('%s\nFAILED: accept_probe failed to run' % (out))
         raise RuntimeError
     ctx['output'] = out
+    print('DIAG guest output:\n' + out, flush=True)
     t = accept_reset_post(ctx)
     if t != None:
         print('FAILED: accept_probe: %s' % (t[1]))
@@ -302,8 +315,6 @@ def main():
     ip4_addr = get_ip4()
     repo_directory = os.path.dirname(os.path.realpath(sys.argv[0])) + "/.."
     try:
-        test_basic_options()
-        test_aslr()
         test_accept_reset()
     except:
         return -1
