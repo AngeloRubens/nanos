@@ -163,7 +163,6 @@ def test_basic_options():
                   (out, p['name'], p['option']))
             raise RuntimeError
         ctx['output'] = out
-    print('DIAG guest output:\n' + out, flush=True)
         if 'post' in p:
             try:
                 t = p['post'](ctx)
