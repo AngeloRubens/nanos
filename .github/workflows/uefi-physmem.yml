@@ -1,0 +1,72 @@
+name: uefi physmem base
+
+on:
+  push:
+    branches: [ci/uefi-physmem]
+  workflow_dispatch:
+
+jobs:
+  pc:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential nasm
+      - name: Build pc kernel and boot loaders (includes bootx64.efi)
+        run: make -j"$(nproc)" PLATFORM=pc kernel && ls -l output/platform/pc/boot/
+
+  virt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu ent xxd
+      - name: Build virt kernel and bootaa64.efi
+        run: make -j"$(nproc)" PLATFORM=virt kernel && ls -l output/platform/virt/boot/
+
+  uefi-boot:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [branch, branch-low-reserved, base]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - if: matrix.variant == 'base'
+        run: git checkout 40c25215eee4504906882dd3fb044f7f33e2e773 -- src
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-system-arm qemu-efi-aarch64 ent xxd
+      - name: Fetch arm64 target root
+        run: mkdir target-root && cd target-root && wget -q https://storage.googleapis.com/testmisc/arm64-target-root.tar.gz && sudo tar --exclude=dev/* -xzf arm64-target-root.tar.gz
+      - name: Enable UEFI_DEBUG (CI only)
+        run: sed -i 's|^//#define UEFI_DEBUG|#define UEFI_DEBUG|' src/boot/uefi.c && grep -n '^#define UEFI_DEBUG' src/boot/uefi.c
+      - name: Reserve 0x40000000-0x40600000 before the base is chosen (CI only)
+        if: matrix.variant == 'branch-low-reserved'
+        run: |
+          sed -i 's|^        load_elf_to_physical(general|        { void *p = pointer_from_u64(0x40000000ull); efi_status r = UBS->allocate_pages(allocate_address, efi_loader_data, 0x600, \&p); uefi_debug("CI reserve 0x40000000 status %ld", r); }\n&|' src/boot/uefi.c
+          grep -n "CI reserve" src/boot/uefi.c
+      - name: Build hw image with UEFI loader
+        env:
+          NANOS_TARGET_ROOT: ${{ github.workspace }}/target-root
+        run: |
+          make -j"$(nproc)" PLATFORM=virt kernel
+          make PLATFORM=virt ENABLE_UEFI=1 TARGET=hw image
+      - name: Boot under qemu with UEFI firmware
+        run: |
+          rc=0
+          for m in 1G 2G 3G; do
+            echo "=== ${{ matrix.variant }} -m $m ==="
+            timeout 300 qemu-system-aarch64 -machine virt,gic-version=2,highmem=off -cpu max -m $m \
+              -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+              -drive if=none,id=hd0,format=raw,file=output/image/disk.raw -device virtio-blk-pci,drive=hd0 \
+              -device virtio-rng-pci -display none -serial stdio -no-reboot -semihosting < /dev/null > boot-$m.log 2>&1 || true
+            grep -a "CI reserve\|UEFI: kernel physical memory base\|UEFI: starting kernel\|hello world" boot-$m.log || true
+            ok=1
+            grep -aq "hello world" boot-$m.log || ok=0
+            case "${{ matrix.variant }}-$m" in
+              branch-low-reserved-2G|branch-low-reserved-3G) grep -aq "memory base 0x0000000080000000" boot-$m.log || ok=0 ;;
+              branch-low-reserved-*) ;;
+              branch-*) grep -aq "starting kernel at 0x0000000040400024" boot-$m.log || ok=0 ;;
+            esac
+            [ $ok = 1 ] || { echo "FAIL $m"; tail -c 3000 boot-$m.log; rc=1; }
+          done
+          exit $rc
