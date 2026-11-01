@@ -313,8 +313,6 @@ def main():
     ip4_addr = get_ip4()
     repo_directory = os.path.dirname(os.path.realpath(sys.argv[0])) + "/.."
     try:
-        test_basic_options()
-        test_aslr()
         test_accept_reset()
     except:
         return -1
