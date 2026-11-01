@@ -1,0 +1,19 @@
+name: accept diag
+on:
+  push:
+    branches: [ci/accept-fix, ci/accept-revert]
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget git python3 nasm qemu-system-x86 qemu-utils
+      - name: Build and run the accept test three times
+        run: |
+          make -j"$(nproc)" PLATFORM=pc kernel
+          make PLATFORM=pc -C test/runtime accept_probe
+          for i in 1 2 3; do python3 test/extended_tests.py; echo "rc=$?"; done
