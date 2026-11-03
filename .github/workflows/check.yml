@@ -1,0 +1,28 @@
+name: check
+on:
+  push:
+    branches: ['check/**']
+  workflow_dispatch:
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 ent ruby rustc
+      - run: make -j4 image TARGET=netsock
+      - name: Run the netsock test
+        run: |
+          set -o pipefail
+          timeout 900 make VCPUS=2 run-noaccel TARGET=netsock 2>&1 | tee run.log | tail -3
+      - name: Collect the kernel
+        if: always()
+        run: |
+          mkdir -p kdist/klibs
+          cp output/platform/pc/bin/kernel.img output/platform/pc/boot/boot.img kdist/ || true
+          (cd output/platform/pc/bin && for f in *; do case $f in test|*.dbg|kernel.*) ;; *) cp -r $f ../../../../kdist/klibs/;; esac; done)
+          git log --oneline -4 > kdist/GITLOG
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel
+          path: kdist
