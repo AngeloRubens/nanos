@@ -1,0 +1,26 @@
+name: check
+on:
+  push:
+    branches: ['check/**']
+  workflow_dispatch:
+jobs:
+  clock:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 ent ruby rustc
+      - run: make -j4 image TARGET=clockrate
+      - name: The rate of the clock, three times
+        run: |
+          for i in 1 2 3; do
+            python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'test')
+          import extended_tests as e
+          e.repo_directory = '.'
+          try:
+              e.test_clock()
+          except RuntimeError:
+              sys.exit(1)
+          PY
+          done
