@@ -7,6 +7,7 @@ from threading import Thread
 import ast
 import re
 import tempfile
+import time
 
 ip4_addr = "127.0.0.1"
 repo_directory = "."
@@ -178,6 +179,67 @@ def test_basic_options():
         print('PASSED: "%s" with option "%s"' % (p['name'], p['option']))
 
 
+CLOCK_LISTEN_PORT = 47000
+
+
+def clock_reader(ctx):
+    while True:
+        try:
+            data, _ = ctx['sock'].recvfrom(64)
+        except:
+            return
+        try:
+            ctx['samples'].append((time.monotonic(), int(data)))
+        except ValueError:
+            continue
+
+
+def test_clock():
+    """The clock of the machine has to run at the rate of the clock of the host."""
+    ctx = {'samples': []}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(('127.0.0.1', CLOCK_LISTEN_PORT))
+    except OSError as err:
+        print('FAILED: cannot listen on port %d: %s' % (CLOCK_LISTEN_PORT, err))
+        raise RuntimeError
+    ctx['sock'] = sock
+    reader = Thread(target=clock_reader, args=(ctx, ))
+    reader.start()
+    try:
+        try:
+            rc, out = run_test('clockrate', 'fault:t')
+        except TimeoutError:
+            print('FAILED: clockrate timed out')
+            raise RuntimeError
+        if rc != 0:
+            print('%s\nFAILED: clockrate failed' % out)
+            raise RuntimeError
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        sock.close()
+        reader.join()
+    samples = ctx['samples']
+    if len(samples) < 8:
+        print('FAILED: clockrate sent only %d samples' % len(samples))
+        raise RuntimeError
+    # the rate is the slope of the clock of the machine against that of the host, so that the delay
+    # of a single datagram does not matter
+    n = len(samples)
+    mean_h = sum(h for h, _ in samples) / n
+    mean_g = sum(g for _, g in samples) / n / 1e9
+    rate = (sum((h - mean_h) * (g / 1e9 - mean_g) for h, g in samples) /
+            sum((h - mean_h)**2 for h, _ in samples))
+    if abs(rate - 1) > 0.005:
+        print('FAILED: the clock of the machine ran %.2f%% off the clock of the host' %
+              ((rate - 1) * 100))
+        raise RuntimeError
+    print('PASSED: the clock of the machine runs at %.4f of the rate of the host' % rate)
+
+
 def test_aslr():
 
     def run(option):
@@ -235,6 +297,7 @@ def main():
     try:
         test_basic_options()
         test_aslr()
+        test_clock()
     except:
         return -1
     return 0
