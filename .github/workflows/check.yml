@@ -15,7 +15,7 @@ jobs:
           set -o pipefail
           for i in 1 2 3 4 5; do
             timeout 900 make VCPUS=2 run-noaccel TARGET=netsock > run$i.log 2>&1 || true
-            grep -E "Error:|tests OK|unimplemented" run$i.log | head -5
+            grep -E "Error:|tests OK|unimplemented|DIAG" run$i.log | head -5
             grep -q "Network socket tests OK" run$i.log || { echo "RUN $i FAILED"; grep "Error" run$i.log | head -3; exit 1; }
           done
       - name: Collect the kernel
