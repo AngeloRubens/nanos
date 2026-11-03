@@ -185,8 +185,9 @@ static void netsock_test_basic(int sock_type)
         int val = 0;
         socklen_t len = sizeof(val);
 
-        test_assert((setsockopt(tx_fd, SOL_SOCKET, SO_REUSEPORT, &val, len) == -1) &&
-                     (errno == ENOPROTOOPT));
+        int diag_ret = setsockopt(tx_fd, SOL_SOCKET, SO_REUSEPORT, &val, len);
+        printf("DIAG SO_REUSEPORT ret %d errno %d\n", diag_ret, errno);
+        test_assert((diag_ret == -1) && (errno == ENOPROTOOPT));
 
         /* UDP_SEGMENT/UDP_GRO (UDP GSO/GRO) are not implemented and must be rejected
          * explicitly rather than silently accepted (setsockopt) or misreported
