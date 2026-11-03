@@ -1,28 +1,28 @@
 name: check
 on:
   push:
-    branches: ['check/**']
+    branches: ['check/arm']
   workflow_dispatch:
 jobs:
-  runtime:
-    runs-on: ubuntu-24.04
+  arm:
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 ent ruby rustc
-      - run: make -j4 image TARGET=netsock
-      - name: Run the netsock test
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 ent xxd ruby rustc
+      - run: uname -m; make -j4 PLATFORM=virt image TARGET=netsock
+      - name: Run the netsock test on aarch64
         run: |
           set -o pipefail
-          timeout 900 make VCPUS=2 run-noaccel TARGET=netsock 2>&1 | tee run.log | tail -3
+          timeout 1200 make PLATFORM=virt VCPUS=2 run-noaccel TARGET=netsock 2>&1 | tee run.log | tail -4
       - name: Collect the kernel
         if: always()
         run: |
           mkdir -p kdist/klibs
-          cp output/platform/pc/bin/kernel.img output/platform/pc/boot/boot.img kdist/ || true
-          (cd output/platform/pc/bin && for f in *; do case $f in test|*.dbg|kernel.*) ;; *) cp -r $f ../../../../kdist/klibs/;; esac; done)
-          git log --oneline -4 > kdist/GITLOG
+          cp output/platform/virt/bin/kernel.img output/platform/virt/boot/bootaa64.efi kdist/ || true
+          (cd output/platform/virt/bin && for f in *; do case $f in test|*.dbg|kernel.*) ;; *) cp -r $f ../../../../kdist/klibs/;; esac; done)
+          ls -la kdist
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: kernel
+          name: kernel-arm
           path: kdist
