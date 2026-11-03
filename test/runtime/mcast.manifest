@@ -1,0 +1,8 @@
+(
+    children:(
+        mcast:(contents:(host:output/test/runtime/bin/mcast))
+    )
+    program:/mcast
+    fault:t
+    environment:()
+)

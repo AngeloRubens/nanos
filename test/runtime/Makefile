@@ -23,6 +23,7 @@ PROGRAMS= \
 	ktest \
 	io_uring \
 	mkdir \
+	mcast \
 	mmap \
 	netlink \
 	netsock \
@@ -240,6 +241,11 @@ SRCS-tun= \
 	$(CURDIR)/tun.c \
 	$(SRCDIR)/unix_process/ssp.c
 LDFLAGS-tun=	-static
+
+SRCS-mcast= \
+	$(CURDIR)/mcast.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-mcast=	-static
 
 SRCS-udploop= \
 	$(CURDIR)/udploop.c \
