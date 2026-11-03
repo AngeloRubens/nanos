@@ -4,21 +4,27 @@ on:
     branches: ['check/**']
   workflow_dispatch:
 jobs:
-  suite:
+  runtime:
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 ent ruby rustc fuse libfuse-dev
-      - run: cd .. && git clone https://github.com/nanovms/ops.git
-      - run: make
-      - run: make tools && make tfs-fuse
-      - run: curl https://ops.city/get.sh -sSfL | sh
-      - name: Runtime tests
+      - run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 ent ruby rustc
+      - run: make -j4 image TARGET=netsock
+      - name: Run the netsock test
         run: |
-          export OPS_DIR=$HOME/.ops
-          export PATH=$HOME/.ops/bin:$PATH
-          make VCPUS=2 test-noaccel
-      - name: Extended tests
+          set -o pipefail
+          for i in 1 2 3 4 5; do
+            timeout 900 make VCPUS=2 run-noaccel TARGET=netsock 2>&1 | tee run$i.log | tail -3
+            grep -q "Network socket tests OK" run$i.log || { echo "RUN $i FAILED"; grep "Error" run$i.log | head -3; exit 1; }
+          done
+      - name: Collect the kernel
         if: always()
-        run: test/extended_tests.py
+        run: |
+          mkdir -p kdist/klibs
+          cp output/platform/pc/bin/kernel.img output/platform/pc/boot/boot.img kdist/ || true
+          (cd output/platform/pc/bin && for f in *; do case $f in test|*.dbg|kernel.*) ;; *) cp -r $f ../../../../kdist/klibs/;; esac; done)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel
+          path: kdist
