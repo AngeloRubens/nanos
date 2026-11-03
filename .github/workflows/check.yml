@@ -1,0 +1,24 @@
+name: check
+on:
+  push:
+    branches: ['check/**']
+  workflow_dispatch:
+jobs:
+  suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 ent ruby rustc fuse libfuse-dev
+      - run: cd .. && git clone https://github.com/nanovms/ops.git
+      - run: make
+      - run: make tools && make tfs-fuse
+      - run: curl https://ops.city/get.sh -sSfL | sh
+      - name: Runtime tests
+        run: |
+          export OPS_DIR=$HOME/.ops
+          export PATH=$HOME/.ops/bin:$PATH
+          make VCPUS=2 test-noaccel
+      - name: Extended tests
+        if: always()
+        run: test/extended_tests.py
