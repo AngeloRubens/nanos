@@ -37,25 +37,32 @@ static boolean pit_wait_msb(u8 msb, u64 *error, u64 *tsc)
     return true;
 }
 
-/* Calibrates the TSC using PIT channel 2. */
+/* Calibrates the TSC using PIT channel 2. Both ends of the measurement are the instants at which the
+ * most significant byte of the PIT counter changes, so that the time that elapses between loading
+ * the counter and the first reading, which is long when accessing an I/O port is slow, is not
+ * counted as part of the first period. */
 static u64 tsc_calibrate(void)
 {
     out8(0x61, (in8(0x61) & ~0x02) | 0x01); /* set gate high, disable speaker */
     out8(0x43, 0xB0);   /* lobyte/hibyte access mode, operating mode 0, binary mode */
     out8(0x42, 0xFF);   /* set initial count LSB */
     out8(0x42, 0xFF);   /* set initial count MSB */
-    in8(0x42); in8(0x42);   /* dummy read (LSB/MSB) to ensure the PIT has started counting */
-    u64 start = rdtsc();
-    int i;
-    u64 error, tsc;
-    for (i = 0; i <= 0xFF;) {
-        if (!pit_wait_msb(0xFF - i, &error, &tsc))
+    in8(0x42);          /* LSB, ignored */
+    u8 msb = in8(0x42);
+    u64 start, error, tsc;
+    if (!pit_wait_msb(msb, &error, &start))
+        return 0;
+    int periods = 0;
+    for (int i = 1; i < msb; i++) {
+        if (!pit_wait_msb(msb - i, &error, &tsc))
             return 0;
-        i++;
+        periods = i;
         if (error < ((tsc - start) >> 11))  /* aim for an error lower than ~500 PPM */
             break;
     }
-    timestamp elapsed = i * PIT_PERIOD_MSB;
+    if (periods == 0)
+        return 0;
+    timestamp elapsed = periods * PIT_PERIOD_MSB;
     return (elapsed << 32) / (tsc - start);
 }
 
