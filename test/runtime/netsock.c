@@ -1077,7 +1077,8 @@ static void netsock_test_rcvbuf_set(void)
     uint8_t pkt[KB];
     const int xfer_size = 80 * KB;
     const int pkt_count = xfer_size / sizeof(pkt);
-    int rx_count;
+    int rx_count, tcp_fd;
+    int sndbuf = 128 * KB;
 
     tx_fd = socket(AF_INET, SOCK_DGRAM, 0);
     test_assert(tx_fd > 0);
@@ -1097,7 +1098,7 @@ static void netsock_test_rcvbuf_set(void)
     static const int sizes[][2] = {
         {128 * KB, 256 * KB}, {1, 2304}, {64 * KB * KB, 416 * KB}, {-1, 416 * KB},
     };
-    for (int i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+    for (int i = 0; i < _countof(sizes); i++) {
         rcvbuf = sizes[i][0];
         test_assert(setsockopt(rx_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
         optlen = sizeof(rcvbuf);
@@ -1114,7 +1115,8 @@ static void netsock_test_rcvbuf_set(void)
     for (int i = 0; i < pkt_count; i++)
         test_assert(sendto(tx_fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&addr,
                            sizeof(addr)) == sizeof(pkt));
-    /* the loopback delivers in order: once this arrives, so has everything sent before it */
+    /* the loopback delivers in order, except for a datagram that another CPU is still handing
+     * over: once this one arrives, what was sent before it has all but certainly been delivered */
     test_assert(sendto(tx_fd, pkt, 1, 0, (struct sockaddr *)&sync_addr,
                        sizeof(sync_addr)) == 1);
     test_assert(recv(sync_fd, pkt, sizeof(pkt), 0) == 1);
@@ -1124,11 +1126,12 @@ static void netsock_test_rcvbuf_set(void)
     test_assert(rx_count == rcvbuf);
 
     /* the option is accepted on a TCP socket too */
-    int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
     test_assert(tcp_fd > 0);
     rcvbuf = 128 * KB;
     test_assert(setsockopt(tcp_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
-    test_assert(setsockopt(tcp_fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf)) == 0);
+    test_assert(setsockopt(tcp_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == 0);
+    test_assert(setsockopt(rx_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == 0);
     test_assert(close(tcp_fd) == 0);
     test_assert((close(tx_fd) == 0) && (close(rx_fd) == 0) && (close(sync_fd) == 0));
 }
