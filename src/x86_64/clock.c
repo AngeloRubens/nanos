@@ -19,8 +19,11 @@ void init_clock(void)
     __vdso_dat->machine.platform_has_rdtscp = (regs[3] & U64_FROM_BIT(27)) != 0;
 }
 
-/* error refers to the time (expressed in TSC cycles) it takes to read the PIT counter value. */
-static boolean pit_wait_msb(u8 msb, u64 *error, u64 *tsc)
+/* Waits for the most significant byte of the PIT counter to change from msb. On return, tsc is the
+ * time stamp counter read just before the reading that saw the change, next is the value that was
+ * seen, and error refers to the time (expressed in TSC cycles) it takes to read the PIT counter
+ * value. */
+static boolean pit_wait_msb(u8 msb, u64 *error, u64 *tsc, u8 *next)
 {
     u64 prev_tsc = 0;
     int i = 0;
@@ -28,8 +31,11 @@ static boolean pit_wait_msb(u8 msb, u64 *error, u64 *tsc)
         *tsc = rdtsc();
         *error = *tsc - prev_tsc;
         in8(0x42);  /* LSB, ignored */
-        if (in8(0x42) != msb)
+        u8 m = in8(0x42);
+        if (m != msb) {
+            *next = m;
             break;
+        }
         if (++i > 10000)
             return false;   /* The PIT is not counting as expected. */
         prev_tsc = *tsc;
@@ -37,25 +43,38 @@ static boolean pit_wait_msb(u8 msb, u64 *error, u64 *tsc)
     return true;
 }
 
-/* Calibrates the TSC using PIT channel 2. */
+/* Calibrates the TSC using PIT channel 2. Both ends of the measurement are the instants at which the
+ * most significant byte of the PIT counter changes, and the number of periods between them is the
+ * difference between the values seen after each of them. The time that elapses between loading the
+ * counter and the first reading is thus not counted as part of the first period, which it would be
+ * if the counting started at the first reading, and that time is long when accessing an I/O port is
+ * slow, as it is in an emulator that runs without acceleration. */
 static u64 tsc_calibrate(void)
 {
     out8(0x61, (in8(0x61) & ~0x02) | 0x01); /* set gate high, disable speaker */
     out8(0x43, 0xB0);   /* lobyte/hibyte access mode, operating mode 0, binary mode */
     out8(0x42, 0xFF);   /* set initial count LSB */
     out8(0x42, 0xFF);   /* set initial count MSB */
-    in8(0x42); in8(0x42);   /* dummy read (LSB/MSB) to ensure the PIT has started counting */
-    u64 start = rdtsc();
-    int i;
-    u64 error, tsc;
-    for (i = 0; i <= 0xFF;) {
-        if (!pit_wait_msb(0xFF - i, &error, &tsc))
+    in8(0x42);          /* LSB, ignored */
+    u8 msb = in8(0x42);
+    u64 start_error, start, error, tsc;
+    u8 first, last;
+    /* The first edge is only waited for, and the measurement starts at the next one. */
+    if (!pit_wait_msb(msb, &start_error, &start, &first) ||
+        !pit_wait_msb(first, &start_error, &start, &first))
+        return 0;
+    int periods = 0;
+    last = first;
+    while (last > 1) {
+        if (!pit_wait_msb(last, &error, &tsc, &last))
             return 0;
-        i++;
-        if (error < ((tsc - start) >> 11))  /* aim for an error lower than ~500 PPM */
+        periods = first - last;
+        if (error + start_error < ((tsc - start) >> 11))    /* aim for an error lower than ~500 PPM */
             break;
     }
-    timestamp elapsed = i * PIT_PERIOD_MSB;
+    if (periods <= 0)
+        return 0;
+    timestamp elapsed = periods * PIT_PERIOD_MSB;
     return (elapsed << 32) / (tsc - start);
 }
 
