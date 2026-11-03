@@ -1,0 +1,8 @@
+(
+    children:(
+        clockrate:(contents:(host:output/test/runtime/bin/clockrate))
+    )
+    program:/clockrate
+    fault:t
+    environment:()
+)
