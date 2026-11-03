@@ -7,6 +7,7 @@ from threading import Thread
 import ast
 import re
 import tempfile
+import time
 
 ip4_addr = "127.0.0.1"
 repo_directory = "."
@@ -178,6 +179,56 @@ def test_basic_options():
         print('PASSED: "%s" with option "%s"' % (p['name'], p['option']))
 
 
+CLOCK_LISTEN_PORT = 47000
+
+
+def clock_reader(ctx):
+    while True:
+        try:
+            data, _ = ctx['sock'].recvfrom(64)
+            ctx['samples'].append((time.monotonic(), int(data)))
+        except:
+            return
+
+
+def test_clock():
+    """The clock of the machine has to run at the rate of the clock of the host."""
+    ctx = {'samples': []}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', CLOCK_LISTEN_PORT))
+    ctx['sock'] = sock
+    reader = Thread(target=clock_reader, args=(ctx, ))
+    reader.start()
+    try:
+        try:
+            rc, out = run_test('clockrate', 'fault:t')
+        except TimeoutError:
+            print('FAILED: clockrate timed out')
+            raise RuntimeError
+        if rc != 0:
+            print('%s\nFAILED: clockrate failed' % out)
+            raise RuntimeError
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        sock.close()
+        reader.join()
+    samples = ctx['samples']
+    if len(samples) < 8:
+        print('FAILED: clockrate sent only %d samples' % len(samples))
+        raise RuntimeError
+    host = samples[-1][0] - samples[0][0]
+    guest = (samples[-1][1] - samples[0][1]) / 1e9
+    rate = guest / host
+    if abs(rate - 1) > 0.005:
+        print('FAILED: the clock of the machine ran %.2f%% off the clock of the host' %
+              ((rate - 1) * 100))
+        raise RuntimeError
+    print('PASSED: the clock of the machine runs at %.4f of the rate of the host' % rate)
+
+
 def test_aslr():
 
     def run(option):
@@ -235,6 +286,7 @@ def main():
     try:
         test_basic_options()
         test_aslr()
+        test_clock()
     except:
         return -1
     return 0
