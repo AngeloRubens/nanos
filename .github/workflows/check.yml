@@ -15,6 +15,7 @@ jobs:
       - run: make tools && make tfs-fuse
       - run: curl https://ops.city/get.sh -sSfL | sh
       - name: Runtime tests
+        timeout-minutes: 75
         run: |
           export OPS_DIR=$HOME/.ops
           export PATH=$HOME/.ops/bin:$PATH
