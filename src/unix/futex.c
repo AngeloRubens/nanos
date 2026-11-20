@@ -206,8 +206,6 @@ sysreturn futex(int *uaddr, int futex_op, int val,
 
         if (!memory_is_user(uaddr2, sizeof(int)))
             return set_syscall_error(current, EFAULT);
-        if ((val < 0) || (nr_requeue < 0))
-            return set_syscall_error(current, EINVAL);
 
         if (nr_requeue > 0) {
             new = soft_create_futex(current->p, u64_from_pointer(uaddr2));
