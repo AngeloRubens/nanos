@@ -6,11 +6,11 @@ name: futex-requeue kernel
 
 on:
   push:
-    branches: [ futex-requeue ]
+    branches: [ futex-requeue-check ]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   kernel:
@@ -42,21 +42,15 @@ jobs:
           grep -q 'All futex tests passed' run-futex.log
           grep -q 'requeue test: passed' run-futex.log
 
+      - name: Tail of the futex log
+        if: always()
+        run: tail -40 run-futex.log || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: futex-requeue-kernel
+          name: futex-requeue-check-run
           path: |
             dist/kernel.img
             dist/boot.img
             run-futex.log
-
-      - name: Publish release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view futex-requeue-kernel >/dev/null 2>&1 || \
-            gh release create futex-requeue-kernel --title futex-requeue-kernel \
-              --notes "kernel.img and boot.img (x86_64 pc) built from branch futex-requeue" \
-              --target "$GITHUB_SHA"
-          gh release upload futex-requeue-kernel dist/kernel.img dist/boot.img --clobber
