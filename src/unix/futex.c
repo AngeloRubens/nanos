@@ -6,6 +6,8 @@ struct futex {
     struct spinlock lock;
 };
 
+#define FUTEX_GAP_MS 2
+
 #define futex_lock(f)   spin_lock(&(f)->lock)
 #define futex_unlock(f) spin_unlock(&(f)->lock)
 
@@ -114,6 +116,10 @@ closure_function(3, 1, sysreturn, futex_bh,
 
     if (!(flags & BLOCKQ_ACTION_BLOCKED)) {
         futex_unlock(f);
+        /* experiment: widen the gap between releasing f->lock and queueing */
+        timestamp end = now(CLOCK_ID_MONOTONIC) + milliseconds(FUTEX_GAP_MS);
+        while (now(CLOCK_ID_MONOTONIC) < end)
+            kern_pause();
         return BLOCKQ_BLOCK_REQUIRED;
     }
 
