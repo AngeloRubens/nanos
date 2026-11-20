@@ -232,7 +232,7 @@ sysreturn futex(int *uaddr, int futex_op, int val,
 
         requeued = 0;
         if (new)
-            requeued = blockq_transfer_waiters(new->bq, f->bq, nr_requeue,
+            requeued = blockq_transfer_waiters(new->bq, f->bq, S32_MAX,
                                                stack_closure(futex_requeue_handler, new));
         rv = woken + requeued;
       requeue_done:
