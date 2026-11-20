@@ -197,46 +197,39 @@ sysreturn futex(int *uaddr, int futex_op, int val,
         return nr_woken;
     }
 
-    case FUTEX_CMP_REQUEUE:
-    case FUTEX_REQUEUE: {
-        /* FUTEX_REQUEUE does not compare the value at uaddr */
+    case FUTEX_CMP_REQUEUE: {
         int woken, requeued;
-        struct futex * new = 0;
 
         if (!memory_is_user(uaddr2, sizeof(int)))
             return set_syscall_error(current, EFAULT);
-        if ((val < 0) || ((int)val2 < 0))
-            return set_syscall_error(current, EINVAL);
-
-        if ((int)val2 > 0) {
-            new = soft_create_futex(current->p, u64_from_pointer(uaddr2));
-            if (new == INVALID_ADDRESS)
-                return -ENOMEM;
-        }
 
         sysreturn rv;
         futex_lock(f);
-        if (op == FUTEX_CMP_REQUEUE) {
-            if (context_set_err(ctx)) {
-                rv = -EFAULT;
-                goto requeue_done;
-            }
-            if (*uaddr != val3) {
-                rv = -EAGAIN;
-                goto requeue_done;
-            }
+        if (context_set_err(ctx)) {
+            rv = -EFAULT;
+            goto cmp_requeue_done;
+        }
+        if (*uaddr != val3) {
+            rv = -EAGAIN;
+            goto cmp_requeue_done;
         }
 
         woken = futex_wake_many(f, val);
 
         requeued = 0;
-        if (new)
-            requeued = blockq_transfer_waiters(new->bq, f->bq, (int)val2,
+        if (val2 > 0) {
+            struct futex * new = soft_create_futex(current->p, u64_from_pointer(uaddr2));
+            if (new == INVALID_ADDRESS) {
+                rv = -ENOMEM;
+                goto cmp_requeue_done;
+            }
+            requeued = blockq_transfer_waiters(new->bq, f->bq, val2,
                                                stack_closure(futex_requeue_handler, new));
+        }
         rv = woken + requeued;
-      requeue_done:
+      cmp_requeue_done:
         futex_unlock(f);
-        if ((op == FUTEX_CMP_REQUEUE) && (rv != -EFAULT))
+        if (rv != -EFAULT)
             context_clear_err(ctx);
         return rv;
     }
