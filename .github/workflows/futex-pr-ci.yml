@@ -5,7 +5,7 @@ name: futex pr ci
 
 on:
   push:
-    branches: [ futex-fmmap ]
+    branches: [ futex-fmmap-final ]
   workflow_dispatch:
 
 permissions:
@@ -13,6 +13,10 @@ permissions:
 
 jobs:
   suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -31,12 +35,12 @@ jobs:
 
       - name: Whole runtime test suite
         run: |
-          tests="mmap mmap mmap mmap mmap"
+          tests="mmap mmap mmap mmap mmap mmap mmap mmap mmap mmap"
           echo "tests: $tests"
           failed=""
           for t in $tests; do
             echo "=== $t"
-            if timeout 900 make VCPUS=2 run-noaccel TARGET=$t PLATFORM=pc \
+            if timeout 120 make VCPUS=2 run-noaccel TARGET=$t PLATFORM=pc \
                 > "run-$t.log" 2>&1; then
               echo "RESULT $t: ok"
             else
@@ -51,5 +55,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: suite-logs
+          name: suite-logs-${{ matrix.rep }}
           path: run-*.log
