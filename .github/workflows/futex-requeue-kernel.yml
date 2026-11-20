@@ -1,0 +1,62 @@
+name: futex-requeue kernel
+
+# Builds the x86_64 pc kernel of this branch, runs the futex runtime test,
+# and publishes kernel.img and boot.img as assets of the release
+# futex-requeue-kernel, so that other jobs can fetch them with curl.
+
+on:
+  push:
+    branches: [ futex-requeue ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils wget git python3 nasm \
+            qemu-system qemu-utils
+
+      - name: Build the kernel and boot image
+        run: |
+          make -j"$(nproc)" kernel PLATFORM=pc
+          make -j"$(nproc)" -C platform/pc boot || true
+          mkdir -p dist
+          cp "$(find output -name kernel.img | head -1)" dist/kernel.img
+          cp "$(find output -name boot.img | head -1)" dist/boot.img
+          ls -l dist
+
+      - name: Futex runtime test
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" image TARGET=futex PLATFORM=pc 2>&1 | tail -3
+          timeout 900 make VCPUS=2 run-noaccel TARGET=futex PLATFORM=pc \
+            2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee run-futex.log || true
+          grep -q 'All futex tests passed' run-futex.log
+          grep -q 'requeue test: passed' run-futex.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: futex-requeue-kernel
+          path: |
+            dist/kernel.img
+            dist/boot.img
+            run-futex.log
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view futex-requeue-kernel >/dev/null 2>&1 || \
+            gh release create futex-requeue-kernel --title futex-requeue-kernel \
+              --notes "kernel.img and boot.img (x86_64 pc) built from branch futex-requeue" \
+              --target "$GITHUB_SHA"
+          gh release upload futex-requeue-kernel dist/kernel.img dist/boot.img --clobber
