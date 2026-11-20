@@ -23,6 +23,8 @@ int wait_test_futex = FUTEX_INITIALIZER;
 int wait_bitset_test_futex = FUTEX_INITIALIZER;
 int cmp_requeue_test_futex_1 = FUTEX_INITIALIZER;
 int cmp_requeue_test_futex_2 = FUTEX_INITIALIZER;
+int requeue_test_futex_1 = FUTEX_INITIALIZER;
+int requeue_test_futex_2 = FUTEX_INITIALIZER;
 int wake_op_test_futex_1 = FUTEX_INITIALIZER;
 int wake_op_test_futex_2 = FUTEX_INITIALIZER;
 
@@ -250,6 +252,57 @@ static void *futex_cmp_requeue_test_thread(void *arg)
     return NULL;
 }
 
+/* Thread function called from futex_requeue_test: blocks on the futex
+passed as argument, whose value is FUTEX_INITIALIZER */
+static void *futex_requeue_test_thread(void *arg)
+{
+    syscall(SYS_futex, (int*)(arg), FUTEX_WAIT, FUTEX_INITIALIZER, 0, NULL, 0);
+    return NULL;
+}
+
+/* FUTEX_REQUEUE test: val threads waiting on uaddr are woken up and the
+rest are moved to uaddr2's queue, without any comparison of the value at uaddr.
+Waking uaddr2 then releases the requeued threads. */
+static boolean futex_requeue_test()
+{
+    int *uaddr = (int*)(&requeue_test_futex_1);
+    int *uaddr2 = (int*)(&requeue_test_futex_2);
+    int val = 3;
+    u64 val2 = INT_MAX;
+    int num_threads = 10;
+    pthread_t threads[num_threads];
+
+    for (int index = 0; index < num_threads; index++) {
+        if (pthread_create(&(threads[index]), NULL, futex_requeue_test_thread, (void*)(uaddr))) {
+            printf("Unable to create thread. requeue test: failed.\n");
+            return false;
+        }
+    }
+
+    sleep(1); /* for main thread */
+
+    int changed = syscall(SYS_futex, uaddr, FUTEX_REQUEUE, val, val2, uaddr2, 0);
+    if (changed != num_threads) {
+        printf("Incorrect number of woken up or requeued threads (%d). requeue test: failed.\n", changed);
+        return false;
+    }
+
+    int remaining = syscall(SYS_futex, uaddr2, FUTEX_WAKE, INT_MAX, 0, NULL, 0);
+    if (remaining != num_threads - val) {
+        printf("Incorrect number of requeued threads (%d). requeue test: failed.\n", remaining);
+        return false;
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        if (pthread_join(threads[i], NULL) != 0) {
+            printf("Unable to join thread. requeue test: failed.\n");
+            return false;
+        }
+    }
+    printf("requeue test: passed\n");
+    return true;
+}
+
 /* FUTEX_WAKE_OP test: Creates group of threads to wait on uaddr
 and another group to wait on uaddr2. Performs FUTEX_WAKE_OP with
 uaddr and uaddr2 and checks that correct number of threads are woken up.
@@ -413,6 +466,11 @@ boolean basic_test()
     if (!futex_cmp_requeue_test_1())
         num_failed++;
     if (!futex_cmp_requeue_test_2())
+        num_failed++;
+
+    /* Requeue Test */
+    printf("---FUTEX_REQUEUE TESTS--- \n");
+    if (!futex_requeue_test())
         num_failed++;
 
     /* Wake_Op Tests: pass in true to wake up threads 
