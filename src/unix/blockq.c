@@ -315,12 +315,6 @@ int blockq_transfer_waiters(blockq dest, blockq src, int n, blockq_action_handle
         thread_unlock(t);
         transferred++;
     }
-    if (transferred < n) {
-        /* A thread that has checked its futex value but is not yet on the
-           queue (see blockq_check_timeout()) could have been requeued had it
-           arrived earlier: make it wake up, as blockq_wake_one() does. */
-        src->wake = true;
-    }
     blockq_unlock(dest);
     blockq_unlock(src);
     return transferred;
