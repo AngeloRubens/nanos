@@ -234,6 +234,32 @@ sysreturn futex(int *uaddr, int futex_op, int val,
         return rv;
     }
 
+    case FUTEX_REQUEUE: {
+        int woken, requeued;
+
+        if (!memory_is_user(uaddr2, sizeof(int)))
+            return set_syscall_error(current, EFAULT);
+
+        sysreturn rv;
+        futex_lock(f);
+        woken = futex_wake_many(f, val);
+
+        requeued = 0;
+        if (val2 > 0) {
+            struct futex * new = soft_create_futex(current->p, u64_from_pointer(uaddr2));
+            if (new == INVALID_ADDRESS) {
+                rv = -ENOMEM;
+                goto requeue_done;
+            }
+            requeued = blockq_transfer_waiters(new->bq, f->bq, val2,
+                                               stack_closure(futex_requeue_handler, new));
+        }
+        rv = woken + requeued;
+      requeue_done:
+        futex_unlock(f);
+        return rv;
+    }
+
     case FUTEX_WAKE_OP: {
         unsigned int cmparg = val3 & MASK(12);
         unsigned int oparg = (val3 >> 12) & MASK(12);
