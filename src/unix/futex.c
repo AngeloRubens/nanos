@@ -197,8 +197,7 @@ sysreturn futex(int *uaddr, int futex_op, int val,
         return nr_woken;
     }
 
-    case FUTEX_CMP_REQUEUE:
-    case FUTEX_REQUEUE: {
+    case FUTEX_CMP_REQUEUE: {
         /* FUTEX_REQUEUE does not compare the value at uaddr */
         int woken, requeued;
         struct futex * new = 0;
