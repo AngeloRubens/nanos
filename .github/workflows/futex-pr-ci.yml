@@ -5,7 +5,7 @@ name: futex pr ci
 
 on:
   push:
-    branches: [ futex-fmmap-master ]
+    branches: [ futex-fmmap-vcpus ]
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rep: [1, 2, 3, 4, 5, 6]
+        vcpus: [1, 2, 4]
+        rep: [1, 2, 3]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -40,7 +41,7 @@ jobs:
           failed=""
           for t in $tests; do
             echo "=== $t"
-            if timeout 120 make VCPUS=2 run-noaccel TARGET=$t PLATFORM=pc \
+            if timeout 120 make VCPUS=${{ matrix.vcpus }} run-noaccel TARGET=$t PLATFORM=pc \
                 > "run-$t.log" 2>&1; then
               echo "RESULT $t: ok"
             else
@@ -55,5 +56,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: suite-logs-${{ matrix.rep }}
+          name: suite-logs-${{ matrix.vcpus }}-${{ matrix.rep }}
           path: run-*.log
