@@ -114,6 +114,10 @@ closure_function(3, 1, sysreturn, futex_bh,
 
     if (!(flags & BLOCKQ_ACTION_BLOCKED)) {
         futex_unlock(f);
+        /* experiment: widen the gap between releasing f->lock and queueing */
+        timestamp end = now(CLOCK_ID_MONOTONIC) + milliseconds(2);
+        while (now(CLOCK_ID_MONOTONIC) < end)
+            kern_pause();
         return BLOCKQ_BLOCK_REQUIRED;
     }
 
